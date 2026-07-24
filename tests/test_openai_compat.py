@@ -55,6 +55,13 @@ def test_resolve_model_alias_maps_intelligence_presets():
     assert _resolve_model_alias("auto", None) == ("auto", None)
 
 
+def test_resolve_model_alias_does_not_infer_unverified_ui_model_names():
+    # UI/display branding is not a ChatGPT Web protocol identifier. Keep an
+    # unknown name intact so capability validation can reject it rather than
+    # silently sending a different model to the provider.
+    assert _resolve_model_alias("gpt-5-6-sol", None) == ("gpt-5-6-sol", None)
+
+
 def test_resolve_image_model_alias_maps_openai_names_to_auto():
     assert _resolve_image_model_alias("gpt-image-1") == "auto"
     assert _resolve_image_model_alias("chatgpt-image") == "auto"

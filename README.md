@@ -969,6 +969,11 @@ Representative aliases:
 Free and Go accounts should normally stay on `auto`. Higher-effort model aliases
 should route only to accounts that actually support them.
 
+Model names in the ChatGPT UI are not automatically protocol model IDs. The
+current verified ChatGPT Web wire family is `gpt-5-5`; do not add an alias for a
+new UI label until its backend slug and a real completion have both been
+verified. See [model alias maintenance](docs/MODEL_ALIAS_MAINTENANCE.md).
+
 ## Accounts, Routing, And Local Limits
 
 Routing strategies:
