@@ -310,8 +310,23 @@ plugin-creator skill, validate it with that skill's `validate_plugin.py`
 script against `./plugins/gpt-bridge`; otherwise review
 `plugins/gpt-bridge/.codex-plugin/plugin.json` manually.
 
+This repository root is itself a local Codex marketplace
+([.agents/plugins/marketplace.json](.agents/plugins/marketplace.json)), so
+`codex plugin marketplace add <path-to-this-repo>` registers it directly.
+
 > ภาษาไทย: plugin นี้ไม่ได้ให้ Codex login หรือจับ cookie แทนคุณ มันเพียงเรียก
 > `gpt-bridge worker` ไปยัง Bridge local ที่คุณเปิดและตั้งค่าเองแล้ว
+
+## Claude Code skill
+
+[.claude/skills/gpt-bridge-worker](.claude/skills/gpt-bridge-worker) is a
+project-scoped skill: any Claude Code session opened in this repository
+auto-discovers it. It documents the same `gpt-bridge worker` commands and
+credential boundaries as the Codex skill above; copy the folder into
+`~/.claude/skills/` for a user-level install outside this repo.
+
+> ภาษาไทย: skill นี้ให้ Claude Code เรียก `gpt-bridge worker` ตาม boundary
+> เดียวกับ Codex ไม่ได้ login หรือจับ cookie แทนคุณ
 
 ## Verification
 
@@ -337,6 +352,7 @@ chatgpt_api/                 Python Bridge API, providers, worker, compatibility
 chatgpt_api/worker/          Loopback client, storage, migration, stack controls
 apps/bridge-console/         Svelte operator console
 plugins/gpt-bridge/          Codex plugin and worker skill
+.claude/skills/              Project-scoped Claude Code worker skill
 integrations/                Consumer integrations and examples
 docs/                        Architecture, API compatibility, CLI, handoff notes
 tests/                       Python regression suite

@@ -11,7 +11,7 @@ User-controlled browser onboarding or manual local capture
   -> encrypted account store (secrets/accounts)
   -> GPT Bridge API on 127.0.0.1:8000
   -> Bridge Console on 127.0.0.1:8080
-  -> local worker, Codex plugin, and optional OpenCode consumer
+  -> local worker, Codex plugin, Claude Code skill, and optional OpenCode consumer
   -> local outputs and artifact metadata
 ```
 
@@ -30,6 +30,7 @@ or another person's account.
 | `chatgpt_api/worker/` and `threads.py` | Loopback client, durable local task threads, report/image/research commands, conservative stack control |
 | `apps/bridge-console/` | Browser operator UI; never stores raw capture material in source or screenshots |
 | `plugins/gpt-bridge/` | Codex worker skill; it may call an already-running worker but never handles browser credentials |
+| `.claude/skills/gpt-bridge-worker/` | Claude Code worker skill with the same worker-only, no-credential-handling boundary |
 
 ## Security decisions
 
