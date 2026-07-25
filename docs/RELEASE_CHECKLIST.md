@@ -24,7 +24,8 @@
 python -m compileall -q chatgpt_api
 python -m pytest -q
 git diff --check
-python C:\Users\User\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .\plugins\gpt-bridge
+# Optional, if you maintain the plugin with the Codex CLI's plugin-creator
+# skill: run that skill's validate_plugin.py against ./plugins/gpt-bridge
 docker compose config
 docker compose up -d --build --remove-orphans gpt-bridge bridge-console
 $env:CHATGPT_API_KEY = "YOUR_LOCAL_KEY"

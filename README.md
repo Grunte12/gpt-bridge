@@ -305,11 +305,10 @@ gpt-bridge worker stack restart
 
 The plugin source lives at [plugins/gpt-bridge](plugins/gpt-bridge). Its skill
 documents when Codex may use the local worker and the strict credential
-boundaries it must keep. Validate it with:
-
-```powershell
-python C:\Users\User\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .\plugins\gpt-bridge
-```
+boundaries it must keep. If you maintain it with the Codex CLI's
+plugin-creator skill, validate it with that skill's `validate_plugin.py`
+script against `./plugins/gpt-bridge`; otherwise review
+`plugins/gpt-bridge/.codex-plugin/plugin.json` manually.
 
 > ภาษาไทย: plugin นี้ไม่ได้ให้ Codex login หรือจับ cookie แทนคุณ มันเพียงเรียก
 > `gpt-bridge worker` ไปยัง Bridge local ที่คุณเปิดและตั้งค่าเองแล้ว
