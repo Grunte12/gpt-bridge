@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package with dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Compile check
+        run: python -m compileall -q chatgpt_api
+      - name: Run test suite
+        run: python -m pytest -q
+      - name: Whitespace/conflict-marker check
+        run: |
+          git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -- \
+            . ':!apps/bridge-console/dist' ':!apps/bridge-console/bun.lock'
+
+  console:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/bridge-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Type/template check
+        run: bun run check
+      - name: Build
+        run: bun run build
+
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      # Compose requires CHATGPT_API_KEY to interpolate even for config/build.
+      # This placeholder is never used to start a container in CI.
+      CHATGPT_API_KEY: ci-placeholder-not-a-real-key
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose config
+        run: docker compose config --quiet
+      - name: Build images (no run; no account secrets in CI)
+        run: docker compose build gpt-bridge bridge-console
