@@ -112,7 +112,7 @@ def looks_like_base64_image(value: str) -> bool:
 
 
 def download_image_input(url: str, metadata: dict[str, Any]) -> ImageInput:
-    request = UrlRequest(url, headers={"User-Agent": "chatgpt-api/0.1"})
+    request = UrlRequest(url, headers={"User-Agent": "gpt-bridge/0.1"})
     with urlopen(request, timeout=30) as response:  # noqa: S310 - local bridge intentionally accepts user-provided URLs.
         data = response.read()
         mime_type = response.headers.get_content_type() or str_or_none(metadata.get("mime_type")) or "image/png"

@@ -12,10 +12,13 @@ The currently verified text-model family is:
 - `gpt-5-5-thinking` with `standard`, `extended`, and `max` effort aliases
 - `gpt-5-5-pro` with `standard` and `extended` effort aliases when the account
   supports them
+- `gpt-5-6-sol-high`, which maps to `gpt-5-6-thinking` with
+  `thinking_effort=extended`. It is exposed only when that exact model/effort
+  pair appears in the account capture or its settings.
 
-`GPT-5.6 Sol` is a UI/display name observed by a user, not a verified backend
-identifier. Do not add `gpt-5-6`, `sol`, or a similar guessed alias solely from
-that display name.
+`GPT-5.6 Sol` was verified from a user-operated capture as
+`gpt-5-6-thinking` with `extended` effort. Do not infer additional GPT-5.6
+aliases or efforts from this one verified pair.
 
 ## Safe update checklist
 

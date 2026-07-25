@@ -4,7 +4,7 @@ import { stdin as procStdin, stdout as procStdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1";
-const DEFAULT_API_KEY = "local-dev-key";
+const DEFAULT_API_KEY = "";
 const DEFAULT_MODEL = "chatgpt-web/auto@optimized";
 
 const ansi = {
@@ -278,7 +278,7 @@ function printConnectionHelp(baseUrl) {
   );
   console.log("Local dev:");
   console.log(
-    `  CHATGPT_API_KEY=local-dev-key python3 -m chatgpt_api serve \\`,
+    `  CHATGPT_API_KEY=YOUR_LOCAL_KEY gpt-bridge serve \\`,
   );
   console.log(`    --accounts free-main,pro-main --account-strategy failover \\`);
   console.log(`    --host 127.0.0.1 --port 8000 \\`);
@@ -287,7 +287,7 @@ function printConnectionHelp(baseUrl) {
   console.log(`  bun --cwd apps/bridge-console dev\n`);
   console.log("Then:");
   console.log(
-    `  bun integrations/opencode/opencode-config.mjs --base-url ${quote(baseUrl)} --api-key local-dev-key`,
+    `  bun integrations/opencode/opencode-config.mjs --base-url ${quote(baseUrl)} --api-key YOUR_LOCAL_KEY`,
   );
 }
 
@@ -299,7 +299,7 @@ function printError(message) {
 
 function header(title) {
   console.log(
-    `${ansi.bold}${ansi.cyan}ChatGPT Web Bridge${ansi.reset} ${ansi.bold}${title}${ansi.reset}`,
+    `${ansi.bold}${ansi.cyan}GPT Bridge${ansi.reset} ${ansi.bold}${title}${ansi.reset}`,
   );
   console.log(
     `${ansi.dim}Only writes/removes opencode consumer config. It does not configure accounts or start the API server.${ansi.reset}\n`,

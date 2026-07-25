@@ -1,0 +1,136 @@
+import json
+
+import pytest
+
+import chatgpt_api.cli as cli
+from chatgpt_api.cli import main
+from chatgpt_api.core.errors import ProviderError
+from chatgpt_api.legacy_cli import translate_legacy_argv
+from chatgpt_api.worker.client import WorkerClient, validate_worker_base_url, validate_worker_path
+from chatgpt_api.worker.stack import compose_args
+from chatgpt_api.worker.storage import default_worker_data_dir
+
+
+def test_worker_client_is_loopback_only_and_preserves_v1_base():
+    assert WorkerClient("http://127.0.0.1:8000/v1").url_for("/models") == "http://127.0.0.1:8000/v1/models"
+    with pytest.raises(ProviderError, match="loopback"):
+        validate_worker_base_url("https://example.com/v1")
+    with pytest.raises(ProviderError, match="API-relative"):
+        validate_worker_path("https://example.com/models")
+
+
+def test_worker_defaults_map_legacy_bridge_environment(monkeypatch):
+    monkeypatch.delenv("CHATGPT_BASE_URL", raising=False)
+    monkeypatch.delenv("CHATGPT_API_KEY", raising=False)
+    monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:8012")
+    monkeypatch.setenv("BRIDGE_TOKEN", "legacy-token")
+
+    args = cli.build_parser().parse_args(["worker", "status"])
+
+    assert args.base_url == "http://127.0.0.1:8012/v1"
+    assert args.api_key == "legacy-token"
+
+
+def test_worker_chat_reuses_router_and_worker_thread_location(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append((method, path, body))
+        return {"choices": [{"message": {"content": "done"}}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["worker", "chat", "--message", "hello", "--thread", "job", "--threads-dir", str(tmp_path)]) == 0
+
+    assert calls[0][1] == "/chat/completions"
+    assert (tmp_path / "job.json").exists()
+    assert "done" in capsys.readouterr().out
+
+
+def test_worker_thread_commands_use_versioned_thread_files(tmp_path, capsys):
+    assert main(["worker", "thread", "list", "--threads-dir", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["threads"] == []
+
+    state_path = tmp_path / "task.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "name": "task", "compacted_summary": None, "messages": []}), encoding="utf-8"
+    )
+    assert main(["worker", "thread", "show", "task", "--threads-dir", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "task"
+    assert main(["worker", "thread", "clear", "task", "--threads-dir", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["cleared"] is True
+    assert not state_path.exists()
+
+
+def test_worker_report_preserves_model_authored_html_without_a_template(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    async def fake_request_json(self, method, path, body=None):
+        calls.append((method, path, body))
+        return {
+            "model": "auto",
+            "choices": [{"message": {"content": "<!doctype html><html><body><canvas id='chart'></canvas></body></html>"}}],
+        }
+
+    monkeypatch.setattr(cli.WorkerClient, "request_json", fake_request_json)
+    output = tmp_path / "analysis.html"
+
+    assert main(["worker", "report", "--prompt", "compare sales", "--title", "Sales", "--out", str(output), "--json"]) == 0
+
+    assert output.read_text(encoding="utf-8") == "<!doctype html><html><body><canvas id='chart'></canvas></body></html>\n"
+    assert calls[0][0:2] == ("POST", "/chat/completions")
+    assert "standalone HTML" in calls[0][2]["messages"][0]["content"]
+    assert json.loads(capsys.readouterr().out)["path"] == str(output.resolve())
+
+
+def test_worker_migrate_wcbridge_copies_threads_without_touching_source(tmp_path, capsys):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "new"
+    source.mkdir()
+    legacy_thread = source / "planning.json"
+    legacy_thread.write_text(
+        json.dumps(
+            [
+                {"role": "system", "content": "Keep it concise."},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        ["worker", "migrate", "wcbridge", "--source-dir", str(source), "--threads-dir", str(destination), "--json"]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["results"] == [{"name": "planning", "status": "migrated"}]
+    assert json.loads(legacy_thread.read_text(encoding="utf-8"))[0]["content"] == "Keep it concise."
+    migrated = json.loads((destination / "planning.json").read_text(encoding="utf-8"))
+    assert migrated["compacted_summary"] == "Keep it concise."
+    assert migrated["messages"] == [{"role": "user", "content": "first"}, {"role": "assistant", "content": "answer"}]
+
+
+def test_worker_stack_arguments_are_conservative():
+    assert compose_args("up") == ["compose", "up", "-d", "gpt-bridge"]
+    assert compose_args("down") == ["compose", "down"]
+    assert "--build" not in compose_args("up")
+    assert "-v" not in compose_args("down")
+
+
+def test_legacy_executable_translates_the_supported_command_contract():
+    assert translate_legacy_argv(["chat", "--message", "hi"]) == ["worker", "chat", "--message", "hi"]
+    assert translate_legacy_argv(["image", "--prompt", "cat", "--out", "cat.png"]) == [
+        "worker",
+        "image",
+        "--prompt",
+        "cat",
+        "--output-path",
+        "cat.png",
+    ]
+    assert translate_legacy_argv(["raw", "GET", "/v1/models"]) == ["worker", "request", "/models", "--method", "GET"]
+
+
+def test_worker_data_dir_uses_explicit_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHATGPT_WORKER_DATA_DIR", str(tmp_path))
+    assert default_worker_data_dir() == tmp_path

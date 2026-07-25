@@ -1,0 +1,18 @@
+{
+  "name": "gpt-bridge",
+  "version": "0.1.0",
+  "description": "Use a user-managed local GPT Bridge worker for chat, research, images, and rich reports.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GPT Bridge Worker",
+    "shortDescription": "Call a user-managed local GPT Bridge from Codex.",
+    "longDescription": "A local-worker plugin for routed chat, research, image generation, persistent task threads, and model-authored standalone HTML reports.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use the local GPT Bridge worker."
+  }
+}

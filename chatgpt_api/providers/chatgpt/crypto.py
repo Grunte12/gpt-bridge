@@ -74,9 +74,9 @@ def load_secrets_key(accounts_dir: Path) -> bytes:
        Docker/headless setups, but weaker than (1): the passphrase can end up
        in shell history, `.env` files, or process listings.
     3. A random key auto-generated on first use and stored next to the
-       accounts directory with owner-only (0600) permissions. Zero-config
-       default; protects against the capture file leaking on its own, but not
-       against a copy of the whole accounts directory.
+       accounts directory with owner-only (0600) permissions on POSIX.
+       Zero-config default; protects against the capture file leaking on its
+       own, but not against a copy of the whole accounts directory.
     """
 
     if _runtime_passphrase:

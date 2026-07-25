@@ -20,6 +20,8 @@ node_modules/
 *.log
 test-results/
 dist/
+!apps/bridge-console/dist/
+!apps/bridge-console/dist/**
 build/
 *.egg-info/
 debug_ai/

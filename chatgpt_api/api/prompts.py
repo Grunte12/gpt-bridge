@@ -5,6 +5,8 @@ request parsing, routing, and provider I/O in other modules so downstream users
 can audit or replace the agent prompt without touching the HTTP server.
 """
 
+DEFAULT_CONCISE_SYSTEM_PROMPT = """Answer the user's request directly and completely. Lead with the result. Omit greetings, filler, repetition, and restating the request. Include only the reasoning, caveats, and actionable detail needed for a correct first-pass answer. If information is missing or uncertain, say so briefly and state the best next action."""
+
 TOOL_BRIDGE_PROMPT = """You are behind a chat-completions-style tool-calling bridge for a coding agent.
 
 You cannot execute tools directly. The client will execute tool calls that you return.

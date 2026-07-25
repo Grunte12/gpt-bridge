@@ -22,10 +22,11 @@ const defaultConfigPath = resolve(scriptDir, "opencode.example.json");
 const defaultApiHost = "127.0.0.1";
 const defaultApiPort = "8000";
 const defaultBaseURL = "http://127.0.0.1:8000/v1";
-const defaultApiKey = "local-dev-key";
+const defaultApiKey = "";
 const defaultConfigHome = resolve(process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"));
 const defaultInstallConfigPath = resolve(defaultConfigHome, "opencode", "opencode.json");
-const defaultStatePath = resolve(defaultConfigHome, "chatgpt-api", "opencode-setup.json");
+const defaultStatePath = resolve(defaultConfigHome, "gpt-bridge", "opencode-setup.json");
+const legacyStatePath = resolve(defaultConfigHome, "chatgpt-api", "opencode-setup.json");
 const ansi = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
@@ -86,7 +87,7 @@ async function runConsumerConfig(parsedArgs, rawArgs) {
 }
 
 async function runOpencode(parsedArgs) {
-  const state = readJsonIfExists(resolve(parsedArgs.statePath || defaultStatePath));
+  const state = readJsonIfExists(resolveStatePath(parsedArgs.statePath));
   const baseModel =
     parsedArgs.model ||
     process.env.CHATGPT_OPENCODE_MODEL ||
@@ -102,7 +103,7 @@ async function runOpencode(parsedArgs) {
   const apiKey = parsedArgs.apiKey || process.env.CHATGPT_API_KEY || state.api_key || defaultApiKey;
   const baseURL = parsedArgs.baseURL || process.env.CHATGPT_OPENCODE_BASE_URL || state.base_url || defaultBaseURL;
   const configPath = resolve(parsedArgs.configPath || defaultConfigPath);
-  const tempDir = mkdtempSync(resolve(tmpdir(), "chatgpt-opencode-"));
+  const tempDir = mkdtempSync(resolve(tmpdir(), "gpt-bridge-opencode-"));
   const tempConfigPath = resolve(tempDir, "opencode.json");
 
   try {
@@ -168,7 +169,7 @@ async function runSetup(parsedArgs) {
     installConfigPath: resolve(parsedArgs.installConfigPath || defaultInstallConfigPath),
     limitStrategy: parsedArgs.limitStrategy || "auto",
     modelFallback: parsedArgs.modelFallback || "auto",
-    statePath: resolve(parsedArgs.statePath || defaultStatePath),
+    statePath: resolveStatePath(parsedArgs.statePath),
   };
 
   let answers = { ...defaults };
@@ -662,14 +663,17 @@ async function askModelScreen(rl, state, defaultModel, policy = modelPolicyForAc
     state,
     "Model group",
     defaults.group,
-    ["auto", "gpt-5.5", "thinking", "pro"],
-    "Choose the model family first. Effort appears only inside Thinking or Pro.",
+    ["auto", "gpt-5.5", "thinking", "pro", "sol-high"],
+    "Choose the model family first. Effort appears only inside Thinking or Pro. Sol High requires capture/settings evidence.",
   );
   if (group === "auto") {
     return "chatgpt-web/auto";
   }
   if (group === "gpt-5.5") {
     return "chatgpt-web/gpt-5-5";
+  }
+  if (group === "sol-high") {
+    return "chatgpt-web/gpt-5-6-sol-high";
   }
   if (group === "thinking") {
     const effort = await askChoiceScreen(
@@ -695,6 +699,9 @@ async function askModelScreen(rl, state, defaultModel, policy = modelPolicyForAc
 
 function modelDefaults(model) {
   const id = normalizeProviderModel(model).split("/", 2)[1] || "auto";
+  if (id.startsWith("gpt-5-6-sol-high")) {
+    return { group: "sol-high", thinkingEffort: "extended", proEffort: "extended" };
+  }
   if (id.startsWith("gpt-5-5-pro")) {
     return { group: "pro", thinkingEffort: "extended", proEffort: id.endsWith("standard") ? "standard" : "extended" };
   }
@@ -795,6 +802,9 @@ function choiceDescription(label, choice, state = {}) {
     }
     if (normalized === "pro") {
       return "Explicit GPT-5.5 Pro. Requires a Pro-capable account and is the most limit-sensitive choice.";
+    }
+    if (normalized === "sol-high") {
+      return "GPT-5.6 Sol High. Available only when the selected account capture or settings observed the verified backend model and effort.";
     }
   }
   if (label === "Thinking effort") {
@@ -1361,6 +1371,16 @@ function readJsonIfExists(path) {
   return readJsonFile(path);
 }
 
+function resolveStatePath(explicitPath) {
+  if (explicitPath) {
+    return resolve(explicitPath);
+  }
+  if (!existsSync(defaultStatePath) && existsSync(legacyStatePath)) {
+    return legacyStatePath;
+  }
+  return defaultStatePath;
+}
+
 function writeJsonWithBackup(path, data) {
   mkdirSync(dirname(path), { recursive: true });
   if (existsSync(path)) {
@@ -1432,7 +1452,7 @@ function serverCommand({ apiKey, accounts, strategy, agentMode, modelFallback, c
   const chatModeFlag = chatMode === "normal" ? " --normal-chat" : " --temporary-chat";
   const imageOutputFlag = imageOutputDir ? ` --image-output-dir ${shellQuote(imageOutputDir)}` : "";
   const researchOutputFlag = researchOutputDir ? ` --research-output-dir ${shellQuote(researchOutputDir)}` : "";
-  return `CHATGPT_API_KEY=${shellQuote(apiKey)} python3 -m chatgpt_api serve ${accountFlags} --port ${shellQuote(normalizePort(port))} --agent-mode ${shellQuote(agentMode)}${fallbackFlag}${chatModeFlag}${imageOutputFlag}${researchOutputFlag}`;
+  return `CHATGPT_API_KEY=${shellQuote(apiKey)} gpt-bridge serve ${accountFlags} --port ${shellQuote(normalizePort(port))} --agent-mode ${shellQuote(agentMode)}${fallbackFlag}${chatModeFlag}${imageOutputFlag}${researchOutputFlag}`;
 }
 
 function timestampSlug() {

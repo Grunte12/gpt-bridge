@@ -14,10 +14,12 @@ class OpenAICompatConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     api_key: str | None = None
+    cors_origins: tuple[str, ...] = ()
     impersonate: str = "safari18_4"
     agent_prompt_mode: str = "optimized"
     account_strategy: str = "auto"
     model_fallback: str | None = "auto"
+    concise_system_prompt: bool = True
     temporary_chat: bool = True
     image_output_dir: Path = Path("outputs/chatgpt-images")
     research_output_dir: Path = Path("outputs/chatgpt-research")

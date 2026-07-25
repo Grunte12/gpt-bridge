@@ -1,11 +1,13 @@
 import base64
 import http.client
+import io
 import json
 import threading
 from http.server import HTTPServer
 
 import pytest
 
+import chatgpt_api.api.admin as admin
 import chatgpt_api.api.openai_compat as compat
 from chatgpt_api.api.openai_compat import (
     AccountRouter,
@@ -50,6 +52,7 @@ def test_resolve_model_alias_maps_intelligence_presets():
     assert _resolve_model_alias("gpt-5-5-thinking-max", None) == ("gpt-5-5-thinking", "max")
     assert _resolve_model_alias("gpt-5-5-pro-standard", None) == ("gpt-5-5-pro", "standard")
     assert _resolve_model_alias("gpt-5-5-pro-extended", None) == ("gpt-5-5-pro", "extended")
+    assert _resolve_model_alias("gpt-5-6-sol-high", None) == ("gpt-5-6-thinking", "extended")
     assert _resolve_model_alias("chatgpt-deep-research", None) == ("auto", None)
     assert _resolve_model_alias("chatgpt-web/chatgpt-deep-research", None) == ("auto", None)
     assert _resolve_model_alias("auto", None) == ("auto", None)
@@ -60,6 +63,42 @@ def test_resolve_model_alias_does_not_infer_unverified_ui_model_names():
     # unknown name intact so capability validation can reject it rather than
     # silently sending a different model to the provider.
     assert _resolve_model_alias("gpt-5-6-sol", None) == ("gpt-5-6-sol", None)
+
+
+def test_models_for_account_advertises_captured_sol_high_and_validates_effort(tmp_path):
+    capture_dir = tmp_path / "accounts" / "sol"
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "chatgpt-request.txt").write_text(
+        'Request Data: {"action":"next","model":"gpt-5-6-thinking","thinking_effort":"extended"}',
+        encoding="utf-8",
+    )
+    config = OpenAICompatConfig(account="sol", accounts_dir=tmp_path / "accounts")
+
+    model_ids = {model["id"] for model in compat._models_for_account(config)}
+
+    assert "gpt-5-6-sol-high" in model_ids
+    assert "gpt-5-6-sol-high@optimized" in model_ids
+    assert "gpt-5-6-sol-high@opencode" in model_ids
+    assert compat._account_supports_model(config, "sol", "gpt-5-6-thinking", "extended") is True
+    assert compat._account_supports_model(config, "sol", "gpt-5-6-thinking", "standard") is False
+
+
+def test_models_for_account_hides_sol_high_without_the_verified_effort(tmp_path):
+    capture_dir = tmp_path / "accounts" / "sol"
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "chatgpt-request.txt").write_text(
+        'Request Data: {"action":"next","model":"gpt-5-6-thinking","thinking_effort":"standard"}',
+        encoding="utf-8",
+    )
+
+    model_ids = {
+        model["id"]
+        for model in compat._models_for_account(
+            OpenAICompatConfig(account="sol", accounts_dir=tmp_path / "accounts")
+        )
+    }
+
+    assert "gpt-5-6-sol-high" not in model_ids
 
 
 def test_resolve_image_model_alias_maps_openai_names_to_auto():
@@ -369,6 +408,36 @@ def test_admin_accounts_response_ignores_empty_account_dirs(tmp_path):
     assert [account["account"] for account in payload["accounts"]] == ["pro"]
 
 
+def test_console_url_prefers_explicit_console_url_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHATGPT_CONSOLE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setattr(admin, "project_root", lambda: tmp_path)
+    config = OpenAICompatConfig(account="free", host="127.0.0.1", port=8000)
+
+    assert compat._console_served_locally(config) is False
+    assert compat._console_url_for_config(config) == "http://127.0.0.1:8080"
+
+
+def test_console_url_falls_back_to_dev_server_without_built_dist(monkeypatch, tmp_path):
+    monkeypatch.delenv("CHATGPT_CONSOLE_URL", raising=False)
+    monkeypatch.setattr(admin, "project_root", lambda: tmp_path)
+    config = OpenAICompatConfig(account="free", host="127.0.0.1", port=8000)
+
+    assert compat._console_served_locally(config) is False
+    assert compat._console_url_for_config(config) == "http://127.0.0.1:5174"
+
+
+def test_console_url_serves_locally_when_dist_is_built(monkeypatch, tmp_path):
+    monkeypatch.delenv("CHATGPT_CONSOLE_URL", raising=False)
+    dist_dir = tmp_path / "apps" / "bridge-console" / "dist"
+    dist_dir.mkdir(parents=True)
+    (dist_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(admin, "project_root", lambda: tmp_path)
+    config = OpenAICompatConfig(account="free", host="0.0.0.0", port=8000)
+
+    assert compat._console_served_locally(config) is True
+    assert compat._console_url_for_config(config) == "http://127.0.0.1:8000/admin/"
+
+
 def test_provider_for_account_uses_chrome_impersonation_for_chrome_capture(tmp_path):
     capture_dir = tmp_path / "accounts" / "free-2"
     capture_dir.mkdir(parents=True)
@@ -428,6 +497,54 @@ def test_multi_account_chat_falls_back_after_provider_error(monkeypatch):
 
     assert calls == ["free", "pro"]
     assert response["choices"][0]["message"]["content"] == "ok from pro"
+
+
+def test_ordinary_chat_adds_concise_policy_only_when_no_system_message(monkeypatch):
+    seen = {}
+
+    class FakeProvider:
+        account = "pro"
+
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
+        seen["messages"] = messages
+        return "ok"
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider())
+    monkeypatch.setattr(compat, "_collect_messages_text", fake_collect_messages_text)
+
+    original = [{"role": "user", "content": "hello"}]
+    compat.asyncio.run(compat._chat_completion(OpenAICompatConfig(account="pro"), {"model": "auto", "messages": original}))
+
+    assert original == [{"role": "user", "content": "hello"}]
+    assert [message.role for message in seen["messages"]] == ["system", "user"]
+    assert "Omit greetings" in seen["messages"][0].content[0].text
+
+
+def test_ordinary_chat_preserves_explicit_system_message_and_can_be_disabled():
+    explicit = [{"role": "system", "content": "be detailed"}, {"role": "user", "content": "hello"}]
+
+    assert compat._ordinary_chat_messages(OpenAICompatConfig(account="pro"), explicit) is explicit
+    plain = [{"role": "user", "content": "hello"}]
+    assert compat._ordinary_chat_messages(OpenAICompatConfig(account="pro", concise_system_prompt=False), plain) is plain
+
+
+def test_ordinary_chat_preset_overrides_default_and_rejects_unknown_names():
+    messages = [{"role": "user", "content": "hello"}]
+
+    effective = compat._ordinary_chat_messages(
+        OpenAICompatConfig(account="pro"),
+        messages,
+        {"metadata": {"chatgpt_preset": "structured"}},
+    )
+
+    assert effective[0]["role"] == "system"
+    assert effective[0]["content"].startswith("Answer as a compact")
+    with pytest.raises(ValueError, match="unknown chatgpt_preset"):
+        compat._ordinary_chat_messages(
+            OpenAICompatConfig(account="pro"),
+            messages,
+            {"metadata": {"chatgpt_preset": "missing"}},
+        )
 
 
 def test_stream_disconnect_stops_chatgpt_conversation(monkeypatch):
@@ -605,6 +722,82 @@ def test_chat_falls_back_to_auto_model_after_empty_explicit_model(monkeypatch):
     assert calls == [("pro", "gpt-5-5-pro", "extended"), ("pro", "auto", None)]
     assert response["choices"][0]["message"]["content"] == "ok from auto"
     assert response["chatgpt_fallback_model"] == "auto"
+
+
+def test_plain_chat_falls_back_to_auto_model_after_recoverable_model_error(monkeypatch):
+    calls = []
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
+        calls.append((provider.account, model_slug, thinking_effort))
+        if model_slug == "gpt-5-5-pro":
+            raise ProviderError("ChatGPT conversation failed: 422 model limit")
+        return "ok from auto"
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_collect_messages_text", fake_collect_messages_text)
+    monkeypatch.setattr(compat, "_conversation_init_metadata", lambda provider, provider_model: compat.asyncio.sleep(0, result={}))
+
+    response = compat.asyncio.run(
+        compat._chat_completion(
+            OpenAICompatConfig(account="pro", accounts=("pro",), model_fallback="auto"),
+            {"model": "gpt-5-5-pro-extended", "messages": [{"role": "user", "content": "hello"}]},
+        )
+    )
+
+    assert calls == [("pro", "gpt-5-5-pro", "extended"), ("pro", "auto", None)]
+    assert response["choices"][0]["message"]["content"] == "ok from auto"
+    assert response["chatgpt_fallback_model"] == "auto"
+
+
+def test_plain_stream_retries_fallback_only_before_content_is_emitted(monkeypatch):
+    calls = []
+
+    class FakeProvider:
+        account = "pro"
+
+        async def stream_chat(self, request):
+            calls.append(request.model)
+            if request.model == "gpt-5-5-pro":
+                raise ProviderError("ChatGPT conversation failed: 422 model limit")
+            yield ChatDelta(text="ok from auto")
+
+    class FakeHandler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status):
+            return None
+
+        def send_header(self, name, value):
+            return None
+
+        def end_headers(self):
+            return None
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider())
+    monkeypatch.setattr(compat, "_conversation_init_metadata", lambda provider, provider_model: compat.asyncio.sleep(0, result={}))
+    handler = FakeHandler()
+
+    compat.asyncio.run(
+        compat._chat_completion_stream(
+            OpenAICompatConfig(account="pro", accounts=("pro",), model_fallback="auto"),
+            {"model": "gpt-5-5-pro-extended", "messages": [{"role": "user", "content": "hello"}]},
+            AccountRouter(("pro",)),
+            handler,
+        )
+    )
+
+    payloads = [
+        json.loads(line[5:])
+        for line in handler.wfile.getvalue().decode("utf-8").splitlines()
+        if line.startswith("data: {")
+    ]
+    assert calls == ["gpt-5-5-pro", "auto"]
+    assert any(payload.get("chatgpt_fallback_model") == "auto" for payload in payloads)
 
 
 def test_deep_research_uses_normal_chat_and_bypasses_tool_prompt(monkeypatch, tmp_path):
@@ -811,7 +1004,54 @@ def test_deep_research_preflight_limit_error_payload(monkeypatch):
     assert status == 400
     assert payload["error"]["code"] == "chatgpt_model_limit"
     assert payload["error"]["chatgpt_deep_research_limit"]["remaining"] == 0
+    assert [(attempt["account"], attempt["code"]) for attempt in payload["error"]["chatgpt_account_attempts"]] == [
+        ("free", "chatgpt_model_limit")
+    ]
     assert "2026-06-25T00:00:00+00:00" in payload["error"]["message"]
+
+
+def test_deep_research_runtime_rate_limit_fails_over_and_tracks_final_operation(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+    async def fake_init_metadata(provider, model):
+        return {"limits_progress": [{"feature_name": "deep_research", "remaining": 1}]}
+
+    async def fake_collect_deep_research_text(provider, prompt, model_slug, operation_id=None):
+        calls.append((provider.account, operation_id))
+        if provider.account == "free":
+            raise ProviderError("ChatGPT research failed: HTTP 429: rate limited")
+        return "research from pro", {"status": "completed"}
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_conversation_init_metadata", fake_init_metadata)
+    monkeypatch.setattr(compat, "_collect_deep_research_text", fake_collect_deep_research_text)
+
+    response = compat.asyncio.run(
+        compat._chat_completion(
+            OpenAICompatConfig(
+                account="free",
+                accounts=("free", "pro"),
+                account_strategy="failover",
+                research_output_dir=tmp_path,
+            ),
+            {
+                "model": "chatgpt-deep-research",
+                "messages": [{"role": "user", "content": "research this"}],
+                "chatgpt_operation_id": "chatgptop_research_failover",
+            },
+        )
+    )
+    status, payload = compat._get_chatgpt_operation("chatgptop_research_failover")
+
+    assert calls == [("free", "chatgptop_research_failover"), ("pro", "chatgptop_research_failover")]
+    assert response["chatgpt_account"] == "pro"
+    assert status == 200
+    assert payload["operation"]["account"] == "pro"
+    assert payload["operation"]["completed"] is True
 
 
 def test_account_usage_response_summarizes_remaining(monkeypatch):
@@ -1180,6 +1420,11 @@ def test_download_file_route_supports_head_and_get(tmp_path):
 
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("HEAD", download_path.split("?", 1)[0])
+        unauthorized_response = conn.getresponse()
+        unauthorized_response.read()
+        assert unauthorized_response.status == 401
+
         conn.request("HEAD", download_path)
         head_response = conn.getresponse()
         head_response.read()
@@ -1192,6 +1437,35 @@ def test_download_file_route_supports_head_and_get(tmp_path):
         get_response = conn.getresponse()
         assert get_response.status == 200
         assert get_response.read() == b"png-bytes"
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_cors_only_allows_configured_console_origin():
+    server = HTTPServer(
+        ("127.0.0.1", 0),
+        compat._handler_class(
+            OpenAICompatConfig(account="test", api_key="test-key", cors_origins=("http://127.0.0.1:8080",))
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("OPTIONS", "/v1/models", headers={"Origin": "http://127.0.0.1:8080"})
+        allowed = conn.getresponse()
+        allowed.read()
+        assert allowed.status == 204
+        assert allowed.getheader("Access-Control-Allow-Origin") == "http://127.0.0.1:8080"
+
+        conn.request("OPTIONS", "/v1/models", headers={"Origin": "https://example.test"})
+        denied = conn.getresponse()
+        denied.read()
+        assert denied.status == 403
+        assert denied.getheader("Access-Control-Allow-Origin") is None
     finally:
         conn.close()
         server.shutdown()
@@ -1271,7 +1545,7 @@ def test_chat_image_request_does_not_repeat_after_assistant_response(monkeypatch
 def test_chat_image_intercept_ignores_structured_game_prompt():
     prompt = json.dumps(
         {
-            "task": "Continue one turn of an interactive character game.",
+            "task": "Continue one turn of an interactive local workflow.",
             "output_contract": {
                 "reply": "assistant dialogue",
                 "state_patch": {},
@@ -1435,6 +1709,67 @@ def test_image_edit_prioritizes_account_with_file_upload_capacity(monkeypatch, t
     assert image_calls == ["pro"]
     assert response["chatgpt_account"] == "pro"
     assert response["data"][0]["download_url"]
+
+
+def test_image_edit_cancellation_stops_selected_account_without_failover(monkeypatch, tmp_path):
+    image_path = tmp_path / "ref.png"
+    image_path.write_bytes(b"ref")
+    image_calls = []
+    stop_calls = []
+
+    class FakeTransport:
+        def stop_conversation(self, conversation_id, *, exclude_async_types=None):
+            stop_calls.append((conversation_id, exclude_async_types))
+            return {"status": "ok"}
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+            self.transport = FakeTransport()
+
+        async def generate_image(self, request):
+            image_calls.append(self.account)
+            request.metadata["on_conversation_id"]("conversation-1")
+            status, _ = compat._cancel_chatgpt_operation("chatgptop_image_cancel")
+            assert status == 200
+            assert request.metadata["cancel_requested"]() is True
+            raise ProviderError("ChatGPT image operation cancelled")
+
+    async def fake_init_metadata(provider, model):
+        return {"limits_progress": [{"feature_name": "image_gen", "remaining": 1}]}
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_conversation_init_metadata", fake_init_metadata)
+
+    with pytest.raises(OpenAICompatProviderError) as raised:
+        compat.asyncio.run(
+            _image_edit(
+                OpenAICompatConfig(
+                    account="free",
+                    accounts=("free", "pro"),
+                    account_strategy="failover",
+                    image_output_dir=tmp_path,
+                ),
+                {
+                    "model": "auto",
+                    "prompt": "edit this icon",
+                    "images": [str(image_path)],
+                    "chatgpt_operation_id": "chatgptop_image_cancel",
+                },
+            )
+        )
+
+    status, error_payload = _provider_error_status_and_payload(raised.value)
+    operation_status, operation_payload = compat._get_chatgpt_operation("chatgptop_image_cancel")
+
+    assert image_calls == ["free"]
+    assert stop_calls == [("conversation-1", ["pro_mode"])]
+    assert status == 499
+    assert error_payload["error"]["code"] == "chatgpt_operation_cancelled"
+    assert [attempt["account"] for attempt in error_payload["error"]["chatgpt_account_attempts"]] == ["free"]
+    assert operation_status == 200
+    assert operation_payload["operation"]["cancel_requested"] is True
+    assert operation_payload["operation"]["completed"] is True
 
 
 def test_models_for_config_includes_openai_image_alias(monkeypatch):

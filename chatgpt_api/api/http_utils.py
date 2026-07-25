@@ -30,14 +30,30 @@ def read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return parsed
 
 
+def cors_origin_allowed(handler: BaseHTTPRequestHandler) -> bool:
+    headers = getattr(handler, "headers", {})
+    origin = headers.get("origin", "").rstrip("/")
+    allowed = {str(value).rstrip("/") for value in getattr(handler, "cors_allowed_origins", ())}
+    return bool(origin and origin in allowed)
+
+
 def send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
-    handler.send_header("Access-Control-Allow-Origin", "*")
+    if not cors_origin_allowed(handler):
+        return
+    origin = getattr(handler, "headers", {}).get("origin", "").rstrip("/")
+    handler.send_header("Access-Control-Allow-Origin", origin)
+    handler.send_header("Vary", "Origin")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
     handler.send_header("Access-Control-Expose-Headers", "X-ChatGPT-Operation-Id")
 
 
 def send_cors_preflight(handler: BaseHTTPRequestHandler) -> None:
+    if not cors_origin_allowed(handler):
+        handler.send_response(403)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
     handler.send_response(204)
     send_cors_headers(handler)
     handler.send_header("Content-Length", "0")

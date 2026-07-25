@@ -40,8 +40,9 @@ def test_load_secrets_key_creates_owner_only_key_file(tmp_path):
     assert key_one == key_two
     key_path = accounts_dir / ".master.key"
     assert key_path.exists()
-    mode = stat.S_IMODE(os.stat(key_path).st_mode)
-    assert mode == 0o600
+    if os.name != "nt":
+        mode = stat.S_IMODE(os.stat(key_path).st_mode)
+        assert mode == 0o600
 
 
 def test_load_secrets_key_from_passphrase_is_deterministic(tmp_path, monkeypatch):

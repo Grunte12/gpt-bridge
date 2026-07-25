@@ -16,6 +16,8 @@ PROFILE_CLAIMS_KEY = "https://api.openai.com/profile"
 CORE_MODEL = "gpt-5-5"
 THINKING_MODEL = "gpt-5-5-thinking"
 PRO_MODEL = "gpt-5-5-pro"
+SOL_THINKING_MODEL = "gpt-5-6-thinking"
+SOL_HIGH_EFFORT = "extended"
 MODEL_ALIASES = {"auto"}
 PRIMARY_SUPPORTED_MODELS = [CORE_MODEL, THINKING_MODEL, PRO_MODEL]
 AUTO_ONLY_PLAN_TYPES = {"free", "go"}
@@ -105,10 +107,13 @@ def infer_account_capabilities(info: ChatGPTAccountInfo) -> dict[str, Any]:
         _append_unique(supported_models, THINKING_MODEL)
     if _allows_pro_model(info):
         _append_unique(supported_models, PRO_MODEL)
+    if _allows_sol_high_model(info):
+        _append_unique(supported_models, SOL_THINKING_MODEL)
 
     default_model = _default_supported_model(info, supported_models)
     thinking_efforts = _thinking_efforts(info) if THINKING_MODEL in supported_models else []
     pro_efforts = _pro_efforts(info) if PRO_MODEL in supported_models else []
+    sol_efforts = _sol_efforts(info) if SOL_THINKING_MODEL in supported_models else []
 
     return {
         "plan_type": info.plan_type,
@@ -119,6 +124,8 @@ def infer_account_capabilities(info: ChatGPTAccountInfo) -> dict[str, Any]:
         "thinking_efforts": thinking_efforts,
         "pro_model": PRO_MODEL if PRO_MODEL in supported_models else None,
         "pro_efforts": pro_efforts,
+        "sol_model": SOL_THINKING_MODEL if SOL_THINKING_MODEL in supported_models else None,
+        "sol_efforts": sol_efforts,
         "backend_reasoning_efforts": info.settings_available_reasoning_efforts,
         "auto_model": "auto",
         "auto_only": bool(auto_only_reason),
@@ -355,6 +362,12 @@ def _allows_pro_model(info: ChatGPTAccountInfo) -> bool:
     return PRO_MODEL in info.observed_models
 
 
+def _allows_sol_high_model(info: ChatGPTAccountInfo) -> bool:
+    """Require an exact per-account capture before exposing GPT-5.6 Sol High."""
+
+    return SOL_HIGH_EFFORT in _model_efforts(info, SOL_THINKING_MODEL)
+
+
 def _model_efforts(info: ChatGPTAccountInfo, model: str) -> list[str]:
     efforts: list[str] = []
     if info.request_model == model:
@@ -382,3 +395,11 @@ def _thinking_efforts(info: ChatGPTAccountInfo) -> list[str]:
     for effort in _model_efforts(info, THINKING_MODEL):
         _append_unique(efforts, effort)
     return efforts
+
+
+def _sol_efforts(info: ChatGPTAccountInfo) -> list[str]:
+    return [
+        effort
+        for effort in _model_efforts(info, SOL_THINKING_MODEL)
+        if effort == SOL_HIGH_EFFORT
+    ]

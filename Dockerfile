@@ -44,7 +44,7 @@ RUN useradd --create-home --uid 10001 appuser
 COPY --from=build /wheels /wheels
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-index --find-links=/wheels chatgpt-api \
+    && python -m pip install --no-index --find-links=/wheels gpt-bridge \
     && rm -rf /wheels
 
 RUN mkdir -p /data/secrets/accounts /data/outputs/chatgpt-images /data/outputs/chatgpt-research \
@@ -57,4 +57,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os, urllib.request; port=os.environ.get('CHATGPT_API_PORT','8000'); req=urllib.request.Request(f'http://127.0.0.1:{port}/health'); key=os.environ.get('CHATGPT_API_KEY'); req.add_header('Authorization', f'Bearer {key}') if key else None; urllib.request.urlopen(req, timeout=4).read()"
 
-CMD ["chatgpt-api", "server", "start"]
+CMD ["gpt-bridge", "server", "start"]

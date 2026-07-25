@@ -1,8 +1,11 @@
 import argparse
+import json
 from pathlib import Path
 
 import chatgpt_api.cli as cli
 from chatgpt_api.cli import main
+from chatgpt_api.core.errors import ProviderError
+from chatgpt_api.core.types import ChatDelta, ImageAsset, ImageResponse
 from chatgpt_api.providers.chatgpt.crypto import (
     clear_runtime_passphrase,
     decrypt_text,
@@ -67,6 +70,46 @@ def test_accounts_lists_profiles(tmp_path, capsys):
     assert "free: capture=yes" in output
 
 
+def test_auth_status_reports_only_non_secret_local_state(tmp_path, capsys):
+    capture_path = tmp_path / "main" / "chatgpt-request.txt"
+    capture_path.parent.mkdir()
+    key = load_secrets_key(tmp_path)
+    capture_path.write_text(encrypt_text("Authorization: Bearer private-token", key), encoding="utf-8")
+
+    exit_code = main(["auth", "status", "--accounts-dir", str(tmp_path), "--json"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert '"account": "main"' in output
+    assert '"encrypted": true' in output
+    assert "private-token" not in output
+
+
+def test_auth_login_requires_explicit_consent_outside_an_interactive_terminal(tmp_path, capsys):
+    exit_code = main(
+        [
+            "auth",
+            "login",
+            "--account",
+            "main",
+            "--accounts-dir",
+            str(tmp_path),
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--api-key",
+            "test-key",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "needs --yes" in capsys.readouterr().err
+
+
+def test_gpt_bridge_parser_uses_the_memorable_command_name():
+    assert cli.build_parser(prog="gpt-bridge").prog == "gpt-bridge"
+
+
 def test_doctor_json_reports_missing_setup_without_crashing(tmp_path, capsys):
     exit_code = main(
         [
@@ -77,7 +120,7 @@ def test_doctor_json_reports_missing_setup_without_crashing(tmp_path, capsys):
             "--base-url",
             "http://127.0.0.1:9/v1",
             "--api-key",
-            "local-dev-key",
+            "test-local-key",
         ]
     )
 
@@ -85,21 +128,34 @@ def test_doctor_json_reports_missing_setup_without_crashing(tmp_path, capsys):
     assert exit_code == 1
     assert '"object": "chatgpt.doctor"' in output
     assert '"account_profiles"' in output
-    assert "local-dev-key" not in output
+    assert "test-local-key" not in output
 
 
 def test_server_command_prints_start_command(capsys):
-    exit_code = main(["server", "command", "--preset", "local", "--api-key", "local-dev-key"])
+    exit_code = main(["server", "command", "--preset", "local", "--api-key", "test-local-key"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "python3 -m chatgpt_api server start" in output
+    assert "gpt-bridge server start" in output
     assert "--accounts" not in output
-    assert "local-dev-key" in output
+    assert "test-local-key" in output
+
+
+def test_serve_concise_system_prompt_flag_and_environment(monkeypatch):
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["serve", "--no-concise-system-prompt"]).concise_system_prompt is False
+    monkeypatch.setenv("CHATGPT_CONCISE_SYSTEM_PROMPT", "false")
+    assert cli.build_parser().parse_args(["serve"]).concise_system_prompt is False
+
+
+def test_serve_rejects_the_known_insecure_default_key(capsys):
+    assert main(["serve", "--api-key", "local-dev-key"]) == 2
+    assert "local-dev-key is not allowed" in capsys.readouterr().err
 
 
 def test_server_command_keeps_explicit_account_pool(capsys):
-    exit_code = main(["server", "command", "--preset", "local", "--accounts", "go,plus-main", "--api-key", "local-dev-key"])
+    exit_code = main(["server", "command", "--preset", "local", "--accounts", "go,plus-main", "--api-key", "test-local-key"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
@@ -114,7 +170,7 @@ def test_server_command_accepts_launch_overrides(capsys):
             "--preset",
             "local",
             "--api-key",
-            "local-dev-key",
+            "test-local-key",
             "--host",
             "127.0.0.1",
             "--port",
@@ -194,6 +250,8 @@ def test_api_chat_posts_route_override_to_bridge_router(monkeypatch, capsys):
             "--temporary-chat",
             "--agent-mode",
             "opencode",
+            "--preset",
+            "structured",
         ]
     )
 
@@ -204,7 +262,24 @@ def test_api_chat_posts_route_override_to_bridge_router(monkeypatch, capsys):
     assert calls["body"]["chatgpt_account"] == "pro"
     assert calls["body"]["metadata"]["chatgpt_temporary_chat"] is True
     assert calls["body"]["metadata"]["agent_mode"] == "opencode"
+    assert calls["body"]["metadata"]["chatgpt_preset"] == "structured"
     assert "ok from router" in output
+
+
+def test_direct_chat_resolves_preset_locally(monkeypatch, capsys):
+    seen = {}
+
+    class FakeProvider:
+        async def stream_chat(self, request):
+            seen["messages"] = request.messages
+            return
+            yield
+
+    monkeypatch.setattr(cli, "_provider_from_chat_args", lambda args, capture_path: FakeProvider())
+
+    assert main(["chat", "--message", "hello", "--preset", "thai-content"]) == 0
+    assert seen["messages"][0].role == "system"
+    assert "natural, polished Thai" in seen["messages"][0].content[0].text
 
 
 def test_api_image_saves_locally_without_sending_host_output_path(tmp_path, monkeypatch, capsys):
@@ -253,6 +328,56 @@ def test_api_image_saves_locally_without_sending_host_output_path(tmp_path, monk
     saved = output_dir / "generated.png"
     assert saved.read_bytes() == b"png-bytes"
     assert f"local_path[1]={saved.resolve()}" in output
+
+
+def test_api_image_enhancement_uses_expanded_prompt_and_surfaces_it(monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append((path, body))
+        if path == "/chat/completions":
+            assert body["messages"][0]["role"] == "system"
+            return {"choices": [{"message": {"content": "expanded cinematic prompt"}}]}
+        assert body["prompt"] == "expanded cinematic prompt"
+        return {"data": [{"url": "https://example.test/image.png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["api", "image", "--prompt", "a cat", "--enhance", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [path for path, _body in calls] == ["/chat/completions", "/images/generations"]
+    assert payload["chatgpt_enhancement_applied"] is True
+    assert payload["chatgpt_enhanced_prompt"] == "expanded cinematic prompt"
+
+
+def test_api_image_enhancement_failure_uses_raw_prompt_with_visible_warning(monkeypatch, capsys):
+    async def fake_api_request_json(args, method, path, body):
+        if path == "/chat/completions":
+            raise ProviderError("enhancer unavailable")
+        assert body["prompt"] == "a cat"
+        return {"data": [{"url": "https://example.test/image.png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["api", "image", "--prompt", "a cat", "--enhance", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["chatgpt_enhancement_applied"] is False
+    assert "enhancer unavailable" in payload["chatgpt_enhancement_error"]
+
+
+def test_direct_image_enhancement_uses_expanded_prompt(monkeypatch, capsys):
+    class FakeProvider:
+        async def stream_chat(self, request):
+            yield ChatDelta(text="expanded direct prompt")
+
+        async def generate_image(self, request):
+            assert request.prompt == "expanded direct prompt"
+            return ImageResponse(images=[ImageAsset(url="https://example.test/image.png")], prompt=request.prompt)
+
+    monkeypatch.setattr(cli, "_provider_from_chat_args", lambda args, capture_path: FakeProvider())
+
+    assert main(["image", "--prompt", "a cat", "--enhance"]) == 0
+    assert "prompt_enhancement=applied" in capsys.readouterr().out
 
 
 def test_api_edit_saves_locally_without_sending_host_output_path(tmp_path, monkeypatch):

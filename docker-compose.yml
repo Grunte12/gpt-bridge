@@ -1,12 +1,15 @@
+name: gpt-bridge
+
 services:
-  chatgpt-api:
+  gpt-bridge:
     build:
       context: .
-    image: chatgpt-api:local
+    image: gpt-bridge:local
     environment:
       CHATGPT_API_HOST: 0.0.0.0
       CHATGPT_API_PORT: 8000
-      CHATGPT_API_KEY: ${CHATGPT_API_KEY:-local-dev-key}
+      CHATGPT_API_KEY: ${CHATGPT_API_KEY:?Set a unique CHATGPT_API_KEY in .env before starting Docker}
+      CHATGPT_CORS_ORIGINS: ${CHATGPT_CORS_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080}
       # Optional local account aliases under secrets/accounts. Leave blank to auto-discover every saved capture.
       CHATGPT_ACCOUNT: ${CHATGPT_ACCOUNT:-}
       CHATGPT_ACCOUNTS: ${CHATGPT_ACCOUNTS:-}
@@ -27,7 +30,7 @@ services:
       CHATGPT_CONSOLE_URL: ${CHATGPT_CONSOLE_URL:-http://127.0.0.1:8080}
       CHATGPT_CONSOLE_COMMAND: ${CHATGPT_CONSOLE_COMMAND:-docker compose up -d bridge-console}
     ports:
-      - "${CHATGPT_API_PORT:-8000}:8000"
+      - "127.0.0.1:${CHATGPT_API_PORT:-8000}:8000"
     volumes:
       - ./secrets/accounts:/data/secrets/accounts
       - ./outputs:/data/outputs
@@ -36,32 +39,9 @@ services:
   bridge-console:
     build:
       context: ./apps/bridge-console
-    image: chatgpt-bridge-console:local
+    image: gpt-bridge-console:local
     depends_on:
-      - chatgpt-api
+      - gpt-bridge
     ports:
-      - "${BRIDGE_CONSOLE_PORT:-8080}:80"
-    restart: unless-stopped
-
-  character-game:
-    build:
-      context: ./apps/character-game
-    image: chatgpt-character-game:local
-    depends_on:
-      - chatgpt-api
-    environment:
-      HOST: 0.0.0.0
-      PORT: 3000
-      CHATGAME_OPENAI_BASE_URL: http://chatgpt-api:8000/v1
-      CHATGAME_PUBLIC_OPENAI_BASE_URL: ${CHATGPT_PUBLIC_BASE_URL:-http://127.0.0.1:8000/v1}
-      CHATGAME_OPENAI_API_KEY: ${CHATGPT_API_KEY:-local-dev-key}
-      CHATGAME_CHAT_MODEL: ${CHATGAME_CHAT_MODEL:-chatgpt-web/auto}
-      CHATGAME_IMAGE_MODEL: ${CHATGAME_IMAGE_MODEL:-chatgpt-web/auto}
-      CHATGAME_AI_MODE: ${CHATGAME_AI_MODE:-live}
-      CHATGAME_DB_PATH: /data/chatgame.sqlite
-      CHATGAME_IMAGE_DIR: /data/images
-    ports:
-      - "${CHARACTER_GAME_PORT:-3000}:3000"
-    volumes:
-      - ./outputs/character-game:/data
+      - "127.0.0.1:${BRIDGE_CONSOLE_PORT:-8080}:80"
     restart: unless-stopped

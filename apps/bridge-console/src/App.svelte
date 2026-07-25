@@ -12,7 +12,7 @@
   import ResponseFieldGuide from "./lib/ResponseFieldGuide.svelte";
   import Textarea from "./lib/Textarea.svelte";
 
-  const DEFAULT_API_KEY = "local-dev-key";
+  const DEFAULT_API_KEY = "";
   const DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1";
   const LOCAL_API_HOST = "127.0.0.1";
   const LOCAL_API_PORT = "8000";
@@ -38,11 +38,6 @@
   };
   const HOST_OPTIONS = [
     ["127.0.0.1", "Local only", "Only this machine can call the API."],
-    [
-      "0.0.0.0",
-      "LAN / Docker",
-      "Listen on every interface. Set Public base URL to a reachable LAN URL.",
-    ],
   ] as const;
   const PORT_OPTIONS = [
     ["8000", "Default API"],
@@ -241,7 +236,7 @@
           defaultValue: "url",
           meaning:
             "Controls response shape. url returns a bridge download URL after saving the file locally.",
-          recommended: "url for browser apps and LAN clients.",
+          recommended: "url for a browser on this same machine.",
           gotcha:
             "The bridge saves completed images only. If no image asset comes back, no library item should appear.",
         },
@@ -251,9 +246,9 @@
           defaultValue: "server image output dir",
           meaning: "Directory where generated images are saved.",
           recommended:
-            "Use a mounted volume in Docker, for example /data/chatgpt-api/images.",
+            "Use a mounted volume in Docker, for example /data/outputs/chatgpt-images.",
           gotcha:
-            "LAN users need Public base URL configured or the returned 127.0.0.1 URL will point at their own machine.",
+            "The returned URL is intentionally local to this machine.",
         },
         {
           name: "output_path / path",
@@ -529,7 +524,7 @@
   const LAUNCH_FIELD_GUIDES = [
     [
       "Host",
-      "Where the API listens. 127.0.0.1 is local-only; 0.0.0.0 is for LAN/Docker.",
+      "Where the API listens. GPT Bridge supports 127.0.0.1 only.",
     ],
     [
       "Port",
@@ -537,11 +532,11 @@
     ],
     [
       "API key",
-      "Bearer token clients must send. Default dev key is local-dev-key; change it before LAN use.",
+      "Bearer token clients must send. Copy the unique local key from .env; this product has no supported LAN mode.",
     ],
     [
       "Public base URL",
-      "The URL clients and download links should use. For LAN, use the machine IP, not 127.0.0.1.",
+      "The local API URL used by this Console and local download links.",
     ],
     [
       "Primary account",
@@ -662,7 +657,7 @@
     ["limits", "Limits", "Per-plan and per-account runtime throttles"],
     ["api-docs", "Docs", "API, CLI, Docker, and route examples"],
     ["storage", "Library", "Preview generated images and reports"],
-    ["opencode", "opencode", "Local inject and LAN client setup"],
+    ["opencode", "opencode", "Local consumer configuration"],
     ["settings", "Launch", "Server presets and command builder"],
   ] as const;
 
@@ -752,6 +747,13 @@
       live: liveByAccount[account.account],
     })),
   );
+  // `accounts` always lists every configured routing alias, including a
+  // placeholder like "free" the server falls back to with nothing saved yet
+  // (capture_exists: false). Use this to detect a genuine zero-account
+  // first-run state instead of `mergedAccounts.length`.
+  const savedAccountCount = $derived(
+    mergedAccounts.filter((account) => account.capture_exists).length,
+  );
   const accountNames = $derived(
     Array.from(new Set(accounts.map((account) => account.account))).filter(Boolean),
   );
@@ -789,7 +791,6 @@
     `bun integrations/opencode/opencode-config.mjs --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
   );
   const consoleCommand = $derived("bun --cwd apps/bridge-console dev");
-  const consoleLanCommand = $derived("bun --cwd apps/bridge-console dev:lan");
   const opencodeLanJson = $derived(buildOpencodeProviderJson());
   const opencodeLanCurl = $derived(
     curl("POST", "/chatgpt/admin/opencode/inject", {
@@ -1423,19 +1424,12 @@
     saveConnection();
   }
 
-  function applyServerPreset(preset: "local" | "lan" | "pro" | "free") {
+  function applyServerPreset(preset: "local" | "pro" | "free") {
     selectedPreset = preset;
     if (preset === "local") {
       serverHost = LOCAL_API_HOST;
       serverPort = LOCAL_API_PORT;
       serverPublicBase = `http://${LOCAL_API_HOST}:${LOCAL_API_PORT}/v1`;
-      serverStrategy = "failover";
-      serverAccounts = "";
-      serverAccount = "";
-    } else if (preset === "lan") {
-      serverHost = "0.0.0.0";
-      serverPort = LOCAL_API_PORT;
-      serverPublicBase = `http://YOUR-LAN-IP:${LOCAL_API_PORT}/v1`;
       serverStrategy = "failover";
       serverAccounts = "";
       serverAccount = "";
@@ -1465,12 +1459,6 @@
         title: "Local dev",
         body: "Use this machine only. Good default for testing the bridge and console.",
         values: "host 127.0.0.1 · accounts auto-discover · failover",
-      },
-      {
-        id: "lan",
-        title: "LAN share",
-        body: "Let phones or another computer call this API through your LAN IP.",
-        values: "host 0.0.0.0 · public URL needs LAN IP",
       },
       {
         id: "pro",
@@ -1742,35 +1730,35 @@
         title: "Check running server",
         note: "Use this first inside Docker, SSH, or a headless box.",
         code: shell(
-          `python3 -m chatgpt_api admin status --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge admin status --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "List live usage",
         note: "Fetches the same usage table as /chatgpt:usage without opening the web console.",
         code: shell(
-          `python3 -m chatgpt_api admin usage --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge admin usage --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "API health from CLI",
         note: "Read-only consumer check. This goes through the same /v1 server target as apps.",
         code: shell(
-          `python3 -m chatgpt_api api health --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge api health --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "API chat with routing",
         note: "Tests the real app route with per-request accounts and strategy overrides.",
         code: shell(
-          `python3 -m chatgpt_api api chat --message 'Reply with exactly: bridge ok' --account-strategy random --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge api chat --message 'Reply with exactly: bridge ok' --account-strategy random --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "API image generation",
         note: "Calls /v1/images/generations and saves only completed image artifacts.",
         code: shell(
-          `python3 -m chatgpt_api api image --prompt 'small blue app icon, no text' --output-dir ./outputs/manual-images --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge api image --prompt 'small blue app icon, no text' --output-dir ./outputs/manual-images --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
@@ -1778,9 +1766,9 @@
         note: "Start with a known operation id, poll until deep_research_ready=yes, then cancel from another terminal if needed.",
         code: shell(
           [
-            `python3 -m chatgpt_api api research --prompt 'Briefly research whether LLMs could reach AGI.' --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
-            `python3 -m chatgpt_api api operation --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
-            `python3 -m chatgpt_api api cancel --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+            `gpt-bridge api research --prompt 'Briefly research whether LLMs could reach AGI.' --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+            `gpt-bridge api operation --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+            `gpt-bridge api cancel --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
           ].join("\n"),
         ),
       },
@@ -1788,21 +1776,21 @@
         title: "Set runtime limits",
         note: "Persists per-plan/per-account throttles into the admin SQLite DB.",
         code: shell(
-          `python3 -m chatgpt_api admin set-limits --chat free=1,go=2,plus=3,pro=4 --upload free=1,go=1,plus=1,pro=1 --image free=1,go=1,plus=2,pro=3 --research free=1,go=1,plus=2,pro=2 --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge admin set-limits --chat free=1,go=2,plus=3,pro=4 --upload free=1,go=1,plus=1,pro=1 --image free=1,go=1,plus=2,pro=3 --research free=1,go=1,plus=2,pro=2 --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "Save account capture",
         note: "Fails before writing if the copied request is incomplete. Use it to refresh an expired account capture safely.",
         code: shell(
-          `python3 -m chatgpt_api admin account add --account main-free --capture-file ./chatgpt-request.txt --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge admin account add --account main-free --capture-file ./chatgpt-request.txt --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
         title: "Inject opencode",
         note: "Only writes opencode consumer config. It does not configure accounts, ports, or quotas.",
         code: shell(
-          `python3 -m chatgpt_api admin opencode inject --model chatgpt-web/auto@optimized --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `gpt-bridge admin opencode inject --model chatgpt-web/auto@optimized --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
@@ -1820,7 +1808,7 @@
             `CHATGPT_UPLOAD_CONCURRENCY=free=1,go=1,plus=1,pro=1 \\`,
             `CHATGPT_RESEARCH_CONCURRENCY=free=1,go=1,plus=2,pro=2 \\`,
             `CHATGPT_ADMIN_DB_PATH=${quoteShell(adminDbPath)} \\`,
-            `python3 -m chatgpt_api serve`,
+            `gpt-bridge serve`,
           ].join("\n"),
         ),
       },
@@ -1880,7 +1868,7 @@
       },
       {
         title: "Image response",
-        body: "Use download_url for browser/LAN clients. path is only useful on the same machine that runs the API.",
+        body: "Use download_url in a browser on this machine. path is only useful to a process on the same machine.",
         code: JSON.stringify(
           {
             created: 1782320000,
@@ -1890,7 +1878,7 @@
               {
                 url: `${fileBase}/chatgpt/files/file_cat/cat.png`,
                 download_url: `${fileBase}/chatgpt/files/file_cat/cat.png`,
-                path: "/Users/work/Desktop/chatgpt-api/outputs/chatgpt-images/cat.png",
+                path: "/Users/work/Desktop/gpt-bridge/outputs/chatgpt-images/cat.png",
                 filename: "cat.png",
                 content_type: "image/png",
               },
@@ -1917,7 +1905,7 @@
               {
                 url: `${fileBase}/chatgpt/files/file_edit/edited.png`,
                 download_url: `${fileBase}/chatgpt/files/file_edit/edited.png`,
-                path: "/Users/work/Desktop/chatgpt-api/outputs/chatgpt-images/edited.png",
+                path: "/Users/work/Desktop/gpt-bridge/outputs/chatgpt-images/edited.png",
                 filename: "edited.png",
                 content_type: "image/png",
               },
@@ -1979,7 +1967,7 @@
             model: "chatgpt-deep-research",
             chatgpt_account: "research-pro",
             chatgpt_research_report_path:
-              "/Users/work/Desktop/chatgpt-api/outputs/chatgpt-research/agi-report.md",
+              "/Users/work/Desktop/gpt-bridge/outputs/chatgpt-research/agi-report.md",
             chatgpt_research_report_download_url: `${fileBase}/chatgpt/files/file_report/agi-report.md`,
             choices: [
               {
@@ -2153,7 +2141,7 @@
         kind: "download",
         read: "binary file body",
         files: "Works for images and markdown reports",
-        operation: "Use public_base_url for LAN clients. URLs restore from the admin DB after API restart when the file still exists.",
+        operation: "URLs restore from the admin DB after API restart when the file still exists.",
         response: "GET returns the file body. HEAD returns Content-Type, Content-Length, and Content-Disposition without a body.",
       },
       {
@@ -2223,7 +2211,7 @@
         kind: "models",
         read: "data[].id",
         files: "none",
-        operation: "Free/Go should choose auto only",
+        operation: "Illustrative account-gated model list; Free/Go should choose auto only",
         response: {
           object: "list",
           data: [
@@ -2231,6 +2219,7 @@
             { id: "gpt-5-5", object: "model" },
             { id: "gpt-5-5-thinking-extended", object: "model" },
             { id: "gpt-5-5-pro-standard", object: "model" },
+            { id: "gpt-5-6-sol-high", object: "model" },
             { id: "auto@optimized", object: "model" },
             { id: "gpt-image-1", object: "model" },
             { id: "chatgpt-deep-research", object: "model" },
@@ -2351,25 +2340,17 @@
 
   function buildDownloadGuides() {
     const localBase = baseUrl || DEFAULT_BASE_URL;
-    const lanBase = serverPublicBase.includes("YOUR-LAN-IP")
-      ? "http://192.168.1.203:8000/v1"
-      : serverPublicBase;
     return [
       {
         title: "Same machine",
         body: "Use path when your app runs on the same machine as the API server. This is fastest for local scripts.",
         example:
-          "/Users/work/Desktop/chatgpt-api/outputs/chatgpt-images/cat.png",
+          "/Users/work/Desktop/gpt-bridge/outputs/chatgpt-images/cat.png",
       },
       {
-        title: "Browser or LAN client",
-        body: "Use download_url. Never send a macOS path to another computer; it cannot read your filesystem.",
+        title: "Local browser",
+        body: "Use download_url in a browser on this machine. Never send a local path or artifact URL to another computer.",
         example: `${localBase.replace(/\/+$/, "")}/chatgpt/files/file_cat/cat.png`,
-      },
-      {
-        title: "LAN public URL",
-        body: "Start the API with --host 0.0.0.0 and set --public-base-url to the LAN IP. Returned download_url will then be reachable by phones or other computers.",
-        example: `python3 -m chatgpt_api serve --host 0.0.0.0 --public-base-url ${quoteShell(lanBase)}`,
       },
       {
         title: "Research reports",
@@ -2381,7 +2362,7 @@
 
   function buildServeCommand() {
     const args: string[] = [
-      "python3 -m chatgpt_api serve",
+      "gpt-bridge serve",
       "--account-strategy",
       quoteShell(serverStrategy),
       "--host",
@@ -2596,7 +2577,7 @@
         label: "Chat",
         title: "Realtime chat and app narration",
         route: "POST /v1/chat/completions",
-        model: "auto, gpt-5-5*, and agent suffixes from /v1/models",
+        model: "auto, gpt-5-5*, gpt-5-6-sol-high, and agent suffixes from /v1/models",
         output: "No file output",
         note: "Best path for game chat, roleplay state updates, streaming UI, and opencode tool calls.",
       },
@@ -2618,7 +2599,7 @@
         route: "POST /v1/images/generations",
         model: "gpt-image-1 or auto",
         output: String(storage.image_output_dir ?? imageOutputDir),
-        note: "Completed images are registered in storage and returned with a download_url for browser or LAN clients.",
+        note: "Completed images are registered in storage and returned with a local download_url.",
       },
       {
         id: "research",
@@ -2674,6 +2655,7 @@
       "gpt-5-5-thinking-max",
       "gpt-5-5-pro-standard",
       "gpt-5-5-pro-extended",
+      "gpt-5-6-sol-high",
       "auto@optimized",
       "auto@opencode",
       "gpt-image-1",
@@ -2688,6 +2670,7 @@
     if (id.includes("@optimized")) return "Compact agent bridge prompt for opencode-style tools.";
     if (id.includes("@opencode")) return "Fuller opencode prompt bridge for tool use.";
     if (id.includes("thinking")) return "Paid thinking model alias; effort is encoded in the model id.";
+    if (id.includes("sol-high")) return "GPT-5.6 Sol High; available only when the account capture or settings observed it.";
     if (id.includes("-pro-")) return "Pro mode alias; requires a Pro-capable account.";
     if (id === "gpt-5-5") return "Explicit GPT-5.5 web model when the account supports it.";
     return "Discovered from the current routed account captures.";
@@ -2909,7 +2892,7 @@
         provider: {
           chatgptWeb: {
             npm: "@ai-sdk/openai-compatible",
-            name: "ChatGPT Web Bridge",
+            name: "GPT Bridge",
             options: {
               baseURL: baseUrl,
               apiKey: apiKey || DEFAULT_API_KEY,
@@ -2931,10 +2914,10 @@
 <div class="console-shell text-slate-100">
   <header class="console-topbar">
     <div class="console-brand">
-      <div class="brand-mark">WB</div>
+      <div class="brand-mark">GB</div>
       <div class="min-w-0">
         <p class="brand-kicker">bridge control plane</p>
-        <h1>Web Bridge Console</h1>
+        <h1>GPT Bridge Console</h1>
       </div>
     </div>
 
@@ -3027,6 +3010,31 @@
     {/if}
 
       {#if page === "overview"}
+        {#if savedAccountCount === 0}
+          <section class="module-panel getting-started-panel" aria-label="Get started">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">get started</p>
+                <h2>No accounts yet</h2>
+              </div>
+            </div>
+            <p class="runtime-note">
+              This console needs at least one ChatGPT account capture before
+              chat, image, or research routes will work.
+            </p>
+            <ol class="getting-started-steps">
+              <li>Open chatgpt.com in your browser and start any chat.</li>
+              <li>
+                Copy the request as described on the Accounts tab (DevTools
+                Network tab, or "Copy as cURL").
+              </li>
+              <li>Paste it under Accounts to add your first account.</li>
+            </ol>
+            <button class="primary-cta" onclick={() => setPage("accounts")}>
+              GO TO ACCOUNTS
+            </button>
+          </section>
+        {/if}
         <section class="dashboard-grid">
           <div class="control-plane" aria-label="Control plane">
             <article class="module-panel runtime-panel">
@@ -3363,6 +3371,36 @@
             class="rounded-[2rem] border border-white/10 bg-slate-900/80 p-5 xl:sticky xl:top-5 xl:self-start"
           >
             <PanelTitle kicker="capture" title="Add new account" />
+            <div
+              class="mt-2 rounded-3xl border border-white/10 bg-white/[0.03] p-4"
+            >
+              <div
+                class="text-xs font-black uppercase tracking-[0.16em] text-slate-400"
+              >
+                How to get a capture
+              </div>
+              <ol class="mt-2 list-decimal space-y-1 pl-4 text-sm text-slate-300">
+                <li>Open chatgpt.com and start (or continue) any chat.</li>
+                <li>
+                  Open your browser's DevTools, Network tab, then send one
+                  message so a
+                  <span class="font-mono text-slate-100"
+                    >conversation</span
+                  > request appears.
+                </li>
+                <li>
+                  Right-click that request → Copy → "Copy as cURL" (or copy
+                  the Headers and Payload/Request tabs on Safari).
+                </li>
+                <li>Paste the full result into the box below.</li>
+              </ol>
+              <p class="mt-2 text-xs text-slate-500">
+                Full walkthrough with screenshots: see
+                <span class="font-mono text-slate-300"
+                  >docs/ACCOUNT_CAPTURE.md</span
+                > in the project.
+              </p>
+            </div>
             <p class="mt-2 text-sm text-slate-400">
               Supports Safari copied request summaries, Chrome DevTools
               Headers/Payload details, and Copy as cURL output. Paste one complete
@@ -3433,26 +3471,37 @@
           <article class="rounded-3xl border border-white/10 bg-[#0b0d12] p-5">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <PanelTitle kicker="runtime policy" title="Concurrency limits" />
-              <div class="flex flex-wrap gap-2">
+              <button
+                class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-black"
+                onclick={resetBridgeSettings}
+              >
+                Reset recommended
+              </button>
+            </div>
+            <p class="mt-2 max-w-3xl text-sm text-slate-400">
+              Recommended defaults are already active for chat, image, and
+              research. Most people never need to change these — expand
+              "Advanced" only to customize limits per plan or per account.
+            </p>
+
+            <details class="mt-5 rounded-3xl border border-white/10 bg-white/[0.02] p-4">
+              <summary class="cursor-pointer text-sm font-black text-slate-300">
+                Advanced: customize per-plan and per-account limits
+              </summary>
+              <p class="mt-2 max-w-3xl text-sm text-slate-400">
+                These are local bridge throttles. Chat controls total calls
+                per account. Image and Research add stricter per-feature
+                limits on top of chat, so one busy feature does not consume
+                every route.
+              </p>
+              <div class="mt-4 flex justify-end">
                 <button
                   class="rounded-2xl bg-sky-300 px-4 py-3 font-black text-slate-950"
                   onclick={saveBridgeSettings}
                 >
                   Save limits
                 </button>
-                <button
-                  class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-black"
-                  onclick={resetBridgeSettings}
-                >
-                  Reset recommended
-                </button>
               </div>
-            </div>
-            <p class="mt-2 max-w-3xl text-sm text-slate-400">
-              These are local bridge throttles. Chat controls total calls per
-              account. Image and Research add stricter per-feature limits on top
-              of chat, so one busy feature does not consume every route.
-            </p>
 
             <div class="mt-5 grid gap-4">
               {#each FEATURES as [feature, label, description] (feature)}
@@ -3564,6 +3613,7 @@
                 </section>
               {/each}
             </div>
+            </details>
           </article>
 
           <aside class="grid gap-4 self-start xl:sticky xl:top-5">
@@ -3758,7 +3808,7 @@
               title="How this bridge is meant to be used"
             />
             <div class="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              {#each [["Base URL", baseUrl, "Every route below is relative to this /v1 URL."], ["Auth", apiKey ? "Bearer key required" : "No auth", "Default dev key is local-dev-key."], ["Not a full clone", "Bridge-style API", "Close to chat completions, with ChatGPT Web specific behavior."], ["Files", "Download route", "Images/reports get local paths and HTTP download links."]] as item (item[0])}
+              {#each [["Base URL", baseUrl, "Every route below is relative to this /v1 URL."], ["Auth", apiKey ? "Bearer key required" : "Key missing", "Copy the unique local key from .env into Settings."], ["Not a full clone", "Bridge-style API", "OpenAI-shaped local API with provider-specific behavior."], ["Files", "Download route", "Images/reports get local paths and HTTP download links."]] as item (item[0])}
                 <div
                   class="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
                 >
@@ -3826,7 +3876,7 @@
             <p class="mt-2 max-w-4xl text-sm leading-relaxed text-slate-400">
               `/v1/models` is the source of truth for the current route. Free
               and Go accounts should use `auto`. Paid accounts may expose
-              explicit GPT-5.5, thinking, and pro aliases. Image and Research
+              explicit GPT-5.5, GPT-5.6 Sol High, thinking, and pro aliases. Image and Research
               are bridge features, so they use their own aliases and routes.
             </p>
             <div class="mt-5 grid gap-3 xl:grid-cols-2">
@@ -4009,9 +4059,8 @@
             <PanelTitle kicker="downloads" title="Files, images, and reports" />
             <p class="mt-2 max-w-3xl text-sm text-amber-100/80">
               Images and Deep Research reports are local files plus HTTP
-              downloads. Same-machine apps may use filesystem paths. Browsers,
-              phones, Docker clients, and LAN machines must use the returned
-              download URL.
+              downloads. Same-machine apps may use filesystem paths; local
+              browsers should use the returned download URL.
             </p>
             <div class="mt-4 grid gap-3 lg:grid-cols-2">
               {#each downloadGuides as guide (guide.title)}
@@ -4099,7 +4148,7 @@
               title="What to check when it breaks"
             />
             <div class="mt-4 grid gap-3 md:grid-cols-2">
-              {#each [["401 unauthorized", "Bearer key does not match the running API server. Check the key in Launch or use the default local-dev-key."], ["missing=url,authorization,cookie", "The capture paste is incomplete. For cURL, paste the whole command including the ChatGPT URL, Authorization, Cookie or -b cookie jar text, and --data-raw JSON."], ["request body must be JSON", "The copied local curl command lost a trailing backslash or Content-Type header. Copy the generated block again."], ["Chat hangs before any text", "Refresh token/prepare may be slow. The bridge now fails token refresh within 30 seconds instead of hanging for Deep Research timeout."], ["Research did not cancel immediately", "Cancel is best effort. The bridge reads the Deep Research widget session from WSS, then sends the MCP stop call when the session id is known."], ["Account expired", "Open Accounts, click Update capture on that account, paste a fresh POST /backend-api/f/conversation request, then Save account."], ["Image is listed but file missing", "Library now hides and prunes stale DB records. A visible item must have exists=true and a real download link."], ["LAN client cannot download files", "Set Public base URL to the machine's LAN address, not 127.0.0.1, before starting the API server."]] as row (row[0])}
+              {#each [["401 unauthorized", "Bearer key does not match the running API server. Copy the unique key from .env into Settings."], ["missing=url,authorization,cookie", "The capture paste is incomplete. For cURL, paste the whole command including the service URL, Authorization, Cookie or -b cookie jar text, and --data-raw JSON."], ["request body must be JSON", "The copied local curl command lost a trailing backslash or Content-Type header. Copy the generated block again."], ["Chat hangs before any text", "Refresh token/prepare may be slow. The bridge fails token refresh rather than waiting for the full research timeout."], ["Research did not cancel immediately", "Cancel is best effort. The bridge requests cancellation after it observes the provider session identifiers."], ["Account expired", "Open Accounts, click Update capture on that account, paste a fresh conversation request, then Save account."], ["Image is listed but file missing", "Library hides and prunes stale DB records. A visible item must have exists=true and a real download link."], ["Another machine cannot connect", "This product is intentionally loopback-only. Do not change it into a LAN/public service."]] as row (row[0])}
                 <div class="rounded-2xl border border-white/10 bg-black/20 p-4">
                   <div class="font-black text-slate-100">{row[0]}</div>
                   <p class="mt-2 text-sm text-slate-400">{row[1]}</p>
@@ -4122,8 +4171,8 @@
             </button>
           </div>
           <p class="mb-4 text-sm text-slate-400">
-            Files are served through the bridge download route, so LAN clients
-            can open them without direct filesystem access.
+            Files are served through the local bridge download route, so this
+            Console can open them without direct filesystem access.
           </p>
           <div class="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
             {#each artifacts as artifact (artifact.file_id)}
@@ -4251,20 +4300,13 @@
                 Eject
               </button>
             </div>
-            <div
-              class="mt-5 rounded-3xl border border-amber-300/20 bg-amber-300/10 p-4 text-sm text-amber-50"
-            >
-              LAN note: start the API with host `0.0.0.0`, set public base URL
-              to `http://YOUR-LAN-IP:8000/v1`, then use that base URL in the
-              client opencode config.
-            </div>
             <CodeBlock
               title="Quick terminal setup"
               code={opencodeQuickCommand}
             />
           </article>
           <article class="rounded-3xl border border-white/10 bg-[#0b0d12] p-5">
-            <PanelTitle kicker="lan" title="LAN client snippets" />
+            <PanelTitle kicker="local" title="Local consumer snippets" />
             <div
               class="mb-4 rounded-2xl border border-sky-300/20 bg-sky-300/10 p-4 text-sm text-sky-50"
             >
@@ -4374,7 +4416,7 @@
                   </div>
                   <p class="mt-1 text-xs text-slate-500">
                     These controls produce the serve command below and should be
-                    the same values you use for Docker or LAN clients.
+                    the same values you use for Docker and local clients.
                   </p>
                 </div>
                 <Badge>launch fields</Badge>
@@ -4559,7 +4601,7 @@
                       Output paths
                     </div>
                     <p class="mt-1 text-xs text-slate-500">
-                      Paths stay editable because Docker volumes and LAN hosts
+                      Paths stay editable because host and Docker volume paths
                       vary per machine.
                     </p>
                   </div>
@@ -4572,7 +4614,7 @@
                     </button>
                     <button
                       class="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-black"
-                      onclick={() => quickOutputRoot("/data/chatgpt-api")}
+                      onclick={() => quickOutputRoot("/data/outputs")}
                     >
                       docker /data
                     </button>
@@ -4595,10 +4637,6 @@
             <CodeBlock
               title="Terminal 2: start console"
               code={consoleCommand}
-            />
-            <CodeBlock
-              title="Terminal 2 alternative: expose console on LAN"
-              code={consoleLanCommand}
             />
           </article>
         </section>

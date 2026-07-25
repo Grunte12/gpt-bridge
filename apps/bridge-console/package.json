@@ -1,15 +1,15 @@
 {
-  "name": "chatgpt-bridge-console",
+  "name": "gpt-bridge-console",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev --host 127.0.0.1 --port 5174 --strictPort",
-    "dev:lan": "vite dev --host 0.0.0.0 --port 5174",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4174",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "screenshots:capture": "node scripts/capture-screenshots.mjs"
   },
   "dependencies": {
     "lucide-svelte": "^1.0.1"
@@ -21,6 +21,7 @@
     "prettier": "^3.8.3",
     "prettier-plugin-svelte": "^4.1.0",
     "prettier-plugin-tailwindcss": "^0.8.0",
+    "playwright": "^1.58.2",
     "svelte": "^5.56.1",
     "svelte-check": "^4.6.0",
     "tailwindcss": "^4.3.0",

@@ -3,15 +3,16 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chatgpt-api"
+name = "gpt-bridge"
 version = "0.1.0"
-description = "Provider-first AI chat and image framework with ChatGPT Web as the first target."
+description = "Local-first Web-session bridge and worker for a user-managed account."
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
   "cryptography>=42",
   "curl_cffi>=0.11",
   "httpx>=0.27",
+  "playwright>=1.58",
   "websocket-client>=1.8",
 ]
 
@@ -22,6 +23,9 @@ dev = [
 
 [project.scripts]
 chatgpt-api = "chatgpt_api.cli:main"
+gpt-bridge = "chatgpt_api.cli:main"
+web-chat-bridge = "chatgpt_api.legacy_cli:main"
+wcbridge = "chatgpt_api.legacy_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["chatgpt_api*"]

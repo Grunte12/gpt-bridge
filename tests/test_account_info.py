@@ -151,6 +151,46 @@ def test_infer_account_capabilities_hides_auto_alias_for_free():
     assert capabilities["extra_observed_models"] == []
 
 
+def test_infer_account_capabilities_exposes_sol_high_only_when_captured():
+    info = detect_account_info(
+        CapturedRequest(
+            request_json={
+                "action": "next",
+                "model": "gpt-5-6-thinking",
+                "thinking_effort": "extended",
+            }
+        )
+    )
+    info.plan_type = "plus"
+    info.plan_bucket = "paid"
+
+    capabilities = infer_account_capabilities(info)
+
+    assert "gpt-5-6-thinking" in capabilities["supported_models"]
+    assert capabilities["sol_model"] == "gpt-5-6-thinking"
+    assert capabilities["sol_efforts"] == ["extended"]
+    assert capabilities["default_model"] == "gpt-5-6-thinking"
+
+
+def test_infer_account_capabilities_exposes_sol_high_from_saved_settings():
+    info = detect_account_info(
+        CapturedRequest(request_json={"action": "next", "model": "auto"}),
+        {
+            "settings": {
+                "last_used_model_config": {
+                    "juices": {"web": {"gpt-5-6-thinking": "extended"}},
+                    "slugs": {"web": "gpt-5-6-thinking"},
+                }
+            }
+        },
+    )
+
+    capabilities = infer_account_capabilities(info)
+
+    assert capabilities["sol_model"] == "gpt-5-6-thinking"
+    assert capabilities["sol_efforts"] == ["extended"]
+
+
 def test_load_settings_file(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text('{"settings":{"wingman_thinking_effort":"instant"}}', encoding="utf-8")
