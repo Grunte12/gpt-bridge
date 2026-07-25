@@ -828,7 +828,7 @@ def _handler_class(config: OpenAICompatConfig, router: AccountRouter | None = No
                     status, payload = asyncio.run(_admin_post_response(config, router, path, body))
                 except ProviderError as exc:
                     status, payload = _provider_error_status_and_payload(exc)
-                except ValueError as exc:
+                except (ValueError, OSError) as exc:
                     status, payload = 400, {"error": {"message": str(exc), "type": "invalid_request_error"}}
                 _send_json(self, status, payload)
                 return

@@ -1473,6 +1473,53 @@ def test_cors_only_allows_configured_console_origin():
         thread.join(timeout=5)
 
 
+def test_admin_opencode_inject_filesystem_error_returns_clean_400(monkeypatch):
+    real_mkdir = admin.Path.mkdir
+
+    def _raise_for_target_path(self, *args, **kwargs):
+        if "nonexistent-config-path-marker" in str(self):
+            raise PermissionError(13, "permission denied")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(admin.Path, "mkdir", _raise_for_target_path)
+
+    server = HTTPServer(
+        ("127.0.0.1", 0),
+        compat._handler_class(OpenAICompatConfig(account="test", api_key="test-key")),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        body = json.dumps(
+            {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "api_key": "test-key",
+                "model": "chatgpt-web/auto@optimized",
+                "config_path": "/nonexistent-config-path-marker/opencode.json",
+            }
+        ).encode()
+        conn.request(
+            "POST",
+            "/v1/chatgpt/admin/opencode/inject",
+            body=body,
+            headers={
+                "Authorization": "Bearer test-key",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 400
+        assert payload["error"]["type"] == "invalid_request_error"
+        assert "permission denied" in payload["error"]["message"].lower()
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_chat_image_request_saves_to_requested_path(monkeypatch, tmp_path):
     requested_path = tmp_path / "cat.png"
 
