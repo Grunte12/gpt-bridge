@@ -1,6 +1,6 @@
 # GPT Bridge — current implementation plan
 
-Updated: 2026-07-25
+Updated: 2026-07-26
 
 ## Completed foundation
 
@@ -10,8 +10,8 @@ Updated: 2026-07-25
 - Built encrypted local account administration, loopback-only Docker defaults,
   restrictive CORS, authenticated artifact downloads, local Console, worker
   threads, model fallback, reports, image, and research workflows.
-- Added consent-based visible-browser onboarding with manual login/MFA/challenge
-  handling and a copied-request fallback.
+- Added consent-based one-shot loopback onboarding in the user's normal
+  browser, with private file import as a fallback.
 - Removed the discontinued demo application and its Docker/profile/screenshot
   references.
 - Added public security, disclaimer, provenance, release-checklist, and handoff
@@ -21,8 +21,8 @@ Updated: 2026-07-25
 
 1. **Reliability:** keep provider-facing behavior behind regression tests; test
    a real user-owned capture manually only when a change needs it.
-2. **Onboarding clarity:** keep the Docker setup, Console, `auth login`, and
-   manual capture fallback understandable for non-technical local users.
+2. **Onboarding clarity:** keep the one-shot setup page, optional Console,
+   `auth login`, and private file fallback understandable for local users.
 3. **Compatibility discipline:** retain necessary internal names/routes and
    legacy command aliases without presenting them as the public product.
 4. **Release hygiene:** maintain documentation, dependency/provenance review,

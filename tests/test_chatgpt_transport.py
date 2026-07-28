@@ -23,14 +23,59 @@ from chatgpt_api.providers.chatgpt.transport import (
     _mark_payload_sent_after_prepare,
     _prepare_payload,
     _stream_handoff_topic,
+    _web_read_headers,
 )
 
 
 def test_stream_status_url_uses_conversation_id():
+    endpoints = ChatGPTEndpoints(base_url="https://example.test")
     assert (
-        ChatGPTEndpoints(base_url="https://example.test").stream_status_url("conversation-1")
+        endpoints.stream_status_url("conversation-1")
         == "https://example.test/backend-api/conversation/conversation-1/stream_status"
     )
+    assert (
+        endpoints.conversations_url(offset=10, limit=20)
+        == "https://example.test/backend-api/conversations?offset=10&limit=20&order=updated"
+    )
+    assert (
+        endpoints.conversation_detail_url("conversation-1")
+        == "https://example.test/backend-api/conversation/conversation-1"
+    )
+
+
+def test_delete_conversation_soft_deletes_exact_selected_id(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = '{"success":true}'
+
+        @staticmethod
+        def json():
+            return {"success": True}
+
+    def fake_patch(url, **kwargs):
+        calls["url"] = url
+        calls.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr("curl_cffi.requests.patch", fake_patch)
+    transport = ChatGPTWebTransport(
+        ChatGPTAuthConfig(access_token="fake"),
+        endpoints=ChatGPTEndpoints(base_url="https://example.test"),
+    )
+
+    result = transport.delete_conversation("conversation-1")
+
+    assert calls["url"] == "https://example.test/backend-api/conversation/conversation-1"
+    assert calls["data"] == b'{"is_visible":false}'
+    assert calls["headers"]["content-type"] == "application/json"
+    assert result == {
+        "ok": True,
+        "conversation_id": "conversation-1",
+        "soft_deleted": True,
+    }
 
 
 def test_build_variant_payload_omits_new_messages():
@@ -406,6 +451,25 @@ def test_conversation_headers_drop_transport_headers():
     assert replay["content-type"] == "application/json"
     assert "content-length" not in replay
     assert "accept-encoding" not in replay
+
+
+def test_web_read_headers_keep_auth_but_drop_conversation_routing_tokens():
+    replay = _web_read_headers(
+        {
+            "authorization": "Bearer fake",
+            "cookie": "session=fake",
+            "x-openai-target-path": "/backend-api/f/conversation",
+            "openai-sentinel-proof-token": "proof",
+            "user-agent": "agent",
+        }
+    )
+
+    assert replay == {
+        "authorization": "Bearer fake",
+        "cookie": "session=fake",
+        "user-agent": "agent",
+        "accept": "application/json",
+    }
 
 
 def test_event_to_delta_extracts_text():

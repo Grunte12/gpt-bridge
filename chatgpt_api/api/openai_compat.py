@@ -112,7 +112,11 @@ from chatgpt_api.providers.chatgpt.accounts import (
 from chatgpt_api.providers.chatgpt.auth import ChatGPTAuthConfig
 from chatgpt_api.providers.chatgpt.provider import ChatGPTProvider
 from chatgpt_api.providers.chatgpt.request_capture import CapturedRequest
-from chatgpt_api.providers.chatgpt.transport import ChatGPTWebTransport
+from chatgpt_api.providers.chatgpt.transport import (
+    ChatGPTWebTransport,
+    _conversation_id_from_events,
+    _latest_message_id_from_value,
+)
 
 
 
@@ -2011,6 +2015,16 @@ def _image_generation_response(
     }
     if account:
         result["chatgpt_account"] = account
+    raw = response.raw if isinstance(response.raw, dict) else {}
+    events = raw.get("events")
+    if isinstance(events, list):
+        conversation_id = _conversation_id_from_events(events)
+        message_id = _latest_message_id_from_value(events)
+        if conversation_id:
+            result["chatgpt_conversation_id"] = conversation_id
+            result["chatgpt_web_url"] = f"https://chatgpt.com/c/{conversation_id}"
+        if message_id:
+            result["chatgpt_message_id"] = message_id
     return result
 
 

@@ -1386,6 +1386,29 @@ def test_image_generation_response_returns_url_by_default():
     assert response["data"] == [{"url": "https://example.test/image.png"}]
 
 
+def test_image_generation_response_exposes_reusable_web_session_metadata():
+    response = _image_generation_response(
+        "auto",
+        ImageResponse(
+            images=[ImageAsset(url="https://example.test/image.png")],
+            prompt="draw",
+            raw={
+                "events": [
+                    {
+                        "conversation_id": "12345678-abcd-4321-abcd-1234567890ab",
+                        "message": {"id": "assistant-image-message"},
+                    }
+                ]
+            },
+        ),
+        "url",
+    )
+
+    assert response["chatgpt_conversation_id"] == "12345678-abcd-4321-abcd-1234567890ab"
+    assert response["chatgpt_message_id"] == "assistant-image-message"
+    assert response["chatgpt_web_url"].endswith("/c/12345678-abcd-4321-abcd-1234567890ab")
+
+
 def test_image_generation_response_saves_downloaded_image_bytes(tmp_path):
     response = _image_generation_response(
         "auto",

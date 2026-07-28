@@ -48,9 +48,10 @@ Docker Compose project name is `gpt-bridge`; running containers should be named
 - Captures are credentials. Never commit, print, paste into issues, upload, or
   share `.env`, `secrets/`, cookies, tokens, raw requests, browser profiles, or
   artifact capability URLs.
-- `gpt-bridge auth login` is consent-based and visible-browser-only. The user
-  signs in, completes MFA/challenges, and sends a message. No stealth, password
-  entry, profile attachment, CAPTCHA solving, challenge bypass, or secret output.
+- `gpt-bridge auth login` is consent-based and loopback-only. It opens a
+  tokenized one-shot page in the normal browser for a user-controlled local
+  capture paste. No stealth, password entry, profile attachment, CAPTCHA
+  solving, challenge bypass, or secret output.
 - No hosted service, account sharing, resale, multi-tenant operation, or
   provider-limit/safety-control evasion.
 
