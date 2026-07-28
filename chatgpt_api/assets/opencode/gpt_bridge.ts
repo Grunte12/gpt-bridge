@@ -82,6 +82,73 @@ export const chat = tool({
   },
 })
 
+export const web_session = tool({
+  description:
+    "Discover, read/export, continue, or explicitly clean up any signed-in ChatGPT Web conversation. Use server-side session context instead of replaying long transcripts.",
+  args: {
+    action: tool.schema.enum(["list", "show", "pull", "send", "delete"]).describe(
+      "list returns compact metadata; show reads/exports; pull syncs the latest image; send appends a message; delete soft-deletes an exact session",
+    ),
+    conversation: tool.schema.string().optional().describe(
+      "Conversation id or https://chatgpt.com/c/... URL; required for show, pull, send, and delete",
+    ),
+    query: tool.schema.string().optional().describe("Case-insensitive title filter for list"),
+    message: tool.schema.string().optional().describe("Arbitrary message to append when action is send"),
+    outputPath: tool.schema.string().optional().describe(
+      "For show, export Markdown; for pull, save the latest image. Must stay inside the OpenCode worktree",
+    ),
+    maxMessages: tool.schema.number().int().min(0).max(200).optional().describe(
+      "For show, recent message limit; 0 keeps all",
+    ),
+    maxChars: tool.schema.number().int().min(0).max(200000).optional().describe(
+      "For show, transcript character budget; 0 is unlimited",
+    ),
+    includeInternal: tool.schema.boolean().optional().describe(
+      "For show, include system/tool-role messages; defaults to user and assistant only",
+    ),
+    confirmDelete: tool.schema.boolean().optional().describe(
+      "Must be true for delete after the exact conversation has been selected",
+    ),
+    model: tool.schema.string().optional().describe(
+      `For send, Bridge model alias; defaults to ${DEFAULT_AGENT_MODEL}`,
+    ),
+  },
+  async execute(args, context) {
+    const command = ["web", args.action]
+    if (args.action === "list") {
+      if (args.query) command.push("--query", args.query)
+      command.push("--json")
+      return JSON.stringify(await runWorker(command), null, 2)
+    }
+    if (!args.conversation) throw new Error(`${args.action} requires conversation`)
+    command.push("--conversation", args.conversation)
+    if (args.action === "delete") {
+      if (!args.confirmDelete) throw new Error("delete requires confirmDelete=true")
+      command.push("--yes", "--json")
+      return JSON.stringify(await runWorker(command), null, 2)
+    }
+    if (args.action === "pull") {
+      if (!args.outputPath) throw new Error("pull requires outputPath")
+      command.push("--output-path", outputPath(context.worktree, args.outputPath), "--json")
+      return JSON.stringify(await runWorker(command), null, 2)
+    }
+    if (args.action === "show") {
+      if (args.maxMessages !== undefined) command.push("--max-messages", String(args.maxMessages))
+      if (args.maxChars !== undefined) command.push("--max-chars", String(args.maxChars))
+      if (args.includeInternal) command.push("--include-internal")
+      if (args.outputPath) {
+        command.push("--output", outputPath(context.worktree, args.outputPath), "--format", "markdown")
+      }
+      command.push("--json")
+      return JSON.stringify(await runWorker(command), null, 2)
+    }
+    if (!args.message?.trim()) throw new Error("send requires message")
+    command.push("--message", args.message, "--model", args.model || DEFAULT_AGENT_MODEL, "--json")
+    const payload = (await runWorker(command)) as { text?: string; web_url?: string }
+    return payload.text || JSON.stringify(payload, null, 2)
+  },
+})
+
 export const research = tool({
   description: "Run Deep Research directly through the captured ChatGPT account; no daemon is required.",
   args: {
@@ -105,6 +172,9 @@ export const image = tool({
     transparent: tool.schema.boolean().optional().describe(
       "Return a frontend-ready PNG with verified alpha; requires outputPath ending in .png",
     ),
+    cleanupSession: tool.schema.boolean().optional().describe(
+      "Soft-delete the generated ChatGPT Web session after the local image is saved; use only for one-shot work",
+    ),
   },
   async execute(args, context) {
     const command = ["image", "--prompt", args.prompt, "--brief"]
@@ -112,6 +182,10 @@ export const image = tool({
     if (args.transparent) {
       if (!args.outputPath) throw new Error("transparent image generation requires outputPath")
       command.push("--transparent")
+    }
+    if (args.cleanupSession) {
+      if (!args.outputPath) throw new Error("cleanupSession requires outputPath")
+      command.push("--cleanup-session")
     }
     const payload = await runWorker(command)
     return JSON.stringify(payload)
@@ -134,6 +208,9 @@ export const image_edit = tool({
     transparent: tool.schema.boolean().optional().describe(
       "Return a frontend-ready PNG with verified alpha; outputPath must end in .png",
     ),
+    cleanupSession: tool.schema.boolean().optional().describe(
+      "Soft-delete the generated ChatGPT Web session after the local edit is saved; use only for one-shot work",
+    ),
   },
   async execute(args, context) {
     const command = [
@@ -150,6 +227,7 @@ export const image_edit = tool({
       command.push("--input-image", outputPath(context.worktree, inputPath))
     }
     if (args.transparent) command.push("--transparent")
+    if (args.cleanupSession) command.push("--cleanup-session")
     const payload = await runWorker(command)
     return JSON.stringify(payload)
   },

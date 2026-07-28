@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote, urlencode
 
 from chatgpt_api.core.errors import ProviderError, ProviderNotConfigured, ProviderNotReady
 from chatgpt_api.core.types import ChatDelta, ChatRequest, ImageAsset, ImageInput, ImageRequest, ImageResponse
@@ -39,6 +40,13 @@ class ChatGPTEndpoints:
 
     def stream_status_url(self, conversation_id: str) -> str:
         return f"{self.base_url}/backend-api/conversation/{conversation_id}/stream_status"
+
+    def conversations_url(self, *, offset: int, limit: int, order: str = "updated") -> str:
+        query = urlencode({"offset": offset, "limit": limit, "order": order})
+        return f"{self.base_url}/backend-api/conversations?{query}"
+
+    def conversation_detail_url(self, conversation_id: str) -> str:
+        return f"{self.base_url}/backend-api/conversation/{quote(conversation_id, safe='')}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +88,96 @@ class ChatGPTWebTransport:
             raise ProviderNotConfigured(
                 "ChatGPT access token is missing. Set CHATGPT_ACCESS_TOKEN or CHATGPT_HAR_PATH."
             )
+
+    def list_conversations(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        order: str = "updated",
+    ) -> dict[str, Any]:
+        """Read signed-in ChatGPT conversation metadata without opening a browser."""
+        self.ensure_configured()
+        if offset < 0:
+            raise ValueError("conversation offset must be non-negative")
+        if not 1 <= limit <= 100:
+            raise ValueError("conversation limit must be between 1 and 100")
+        if order not in {"updated", "created"}:
+            raise ValueError("conversation order must be updated or created")
+        try:
+            from curl_cffi import requests
+        except ImportError as exc:
+            raise ProviderNotConfigured("curl_cffi is required for ChatGPT Web transport") from exc
+        response = requests.get(
+            self.endpoints.conversations_url(offset=offset, limit=limit, order=order),
+            headers=_web_read_headers(self.auth.request_headers()),
+            impersonate=self.impersonate,
+            timeout=min(float(self.timeout), 30.0),
+        )
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"ChatGPT conversation list failed: {response.status_code} {_body_preview(response)}"
+            )
+        return _json_response(response)
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Read one signed-in ChatGPT conversation tree."""
+        self.ensure_configured()
+        if not conversation_id.strip():
+            raise ValueError("conversation id is required")
+        try:
+            from curl_cffi import requests
+        except ImportError as exc:
+            raise ProviderNotConfigured("curl_cffi is required for ChatGPT Web transport") from exc
+        response = requests.get(
+            self.endpoints.conversation_detail_url(conversation_id.strip()),
+            headers=_web_read_headers(self.auth.request_headers()),
+            impersonate=self.impersonate,
+            timeout=min(float(self.timeout), 30.0),
+        )
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"ChatGPT conversation read failed: {response.status_code} {_body_preview(response)}"
+            )
+        return _json_response(response)
+
+    def download_conversation_image(self, conversation_id: str, asset_pointer: str) -> ImageAsset:
+        """Download one image asset referenced by a signed-in conversation."""
+        self.ensure_configured()
+        return self._download_generated_image(
+            asset_pointer,
+            self.auth.request_headers(),
+            conversation_id,
+        )
+
+    def delete_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Soft-delete one conversation by hiding it from signed-in ChatGPT history."""
+        self.ensure_configured()
+        if not conversation_id.strip():
+            raise ValueError("conversation id is required")
+        try:
+            from curl_cffi import requests
+        except ImportError as exc:
+            raise ProviderNotConfigured("curl_cffi is required for ChatGPT Web transport") from exc
+        headers = _web_read_headers(self.auth.request_headers())
+        headers["content-type"] = "application/json"
+        response = requests.patch(
+            self.endpoints.conversation_detail_url(conversation_id.strip()),
+            headers=headers,
+            data=b'{"is_visible":false}',
+            impersonate=self.impersonate,
+            timeout=min(float(self.timeout), 30.0),
+        )
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"ChatGPT conversation delete failed: {response.status_code} {_body_preview(response)}"
+            )
+        result = _json_response(response)
+        return {
+            "ok": result.get("success", True) is not False,
+            "conversation_id": conversation_id.strip(),
+            "soft_deleted": True,
+        }
 
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatDelta]:
         self.ensure_configured()
@@ -1791,6 +1889,24 @@ def _asset_download_headers(headers: dict[str, str]) -> dict[str, str]:
     allowed = {"authorization", "user-agent", "cookie", "origin", "referer"}
     replay = {name: value for name, value in headers.items() if name in allowed}
     replay["accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    return replay
+
+
+def _web_read_headers(headers: dict[str, str]) -> dict[str, str]:
+    allowed = {
+        "authorization",
+        "cookie",
+        "oai-client-build-number",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "oai-session-id",
+        "origin",
+        "referer",
+        "user-agent",
+    }
+    replay = {name: value for name, value in headers.items() if name in allowed}
+    replay["accept"] = "application/json"
     return replay
 
 

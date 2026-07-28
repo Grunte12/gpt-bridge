@@ -31,7 +31,7 @@ or another person's account.
 | `chatgpt_api/api/operations.py` | Long-running operation state and best-effort cancellation |
 | `chatgpt_api/providers/chatgpt/` | Session capture parsing, encryption, account inspection, provider transport, and model metadata |
 | `chatgpt_api/image_alpha.py` | Verifies native image alpha or safely converts a flat generated matte into a transparent frontend PNG |
-| `chatgpt_api/worker/` and `threads.py` | Direct one-account transport, optional loopback client, durable task threads, reports/image generation/reference edits/research, conservative stack control |
+| `chatgpt_api/worker/`, `web_sessions.py`, and `threads.py` | Direct one-account transport, compact signed-in Web conversation discovery/read/continuation, optional loopback client, durable local task threads, reports/image generation/reference edits/research, conservative stack control |
 | `chatgpt_api/integration_installer.py` | Non-interactive host registration and non-destructive OpenCode configuration |
 | `chatgpt_api/assets/opencode/` | Native OpenCode tools that invoke the direct worker CLI |
 | `apps/bridge-console/` | Browser operator UI; never stores raw capture material in source or screenshots |
@@ -41,6 +41,8 @@ or another person's account.
 ## Security decisions
 
 - Direct mode creates no listening socket and uses exactly one selected account.
+- Web conversation listing returns compact selection metadata; transcript
+  export/continuation requires an explicit conversation id or signed-in Web URL.
 - Optional Docker publishes only loopback ports and requires a non-default bearer key.
 - Captures are sensitive and encrypted in the local account store.
 - Setup binds an ephemeral `127.0.0.1` port, uses a random URL token, accepts

@@ -364,13 +364,16 @@ def test_api_image_default_makes_only_one_generation_request(monkeypatch, capsys
     assert json.loads(capsys.readouterr().out)["data"][0]["url"] == "https://example.test/image.png"
 
 
-def test_worker_image_brief_returns_only_output_location(tmp_path, monkeypatch, capsys):
+def test_worker_image_brief_returns_output_and_reusable_web_session(tmp_path, monkeypatch, capsys):
     output = tmp_path / "draft.png"
+    conversation_id = "12345678-abcd-4321-abcd-1234567890ab"
 
     async def fake_api_request_json(args, method, path, body):
         return {
             "model": body["model"],
             "chatgpt_operation_id": "image-operation",
+            "chatgpt_conversation_id": conversation_id,
+            "chatgpt_web_url": f"https://chatgpt.com/c/{conversation_id}",
             "data": [
                 {
                     "url": "/v1/files/generated/content",
@@ -384,8 +387,85 @@ def test_worker_image_brief_returns_only_output_location(tmp_path, monkeypatch, 
 
     assert main(["worker", "--transport", "http", "image", "--prompt", "draft", "--brief"]) == 0
     assert capsys.readouterr().out == (
-        f'{{"ok":true,"outputs":[{{"path":"{output}"}}]}}\n'
+        f'{{"ok":true,"outputs":[{{"path":"{output}"}}],'
+        f'"conversation":{{"id":"{conversation_id}","web_url":"https://chatgpt.com/c/{conversation_id}"}}}}\n'
     )
+
+
+def test_worker_image_cleanup_soft_deletes_only_after_local_save(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "one-shot.png"
+    conversation_id = "12345678-abcd-4321-abcd-1234567890ab"
+    deleted = []
+
+    async def fake_api_request_json(args, method, path, body):
+        return {
+            "chatgpt_conversation_id": conversation_id,
+            "data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}],
+        }
+
+    class FakeWebClient:
+        async def delete_web_conversation(self, requested_conversation):
+            assert output.read_bytes() == b"png-bytes"
+            deleted.append(requested_conversation)
+            return {
+                "ok": True,
+                "conversation_id": requested_conversation,
+                "soft_deleted": True,
+            }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    monkeypatch.setattr(cli, "_direct_web_client", lambda args: FakeWebClient())
+
+    assert main(
+        [
+            "worker",
+            "image",
+            "--prompt",
+            "one-shot image",
+            "--output-path",
+            str(output),
+            "--cleanup-session",
+            "--brief",
+        ]
+    ) == 0
+
+    assert deleted == [conversation_id]
+    assert capsys.readouterr().out == (
+        f'{{"ok":true,"outputs":[{{"path":"{output.resolve()}"}}],"session_cleanup":"soft_deleted"}}\n'
+    )
+
+
+def test_worker_image_cleanup_keeps_session_when_output_is_not_saved(monkeypatch, capsys):
+    conversation_id = "12345678-abcd-4321-abcd-1234567890ab"
+    deleted = []
+
+    async def fake_api_request_json(args, method, path, body):
+        return {
+            "chatgpt_conversation_id": conversation_id,
+            "data": [{"url": "https://example.test/generated.png"}],
+        }
+
+    class FakeWebClient:
+        async def delete_web_conversation(self, requested_conversation):
+            deleted.append(requested_conversation)
+            return {"ok": True, "soft_deleted": True}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    monkeypatch.setattr(cli, "_direct_web_client", lambda args: FakeWebClient())
+
+    assert main(
+        [
+            "worker",
+            "image",
+            "--prompt",
+            "one-shot image",
+            "--cleanup-session",
+            "--brief",
+        ]
+    ) == 2
+
+    assert deleted == []
+    assert "requires --output-path or --output-dir" in capsys.readouterr().err
 
 
 def test_worker_image_transparent_adds_matte_contract_and_verifies_alpha(tmp_path, monkeypatch, capsys):

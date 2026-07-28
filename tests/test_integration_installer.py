@@ -100,7 +100,10 @@ def test_opencode_installer_preserves_config_and_installs_native_tools(tmp_path)
     tool_text = (config_path.parent / "tools" / "gpt_bridge.ts").read_text(encoding="utf-8")
     assert "export const research" in tool_text
     assert "export const image_edit" in tool_text
+    assert "export const web_session" in tool_text
     assert "transparent image generation requires outputPath" in tool_text
+    assert "cleanupSession requires outputPath" in tool_text
+    assert "delete requires confirmDelete=true" in tool_text
     assert "repeat calls as needed for quality" in tool_text
     assert '"--brief"' in tool_text
     assert '"--enhance"' not in tool_text
@@ -111,6 +114,7 @@ def test_opencode_installer_preserves_config_and_installs_native_tools(tmp_path)
     assert (skill_dir / "references" / "image-core.md").is_file()
     assert (skill_dir / "references" / "frontend-asset.md").is_file()
     assert (skill_dir / "references" / "presentation-deck.md").is_file()
+    assert (skill_dir / "references" / "web-sessions.md").is_file()
     assert (skill_dir / "references" / "risks" / "reference-edit-consistency.md").is_file()
     assert (skill_dir / "scripts" / "images_to_pptx.py").is_file()
     assert (skill_dir / "scripts" / "make_transparent.py").is_file()

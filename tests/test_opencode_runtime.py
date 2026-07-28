@@ -69,6 +69,7 @@ def test_installed_opencode_tools_are_registered_by_the_runtime(tmp_path):
             "gpt_bridge_image_edit",
             "gpt_bridge_report",
             "gpt_bridge_research",
+            "gpt_bridge_web_session",
         }.issubset(set(tool_ids))
     finally:
         process.terminate()

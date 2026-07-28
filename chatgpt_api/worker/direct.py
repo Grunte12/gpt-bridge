@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +16,14 @@ from chatgpt_api.api.openai_compat import (
     _image_edit,
     _image_generation,
     _models_response,
+    _provider_for_account,
+    _resolve_model_alias,
     _vision_request,
 )
 from chatgpt_api.core.errors import ProviderError
+from chatgpt_api.core.types import ChatRequest, Message
 from chatgpt_api.providers.chatgpt.accounts import list_account_profiles, resolve_account_capture_path
+from chatgpt_api.providers.chatgpt.transport import _latest_message_id_from_value
 from chatgpt_api.worker.storage import WorkerPaths
 
 
@@ -81,6 +86,84 @@ class DirectWorkerClient:
             admin_db_path=paths.root / "worker.db",
             web_timeout=self.timeout,
         )
+
+    def provider(self):
+        return _provider_for_account(self.config(), str(self.account))
+
+    async def list_web_conversations(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        order: str = "updated",
+    ) -> dict[str, Any]:
+        provider = self.provider()
+        return await asyncio.to_thread(
+            provider.transport.list_conversations,
+            offset=offset,
+            limit=limit,
+            order=order,
+        )
+
+    async def get_web_conversation(self, conversation_id: str) -> dict[str, Any]:
+        provider = self.provider()
+        return await asyncio.to_thread(provider.transport.get_conversation, conversation_id)
+
+    async def download_web_image(self, conversation_id: str, asset_pointer: str):
+        provider = self.provider()
+        return await asyncio.to_thread(
+            provider.transport.download_conversation_image,
+            conversation_id,
+            asset_pointer,
+        )
+
+    async def delete_web_conversation(self, conversation_id: str) -> dict[str, Any]:
+        provider = self.provider()
+        return await asyncio.to_thread(provider.transport.delete_conversation, conversation_id)
+
+    async def send_web_message(
+        self,
+        *,
+        conversation_id: str,
+        parent_message_id: str,
+        message: str,
+        model: str = DEFAULT_AGENT_MODEL,
+        thinking_effort: str | None = None,
+    ) -> dict[str, Any]:
+        """Continue the current ChatGPT Web branch without replaying its transcript."""
+        provider = self.provider()
+        model_slug, resolved_effort = _resolve_model_alias(model, thinking_effort)
+        chunks: list[str] = []
+        response_conversation_id = conversation_id
+        response_message_id: str | None = None
+        async for delta in provider.stream_chat(
+            ChatRequest(
+                messages=[Message.text("user", message)],
+                model=model_slug,
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
+                action="next",
+                thinking_effort=resolved_effort,
+                stream=True,
+                metadata={"history_and_training_disabled": False},
+            )
+        ):
+            if delta.text:
+                chunks.append(delta.text)
+            if delta.conversation_id:
+                response_conversation_id = delta.conversation_id
+            latest_message_id = _latest_message_id_from_value(delta.raw)
+            if latest_message_id:
+                response_message_id = latest_message_id
+        return {
+            "conversation_id": response_conversation_id,
+            "parent_message_id": parent_message_id,
+            "message_id": response_message_id,
+            "model": model,
+            "provider_model": model_slug,
+            "thinking_effort": resolved_effort,
+            "text": "".join(chunks).strip(),
+        }
 
     async def request_json(
         self,

@@ -72,6 +72,16 @@ from chatgpt_api.worker.client import WorkerClient
 from chatgpt_api.worker.migration import default_legacy_threads_dir, migrate_legacy_threads
 from chatgpt_api.worker.stack import compose_args, default_stack_dir, run_compose
 from chatgpt_api.worker.storage import WorkerPaths
+from chatgpt_api.web_sessions import (
+    compact_conversation_list,
+    conversation_id_from_reference,
+    conversation_markdown,
+    conversation_web_url,
+    current_branch_assets,
+    current_conversation_node,
+    normalized_conversation,
+    write_conversation,
+)
 from chatgpt_api.providers.chatgpt.models import parse_model_picker
 from chatgpt_api.providers.chatgpt.proof import decode_proof_config, generate_proof_token
 from chatgpt_api.providers.chatgpt.provider import ChatGPTProvider
@@ -802,6 +812,11 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
         action="store_true",
         help="Return compact JSON with output locations only, minimizing agent context",
     )
+    worker_image.add_argument(
+        "--cleanup-session",
+        action="store_true",
+        help="Soft-delete the generated ChatGPT Web conversation after a local output is saved",
+    )
     worker_image.add_argument("--json", action="store_true")
     _add_api_route_arguments(worker_image)
     worker_image.set_defaults(func=cmd_worker_image)
@@ -835,6 +850,11 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
         action="store_true",
         help="Return compact JSON with output locations only, minimizing agent context",
     )
+    worker_edit.add_argument(
+        "--cleanup-session",
+        action="store_true",
+        help="Soft-delete the generated ChatGPT Web conversation after a local output is saved",
+    )
     worker_edit.add_argument("--json", action="store_true")
     _add_api_route_arguments(worker_edit)
     worker_edit.set_defaults(func=cmd_worker_edit)
@@ -855,6 +875,68 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_thread.add_argument("--threads-dir", type=Path, default=None)
     worker_thread.add_argument("--json", action="store_true")
     worker_thread.set_defaults(func=cmd_worker_thread)
+
+    worker_web = worker_subparsers.add_parser(
+        "web",
+        help="Find, read, export, or continue signed-in ChatGPT Web conversations",
+    )
+    worker_web_subparsers = worker_web.add_subparsers(required=True)
+
+    worker_web_list = worker_web_subparsers.add_parser(
+        "list",
+        help="List compact conversation metadata for agent-side selection",
+    )
+    worker_web_list.add_argument("--query", default=None, help="Case-insensitive title filter")
+    worker_web_list.add_argument("--limit", type=int, default=20)
+    worker_web_list.add_argument("--offset", type=int, default=0)
+    worker_web_list.add_argument("--order", choices=["updated", "created"], default="updated")
+    worker_web_list.add_argument("--json", action="store_true")
+    worker_web_list.set_defaults(func=cmd_worker_web_list)
+
+    worker_web_show = worker_web_subparsers.add_parser(
+        "show",
+        help="Read the selected current branch with explicit context limits or export it to a file",
+    )
+    worker_web_show.add_argument("--conversation", required=True, help="Conversation id or https://chatgpt.com/c/<id>")
+    worker_web_show.add_argument("--max-messages", type=int, default=20, help="Recent messages to return; 0 keeps all")
+    worker_web_show.add_argument("--max-chars", type=int, default=12_000, help="Text character budget; 0 is unlimited")
+    worker_web_show.add_argument("--include-internal", action="store_true", help="Include system and tool-role messages")
+    worker_web_show.add_argument("--output", type=Path, default=None, help="Write the normalized branch instead of printing it")
+    worker_web_show.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    worker_web_show.add_argument("--json", action="store_true")
+    worker_web_show.set_defaults(func=cmd_worker_web_show)
+
+    worker_web_pull = worker_web_subparsers.add_parser(
+        "pull",
+        help="Download image assets from the selected current ChatGPT Web branch",
+    )
+    worker_web_pull.add_argument("--conversation", required=True, help="Conversation id or https://chatgpt.com/c/<id>")
+    worker_web_pull.add_argument("--output-path", type=Path, default=None, help="Destination for the latest image")
+    worker_web_pull.add_argument("--output-dir", type=Path, default=None, help="Destination directory")
+    worker_web_pull.add_argument("--all", action="store_true", help="Download every assistant image on the current branch")
+    worker_web_pull.add_argument("--json", action="store_true")
+    worker_web_pull.set_defaults(func=cmd_worker_web_pull)
+
+    worker_web_delete = worker_web_subparsers.add_parser(
+        "delete",
+        help="Soft-delete one explicitly selected ChatGPT Web conversation",
+    )
+    worker_web_delete.add_argument("--conversation", required=True, help="Conversation id or https://chatgpt.com/c/<id>")
+    worker_web_delete.add_argument("--yes", action="store_true", help="Confirm deletion of this exact conversation")
+    worker_web_delete.add_argument("--json", action="store_true")
+    worker_web_delete.set_defaults(func=cmd_worker_web_delete)
+
+    worker_web_send = worker_web_subparsers.add_parser(
+        "send",
+        help="Continue the selected ChatGPT Web branch with an arbitrary agent-authored message",
+    )
+    worker_web_send.add_argument("--conversation", required=True, help="Conversation id or https://chatgpt.com/c/<id>")
+    worker_web_send.add_argument("--message", "-m", required=True)
+    worker_web_send.add_argument("--model", default=DEFAULT_AGENT_MODEL)
+    worker_web_send.add_argument("--thinking-effort", default=None)
+    worker_web_send.add_argument("--output", type=Path, default=None, help="Write assistant text to a file")
+    worker_web_send.add_argument("--json", action="store_true")
+    worker_web_send.set_defaults(func=cmd_worker_web_send)
 
     worker_migrate = worker_subparsers.add_parser("migrate", help="Copy supported state from a legacy local worker")
     worker_migrate_subparsers = worker_migrate.add_subparsers(required=True)
@@ -1284,6 +1366,212 @@ async def cmd_worker_thread(args: argparse.Namespace) -> int:
         return 0
     except ValueError as exc:
         raise ProviderError(str(exc)) from exc
+
+
+def _direct_web_client(args: argparse.Namespace) -> DirectWorkerClient:
+    if getattr(args, "transport", "direct") != "direct":
+        raise ProviderError("worker web commands use direct mode; omit `--transport http`")
+    client = _worker_client(args)
+    if not isinstance(client, DirectWorkerClient):
+        raise ProviderError("worker web commands require the direct one-account transport")
+    return client
+
+
+async def cmd_worker_web_list(args: argparse.Namespace) -> int:
+    if args.offset < 0:
+        raise ProviderError("--offset must be non-negative")
+    if not 1 <= args.limit <= 100:
+        raise ProviderError("--limit must be between 1 and 100")
+    payload = await _direct_web_client(args).list_web_conversations(
+        offset=args.offset,
+        limit=args.limit,
+        order=args.order,
+    )
+    conversations = compact_conversation_list(payload, query=args.query, limit=args.limit)
+    result = {
+        "object": "chatgpt.web.conversation.list",
+        "query": args.query,
+        "offset": args.offset,
+        "limit": args.limit,
+        "conversations": conversations,
+    }
+    if payload.get("total") is not None:
+        result["total"] = payload["total"]
+    if args.json:
+        _print_json(result)
+    elif conversations:
+        for conversation in conversations:
+            print(f"{conversation['id']}\t{conversation['title']}\t{conversation['web_url']}")
+    else:
+        print("(no matching conversations)")
+    return 0
+
+
+async def cmd_worker_web_show(args: argparse.Namespace) -> int:
+    if args.max_messages < 0:
+        raise ProviderError("--max-messages must be non-negative")
+    if args.max_chars < 0:
+        raise ProviderError("--max-chars must be non-negative")
+    try:
+        conversation_id = conversation_id_from_reference(args.conversation)
+        raw = await _direct_web_client(args).get_web_conversation(conversation_id)
+        raw.setdefault("id", conversation_id)
+        normalized = normalized_conversation(
+            raw,
+            include_internal=args.include_internal,
+            max_messages=args.max_messages,
+            max_chars=args.max_chars,
+        )
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
+    if args.output:
+        try:
+            path = write_conversation(args.output, normalized, output_format=args.format)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
+        result = {
+            "object": "chatgpt.web.conversation.export",
+            "id": conversation_id,
+            "title": normalized["title"],
+            "web_url": normalized["web_url"],
+            "path": str(path),
+            "format": args.format,
+            "message_count": normalized["message_count"],
+            "omitted_messages": normalized["omitted_messages"],
+        }
+        if args.json:
+            _print_json(result)
+        else:
+            print(f"path={path}")
+            print(f"conversation_url={normalized['web_url']}")
+        return 0
+    if args.json:
+        _print_json(normalized)
+    else:
+        print(conversation_markdown(normalized), end="")
+    return 0
+
+
+async def cmd_worker_web_send(args: argparse.Namespace) -> int:
+    message = args.message.strip()
+    if not message:
+        raise ProviderError("--message must not be empty")
+    try:
+        conversation_id = conversation_id_from_reference(args.conversation)
+        client = _direct_web_client(args)
+        conversation = await client.get_web_conversation(conversation_id)
+        parent_message_id = current_conversation_node(conversation)
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
+    response = await client.send_web_message(
+        conversation_id=conversation_id,
+        parent_message_id=parent_message_id,
+        message=message,
+        model=args.model,
+        thinking_effort=args.thinking_effort,
+    )
+    text = str(response.get("text") or "")
+    if args.output:
+        _write_text_output(args.output, text)
+    result = {
+        "object": "chatgpt.web.conversation.turn",
+        "id": response.get("conversation_id") or conversation_id,
+        "title": conversation.get("title") if isinstance(conversation.get("title"), str) else "Untitled",
+        "web_url": conversation_web_url(str(response.get("conversation_id") or conversation_id)),
+        "parent_message_id": parent_message_id,
+        "message_id": response.get("message_id"),
+        "model": response.get("model"),
+        "provider_model": response.get("provider_model"),
+        "thinking_effort": response.get("thinking_effort"),
+        "text": text,
+    }
+    if args.output:
+        result["path"] = str(args.output.expanduser().resolve())
+    if args.json:
+        _print_json(result)
+    else:
+        if text:
+            print(text)
+        print(f"conversation_url={result['web_url']}", file=sys.stderr)
+        if args.output:
+            print(f"output_path={result['path']}", file=sys.stderr)
+    return 0
+
+
+async def cmd_worker_web_delete(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ProviderError("worker web delete requires --yes for the exact selected conversation")
+    try:
+        conversation_id = conversation_id_from_reference(args.conversation)
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
+    result = await _direct_web_client(args).delete_web_conversation(conversation_id)
+    payload = {
+        "object": "chatgpt.web.conversation.delete",
+        "id": conversation_id,
+        "soft_deleted": bool(result.get("soft_deleted")),
+        "ok": bool(result.get("ok")),
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"deleted={'yes' if payload['ok'] else 'no'}")
+        print(f"conversation_id={conversation_id}")
+    return 0 if payload["ok"] else 1
+
+
+async def cmd_worker_web_pull(args: argparse.Namespace) -> int:
+    if args.all and args.output_path:
+        raise ProviderError("--output-path cannot be combined with --all; use --output-dir")
+    try:
+        conversation_id = conversation_id_from_reference(args.conversation)
+        client = _direct_web_client(args)
+        conversation = await client.get_web_conversation(conversation_id)
+        assets = current_branch_assets(conversation)
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
+    if not assets:
+        raise ProviderError("selected ChatGPT Web branch contains no assistant image assets")
+    selected = assets if args.all else assets[-1:]
+    destination_dir = (
+        args.output_dir.expanduser()
+        if args.output_dir
+        else WorkerPaths.default().root / "web-assets" / conversation_id
+    )
+    saved: list[dict[str, object]] = []
+    for index, asset in enumerate(selected, start=1):
+        image = await client.download_web_image(conversation_id, asset["asset_pointer"])
+        if image.data is None:
+            raise ProviderError("ChatGPT Web image asset did not include downloadable bytes")
+        suffix = _suffix_for_content_type(image.mime_type)
+        if args.output_path:
+            target = args.output_path.expanduser()
+        else:
+            message_id = re.sub(r"[^A-Za-z0-9_-]+", "-", asset["message_id"]).strip("-") or f"image-{index}"
+            target = destination_dir / f"{message_id}{suffix}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(image.data)
+        saved.append(
+            {
+                "path": str(target.resolve()),
+                "mime_type": image.mime_type,
+                "bytes": len(image.data),
+                "message_id": asset["message_id"],
+            }
+        )
+    result = {
+        "object": "chatgpt.web.conversation.assets",
+        "id": conversation_id,
+        "title": conversation.get("title") if isinstance(conversation.get("title"), str) else "Untitled",
+        "web_url": conversation_web_url(conversation_id),
+        "assets": saved,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        for item in saved:
+            print(item["path"])
+    return 0
 
 
 async def cmd_worker_migrate_wcbridge(args: argparse.Namespace) -> int:
@@ -3015,7 +3303,18 @@ def _brief_image_payload(payload: dict[str, object], local_paths: list[Path]) ->
                 url = item.get("download_url") or item.get("url")
                 if isinstance(url, str) and url:
                     outputs.append({"url": url})
-    return {"ok": bool(outputs), "outputs": outputs}
+    result: dict[str, object] = {"ok": bool(outputs), "outputs": outputs}
+    cleanup = payload.get("chatgpt_session_cleanup")
+    if isinstance(cleanup, dict) and cleanup.get("soft_deleted"):
+        result["session_cleanup"] = "soft_deleted"
+        return result
+    conversation_id = payload.get("chatgpt_conversation_id")
+    if isinstance(conversation_id, str) and conversation_id:
+        result["conversation"] = {
+            "id": conversation_id,
+            "web_url": payload.get("chatgpt_web_url") or conversation_web_url(conversation_id),
+        }
+    return result
 
 
 _TRANSPARENT_ASSET_SUFFIX = (
@@ -3057,6 +3356,27 @@ def _apply_transparent_output(
     return converted, results
 
 
+async def _cleanup_one_shot_image_session(
+    args: argparse.Namespace,
+    payload: dict[str, object],
+    local_paths: list[Path],
+) -> None:
+    if not getattr(args, "cleanup_session", False):
+        return
+    if not local_paths:
+        raise ProviderError("--cleanup-session requires --output-path or --output-dir so the artifact is saved first")
+    conversation_id = payload.get("chatgpt_conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ProviderError("image response did not expose a ChatGPT Web conversation to clean up")
+    result = await _direct_web_client(args).delete_web_conversation(conversation_id)
+    if not result.get("ok"):
+        raise ProviderError("ChatGPT Web conversation cleanup was not confirmed")
+    payload["chatgpt_session_cleanup"] = {
+        "conversation_id": conversation_id,
+        "soft_deleted": True,
+    }
+
+
 async def cmd_api_image(args: argparse.Namespace) -> int:
     metadata: dict[str, object] = {}
     if args.operation_id:
@@ -3086,6 +3406,7 @@ async def cmd_api_image(args: argparse.Namespace) -> int:
         payload["local_paths"] = [str(path) for path in local_paths]
     if transparency_results:
         payload["chatgpt_transparency"] = transparency_results
+    await _cleanup_one_shot_image_session(args, payload, local_paths)
     if args.enhance:
         _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
     if getattr(args, "brief", False):
@@ -3131,6 +3452,7 @@ async def cmd_api_edit(args: argparse.Namespace) -> int:
         payload["local_paths"] = [str(path) for path in local_paths]
     if transparency_results:
         payload["chatgpt_transparency"] = transparency_results
+    await _cleanup_one_shot_image_session(args, payload, local_paths)
     if args.enhance:
         _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
     if getattr(args, "brief", False):

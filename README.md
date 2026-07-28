@@ -5,7 +5,8 @@
 GPT Bridge is an independently maintained Python-first project. It combines a
 direct one-account agent worker with an optional local OpenAI-compatible API:
 
-- direct chat, images, vision, Deep Research, and reports with no daemon;
+- direct chat, images, vision, Deep Research, reports, and signed-in ChatGPT
+  Web conversation continuation with no daemon;
 - a one-account `worker` CLI optimized for agents and automation;
 - an optional loopback API for clients that specifically require HTTP;
 - persistent local task threads and non-destructive legacy migration;
@@ -24,7 +25,7 @@ products. GPT Bridge is the source of truth:
 
 | Component | Responsibility |
 | --- | --- |
-| Worker CLI | Default one-account, no-daemon agent path for chat, task threads, reports, images, and research |
+| Worker CLI | Default one-account, no-daemon agent path for chat, Web conversations, task threads, reports, images, and research |
 | Bridge API | Optional account routing, model fallback, OpenAI-shaped HTTP API, and artifacts |
 | Console | Local browser UI for accounts, health, capacity, storage, and API tools |
 | Codex plugin | A local skill that teaches Codex to call the worker without touching browser credentials |
@@ -185,6 +186,24 @@ with:
 gpt-bridge worker doctor --json
 ```
 
+Existing ChatGPT Web conversations are also reusable agent context. The bridge
+can list compact metadata, export the selected current branch, or append any
+agent-authored message without replaying the transcript:
+
+```powershell
+gpt-bridge worker web list --query "project title" --json
+gpt-bridge worker web show --conversation https://chatgpt.com/c/CONVERSATION_ID --output context.md --json
+gpt-bridge worker web pull --conversation CONVERSATION_ID --output-path latest.png --json
+gpt-bridge worker web send --conversation CONVERSATION_ID --message "Produce the exact implementation artifact needed now." --json
+gpt-bridge worker web delete --conversation CONVERSATION_ID --yes --json
+```
+
+These are generic primitives rather than fixed handoff templates. `web pull`
+syncs assistant-generated images from the current branch. An agent can
+use the same session for implementation planning, decision extraction,
+critique, writing, research follow-up, image refinement, or a new purpose.
+`web send` modifies the selected ChatGPT conversation; `web show` is read-only.
+
 ## Worker: the unified agent interface
 
 Install locally for development:
@@ -244,6 +263,7 @@ inspect it before opening it in a browser.
 gpt-bridge worker image --prompt "Deliverable: product hero. Canvas: wide landscape. Content: one clean product silhouette. Visual direction: premium studio photography. Constraints: no text, no unrelated objects, no watermark." --output-path .\work\image-draft.png --brief
 gpt-bridge worker edit --prompt "Change only the background to warm gray. Preserve product geometry, label, camera, and lighting." --input-image .\work\image-draft.png --output-path .\work\image-draft.png --brief
 gpt-bridge worker image --prompt "Frontend asset: isolated decorative leaf cluster, no text or scenery." --output-path .\src\assets\generated\leaf-cluster.png --transparent --brief
+gpt-bridge worker image --prompt "One-shot disposable concept, no text." --output-path .\work\one-shot.png --cleanup-session --brief
 gpt-bridge worker research --prompt "Compare these options with sources" --json
 ```
 
@@ -252,6 +272,11 @@ Agents should prepare each production-ready image prompt locally and use
 or refine as many times as needed, reusing one draft path and inspecting only
 the latest result. When the host supports an isolated worker or subagent, keep
 the image iteration there and return only the accepted path to the main task.
+For clearly one-shot image or edit work, `--cleanup-session` soft-deletes the
+generated ChatGPT conversation after the local file is saved and transparency
+processing succeeds. Omit it for iterative work or whenever recovery/follow-up
+may matter. Manual `worker web delete` also requires `--yes` and an exact
+conversation ID or URL.
 The legacy `--enhance` option is not recommended; if its result looks like an
 image artifact or file path, the CLI rejects it and falls back to the original
 prompt. Deep Research can be long-running and consumes the account's available

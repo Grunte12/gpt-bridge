@@ -47,21 +47,45 @@ gpt-bridge worker doctor --json
 gpt-bridge worker chat --message "Summarize these notes" --json
 gpt-bridge worker chat --message "Continue the analysis" --thread analysis --json
 gpt-bridge worker thread list
+gpt-bridge worker web list --query "brainstorm title" --json
+gpt-bridge worker web show --conversation <id-or-url> --output context.md --json
+gpt-bridge worker web pull --conversation <id-or-url> --output-path latest.png --json
+gpt-bridge worker web send --conversation <id-or-url> --message "Turn the current thinking into the artifact I need." --json
+gpt-bridge worker web delete --conversation <id-or-url> --yes --json
 gpt-bridge worker report --prompt "Explain this data with useful charts" --out report.html --json
 gpt-bridge worker image --prompt "Deliverable: clean product hero. Canvas: wide landscape. Content: one product. Constraints: no text, no unrelated objects, no watermark." --output-path work/image-draft.png --brief
 gpt-bridge worker edit --prompt "Change only the background. Preserve the product and label." --input-image work/image-draft.png --output-path work/image-draft.png --brief
 gpt-bridge worker image --prompt "Frontend asset: isolated organic ornament, no text or scenery." --output-path src/assets/generated/ornament.png --transparent --brief
+gpt-bridge worker image --prompt "One-shot disposable concept, no text." --output-path work/one-shot.png --cleanup-session --brief
 gpt-bridge worker research --prompt "Compare these options with sources" --json
 ```
 
 The worker defaults to direct, one-account execution and exits after the
-command. A thread is local JSON state; it does not resume a browser
-conversation. `worker report` preserves complete
+command. A `worker thread` is local JSON state. `worker web` instead works with
+normal conversations already visible in the signed-in ChatGPT Web account:
+
+- `web list` returns title/id/date metadata only so an agent can select safely;
+- `web show` reads the current branch with message/character limits, or exports
+  it to Markdown/JSON without filling the main agent context; and
+- `web pull` downloads the latest assistant image (or every current-branch
+  image on explicit request) into the local workspace; and
+- `web send` fetches the latest current node and appends an arbitrary message,
+  allowing ChatGPT to use the complete server-side session context; and
+- `web delete` soft-deletes one exact selected conversation and requires
+  `--yes`.
+
+Use these as composable primitives rather than fixed workflow names. Prefer
+`web send` when the desired output can be requested directly from the existing
+session. Prefer `web show --output` when implementation needs original source
+messages. A conversation URL is a private reference, not a credential.
+
+`worker report` preserves complete
 model-authored HTML without a fixed template. Treat output as untrusted active
 content.
 
 For images, agents should turn the user's request into one concise labeled spec
-per attempt. Use `--brief` so the command returns only output locations, reuse
+per attempt. Use `--brief` so the command returns output locations plus the
+reusable ChatGPT Web conversation reference, reuse
 one temporary draft path, and inspect only the latest draft. Regenerate or
 refine as many times as needed for quality. Prefer an isolated worker or
 subagent for this loop when the host supports one, returning only the accepted
@@ -70,6 +94,12 @@ intended use, canvas/composition, required content and relationships, visual
 direction, exact quoted text, and constraints directly in `--prompt`. The
 ChatGPT Web path does not expose reliable native `size` or `quality` controls,
 so express those needs in the prompt.
+
+Use `--cleanup-session` for a clearly one-shot image or edit with an explicit
+local output. It soft-deletes the generated Web conversation only after the
+file is saved and transparent-PNG conversion succeeds. Omit it for iterative
+work, possible follow-up, or recovery. This is history cleanup, not a guarantee
+of immediate server-side erasure.
 
 The host sees only the installed skill description until the skill activates.
 The activated body is a compact router that selects one deliverable
