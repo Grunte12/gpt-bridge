@@ -317,51 +317,67 @@ inspect it before opening it in a browser.
 > ภาษาไทย: report ให้โมเดลเลือกวิธีนำเสนอที่มีประสิทธิภาพที่สุดเอง ไม่ถูกล็อก
 > ด้วย template จึงทำกราฟหรือ interaction ขั้นสูงได้
 
-### Images and Deep Research
+### Images
 
 ```powershell
 gpt-bridge worker image --prompt "Deliverable: product hero. Canvas: wide landscape. Content: one clean product silhouette. Visual direction: premium studio photography. Constraints: no text, no unrelated objects, no watermark." --output-path .\work\image-draft.png --brief
 gpt-bridge worker edit --prompt "Change only the background to warm gray. Preserve product geometry, label, camera, and lighting." --input-image .\work\image-draft.png --output-path .\work\image-draft.png --brief
 gpt-bridge worker image --prompt "Frontend asset: isolated decorative leaf cluster, no text or scenery." --output-path .\src\assets\generated\leaf-cluster.png --transparent --brief
 gpt-bridge worker image --prompt "One-shot disposable concept, no text." --output-path .\work\one-shot.png --cleanup-session --brief
-gpt-bridge worker research --prompt "Compare these options with sources" --json
 ```
 
-Agents should prepare each production-ready image prompt locally and use
-`--brief` to keep only output locations in their context. They may regenerate
-or refine as many times as needed, reusing one draft path and inspecting only
-the latest result. When the host supports an isolated worker or subagent, keep
-the image iteration there and return only the accepted path to the main task.
-For clearly one-shot image or edit work, `--cleanup-session` soft-deletes the
-generated ChatGPT conversation after the local file is saved and transparency
-processing succeeds. Omit it for iterative work or whenever recovery/follow-up
-may matter. Manual `worker web delete` also requires `--yes` and an exact
-conversation ID or URL.
-The legacy `--enhance` option is not recommended; if its result looks like an
-image artifact or file path, the CLI rejects it and falls back to the original
-prompt. Deep Research can be long-running and consumes the account's available
-capacity.
+#### Agent-efficient workflow
 
-Only the skill description is exposed before activation. After activation, its
-small router loads one primary deliverable guide—including frontend assets,
-photos, illustrations, infographics, diagrams, educational, product, UI,
-brand, story, scientific, spatial, or presentation work—and only applicable
-risk overlays. Detailed guides do not enter agent context unless selected.
+1. Prepare the production-ready prompt locally.
+2. Use `--brief` so the agent receives only the result location.
+3. Reuse one draft path while iterating and inspect only the latest result.
+4. When supported, isolate iteration in a worker or subagent and return only
+   the accepted path to the main task.
 
-Use `worker edit` for targeted correction, reference-guided restyling,
-localization, identity/product preservation, or multi-image compositing. It
-accepts up to 10 ordered `--input-image` values and supports the same compact
-`--brief` response as generation. This prevents each refinement from starting
-from zero and reduces prompt drift.
+The legacy `--enhance` option is not recommended. If its output resembles an
+image artifact or file path, the CLI rejects it and uses the original prompt.
 
-For frontend assets, `--transparent` requires a `.png` output path. It requests
-native alpha, then verifies the saved image. If the ChatGPT Web output is
-opaque, the CLI removes only a flat edge-connected matte; it refuses a complex
-background instead of damaging the subject. Inspect accepted assets on both
-light and dark backgrounds before importing them into the frontend.
+#### On-demand prompt guides
 
-Presentation mode generates one accepted 16:9 image per slide and combines the
-ordered images into a flattened `.pptx`:
+Before activation, the agent sees only the skill description. The activated
+router selects one guide for the requested deliverable and only relevant risk
+overlays. Unselected guides never enter the agent's context.
+
+Available deliverables include frontend assets, photos, illustrations,
+infographics, diagrams, educational visuals, product and UI work, brand and
+story visuals, scientific and spatial graphics, and presentations.
+
+#### Editing and compositing
+
+Use `worker edit` for targeted corrections, reference-guided restyling,
+localization, identity or product preservation, and multi-image compositing.
+It accepts up to 10 ordered `--input-image` values and supports `--brief`.
+Editing an existing result reduces prompt drift and avoids restarting from
+zero.
+
+#### Transparent frontend assets
+
+`--transparent` requires a `.png` output path. The CLI requests native alpha
+and verifies the saved result. If the result is opaque, it removes only a flat,
+edge-connected matte. It refuses complex backgrounds rather than risk damaging
+the subject.
+
+Inspect accepted assets on both light and dark backgrounds before importing
+them into the frontend.
+
+#### Session cleanup
+
+Use `--cleanup-session` only for clearly one-shot generation or editing. After
+the local file is saved—and transparency processing succeeds when requested—it
+soft-deletes the generated ChatGPT conversation.
+
+Omit cleanup while iterating or when recovery and follow-up may matter. Manual
+`worker web delete` requires both `--yes` and an exact conversation ID or URL.
+
+### Presentations
+
+Presentation mode generates one accepted 16:9 image per slide, then combines
+the ordered images into a flattened `.pptx`:
 
 ```powershell
 python <installed-skill>\scripts\images_to_pptx.py `
@@ -371,6 +387,15 @@ python <installed-skill>\scripts\images_to_pptx.py `
 ```
 
 Slide contents in this mode are images and are not individually editable.
+
+### Deep Research
+
+```powershell
+gpt-bridge worker research --prompt "Compare these options with sources" --json
+```
+
+Deep Research may run for a long time and consumes the account's available
+capacity.
 
 ## Legacy web-chat-bridge-cli transition
 
