@@ -67,6 +67,30 @@ skill triggers, and detailed references load only when selected by
 `worker tools --query`. The capability search itself does not use the account
 or network.
 
+### ภาษาไทย: Agent ใช้เครื่องมือนี้อย่างไร
+
+Agent ไม่ได้โหลดคู่มือทั้งหมดเข้า context ตั้งแต่ต้น แต่จะเห็นเพียงชื่อและ
+คำอธิบายสั้นของ skill ก่อน เมื่อได้รับงานจึงโหลด router ขนาดเล็ก หากยังไม่แน่ใจ
+ว่าควรใช้คำสั่งใด จะเรียก `gpt-bridge worker tools --query "<งาน>" --json`
+เพื่อค้นหา route และอ่านเฉพาะ reference ที่ตรงกับงานนั้น จากนั้นจึงเรียก CLI
+แบบ direct ด้วย account เดียว โดยไม่ต้องเปิด Docker หรือ daemon ค้างไว้
+
+| เครื่องมือ | Agent ใช้เมื่อ | การจัดการ context/session |
+| --- | --- | --- |
+| `worker tools` | ค้นหาว่าควรใช้ capability และ reference ใด | ทำงานในเครื่อง ไม่ใช้ account หรือ network |
+| `worker doctor` | ตรวจว่า runtime และ account พร้อมใช้งาน | อ่านสถานะเท่านั้น |
+| `worker chat` | ขอคำตอบ วิเคราะห์โค้ด หรือสร้าง implementation brief | ใช้ temporary chat เป็นค่าเริ่มต้น |
+| `worker chat --thread` | งานที่ต้องทำต่อหลายรอบ | เก็บ context แบบย่อเป็น JSON ในเครื่อง |
+| `worker web list/show/send` | ค้น อ่าน หรือคุยต่อจาก ChatGPT Web session เดิม | ใช้ context ที่อยู่ฝั่ง ChatGPT โดยไม่ paste transcript ทั้งหมดกลับเข้า agent |
+| `worker web pull` | ดึงภาพล่าสุดจาก session เดิมลง workspace | คืนเฉพาะ path ของไฟล์ให้ agent |
+| `worker report` | สร้างรายงาน HTML พร้อมกราฟหรือ interaction | บันทึกเป็นไฟล์ standalone |
+| `worker image` / `worker edit` | สร้างภาพ แก้ภาพ ทำ asset โปร่งใส หรือภาพสำหรับสไลด์ | ใช้ `--brief` เพื่อลด output ใน main-agent context |
+| `worker research` | งานค้นคว้าเชิงลึกที่ต้องมีแหล่งอ้างอิง | เป็นงาน long-running และคืนผลลัพธ์ที่บันทึกได้ |
+
+งานภาพแบบ one-shot ที่บันทึกไฟล์สำเร็จสามารถใช้ `--cleanup-session` เพื่อลบ
+session ที่สร้างขึ้นจาก history ส่วนงานที่ยังต้องแก้ต่อหรือเกิดข้อผิดพลาดจะเก็บ
+session ไว้เพื่อให้ agent ทำต่อหรือกู้ผลลัพธ์ได้
+
 ## Important boundaries
 
 - This is not an official OpenAI product or API.
@@ -534,6 +558,3 @@ before using them for important decisions.
 
 The license covers this repository's code only; it grants no rights to OpenAI,
 ChatGPT, their marks, or any third-party service. See [DISCLAIMER.md](DISCLAIMER.md).
-
-> ภาษาไทย: ใช้โค้ดภายใต้ MIT ได้ตามเงื่อนไข แต่คุณต้องรับผิดชอบการใช้งาน account
-> และผลลัพธ์ของระบบเอง ควรรัน local, ปกป้อง credentials และตรวจคำตอบก่อนใช้จริง
