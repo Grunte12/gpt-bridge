@@ -32,11 +32,22 @@ class ChatGPTAccountProfile:
         return self.settings_path.exists()
 
 
+def default_accounts_dir() -> Path:
+    """Return a stable per-user account store without creating it."""
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "gpt-bridge" / "accounts"
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return root / "gpt-bridge" / "accounts"
+
+
 def accounts_dir_from_env() -> Path:
     value = os.environ.get("CHATGPT_ACCOUNTS_DIR", "").strip()
     if value:
         return Path(value).expanduser()
-    return DEFAULT_ACCOUNTS_DIR
+    return default_accounts_dir()
 
 
 def resolve_account_capture_path(account: str, accounts_dir: Path | None = None) -> Path:

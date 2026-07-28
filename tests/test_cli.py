@@ -350,6 +350,133 @@ def test_api_image_enhancement_uses_expanded_prompt_and_surfaces_it(monkeypatch,
     assert payload["chatgpt_enhanced_prompt"] == "expanded cinematic prompt"
 
 
+def test_api_image_default_makes_only_one_generation_request(monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append((path, body))
+        return {"data": [{"url": "https://example.test/image.png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["api", "image", "--prompt", "a concise production prompt", "--json"]) == 0
+    assert [path for path, _body in calls] == ["/images/generations"]
+    assert json.loads(capsys.readouterr().out)["data"][0]["url"] == "https://example.test/image.png"
+
+
+def test_worker_image_brief_returns_only_output_location(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "draft.png"
+
+    async def fake_api_request_json(args, method, path, body):
+        return {
+            "model": body["model"],
+            "chatgpt_operation_id": "image-operation",
+            "data": [
+                {
+                    "url": "/v1/files/generated/content",
+                    "path": str(output),
+                    "file_id": "large-internal-id",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["worker", "--transport", "http", "image", "--prompt", "draft", "--brief"]) == 0
+    assert capsys.readouterr().out == (
+        f'{{"ok":true,"outputs":[{{"path":"{output}"}}]}}\n'
+    )
+
+
+def test_worker_image_transparent_adds_matte_contract_and_verifies_alpha(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "asset.png"
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["body"] = body
+        return {"data": [{"b64_json": "ZmFrZS1pbWFnZQ==", "mime_type": "image/png"}]}
+
+    def fake_ensure_transparent_png(source, destination):
+        assert source == output
+        assert destination == output
+        return {
+            "ok": True,
+            "path": str(output),
+            "already_transparent": False,
+            "transparent_pixels": 100,
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    monkeypatch.setattr(cli, "ensure_transparent_png", fake_ensure_transparent_png)
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "image",
+            "--prompt",
+            "isolated leaf",
+            "--output-path",
+            str(output),
+            "--transparent",
+            "--brief",
+        ]
+    ) == 0
+    assert "truly transparent alpha" in calls["body"]["prompt"]
+    assert "#FF00FF" in calls["body"]["prompt"]
+    assert capsys.readouterr().out == f'{{"ok":true,"outputs":[{{"path":"{output}"}}]}}\n'
+
+
+def test_worker_image_transparent_requires_png_output_path(capsys):
+    assert main(["worker", "image", "--prompt", "asset", "--transparent"]) == 2
+    assert "requires --output-path" in capsys.readouterr().err
+
+
+def test_worker_edit_brief_returns_only_output_location(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    output = tmp_path / "edited.png"
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["path"] = path
+        calls["body"] = body
+        return {"data": [{"path": str(output), "file_id": "large-internal-id"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "edit",
+            "--prompt",
+            "Change only the background",
+            "--input-image",
+            str(source),
+            "--brief",
+        ]
+    ) == 0
+    assert calls["path"] == "/images/edits"
+    assert calls["body"]["input_images"][0]["name"] == "source.png"
+    assert capsys.readouterr().out == (
+        f'{{"ok":true,"outputs":[{{"path":"{output}"}}]}}\n'
+    )
+
+
+def test_worker_edit_rejects_more_than_ten_inputs(tmp_path, capsys):
+    argv = ["worker", "edit", "--prompt", "composite", "--brief"]
+    for index in range(11):
+        source = tmp_path / f"source-{index}.png"
+        source.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        argv.extend(["--input-image", str(source)])
+
+    assert main(argv) == 2
+    assert "requires 1 to 10" in capsys.readouterr().err
+
+
 def test_api_image_enhancement_failure_uses_raw_prompt_with_visible_warning(monkeypatch, capsys):
     async def fake_api_request_json(args, method, path, body):
         if path == "/chat/completions":
@@ -378,6 +505,73 @@ def test_direct_image_enhancement_uses_expanded_prompt(monkeypatch, capsys):
 
     assert main(["image", "--prompt", "a cat", "--enhance"]) == 0
     assert "prompt_enhancement=applied" in capsys.readouterr().out
+
+
+def test_api_image_enhancement_rejects_artifact_response(monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append((path, body))
+        if path == "/chat/completions":
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Image generated.\nSaved files:\n/Users/test/generated_images/wrong.png"
+                        }
+                    }
+                ]
+            }
+        assert body["prompt"] == "a precise architecture diagram"
+        return {"data": [{"url": "https://example.test/image.png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(
+        [
+            "api",
+            "image",
+            "--prompt",
+            "a precise architecture diagram",
+            "--enhance",
+            "--json",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [path for path, _body in calls] == ["/chat/completions", "/images/generations"]
+    assert payload["chatgpt_enhancement_applied"] is False
+    assert "artifact response" in payload["chatgpt_enhancement_error"]
+
+
+def test_direct_image_enhancement_rejects_file_path(monkeypatch, capsys):
+    class FakeProvider:
+        async def stream_chat(self, request):
+            yield ChatDelta(text="/Users/test/generated_images/wrong.png")
+
+        async def generate_image(self, request):
+            assert request.prompt == "a cat"
+            return ImageResponse(images=[ImageAsset(url="https://example.test/image.png")], prompt=request.prompt)
+
+    monkeypatch.setattr(cli, "_provider_from_chat_args", lambda args, capture_path: FakeProvider())
+
+    assert main(["image", "--prompt", "a cat", "--enhance"]) == 0
+    captured = capsys.readouterr()
+    assert "file path" in captured.err
+
+
+def test_provider_errors_are_compact(monkeypatch, capsys):
+    async def fail(_args):
+        raise ProviderError("first line\n" + ("x" * 2000))
+
+    parser = cli.build_parser()
+    monkeypatch.setattr(parser, "parse_args", lambda _argv: argparse.Namespace(func=fail))
+    monkeypatch.setattr(cli, "build_parser", lambda **_kwargs: parser)
+
+    assert main(["ignored"]) == 2
+    error = capsys.readouterr().err
+    assert "\n" not in error.rstrip("\n")
+    assert error.startswith("provider error: first line ")
+    assert len(error) <= 620
 
 
 def test_api_edit_saves_locally_without_sending_host_output_path(tmp_path, monkeypatch):

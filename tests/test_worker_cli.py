@@ -6,6 +6,9 @@ import chatgpt_api.cli as cli
 from chatgpt_api.cli import main
 from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.legacy_cli import translate_legacy_argv
+from chatgpt_api.providers.chatgpt.crypto import is_encrypted
+from chatgpt_api.providers.chatgpt.local_setup import LocalSetupResult
+from chatgpt_api.worker.direct import DEFAULT_AGENT_MODEL, DirectWorkerClient, resolve_direct_account
 from chatgpt_api.worker.client import WorkerClient, validate_worker_base_url, validate_worker_path
 from chatgpt_api.worker.stack import compose_args
 from chatgpt_api.worker.storage import default_worker_data_dir
@@ -29,6 +32,17 @@ def test_worker_defaults_map_legacy_bridge_environment(monkeypatch):
 
     assert args.base_url == "http://127.0.0.1:8012/v1"
     assert args.api_key == "legacy-token"
+    assert args.transport == "direct"
+
+
+def test_worker_agent_commands_default_to_verified_sol_high():
+    parser = cli.build_parser()
+
+    chat = parser.parse_args(["worker", "chat", "--message", "hello"])
+    report = parser.parse_args(["worker", "report", "--prompt", "analyse this"])
+
+    assert chat.model == DEFAULT_AGENT_MODEL
+    assert report.model == DEFAULT_AGENT_MODEL
 
 
 def test_worker_chat_reuses_router_and_worker_thread_location(tmp_path, monkeypatch, capsys):
@@ -75,7 +89,21 @@ def test_worker_report_preserves_model_authored_html_without_a_template(tmp_path
     monkeypatch.setattr(cli.WorkerClient, "request_json", fake_request_json)
     output = tmp_path / "analysis.html"
 
-    assert main(["worker", "report", "--prompt", "compare sales", "--title", "Sales", "--out", str(output), "--json"]) == 0
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "report",
+            "--prompt",
+            "compare sales",
+            "--title",
+            "Sales",
+            "--out",
+            str(output),
+            "--json",
+        ]
+    ) == 0
 
     assert output.read_text(encoding="utf-8") == "<!doctype html><html><body><canvas id='chart'></canvas></body></html>\n"
     assert calls[0][0:2] == ("POST", "/chat/completions")
@@ -134,3 +162,137 @@ def test_legacy_executable_translates_the_supported_command_contract():
 def test_worker_data_dir_uses_explicit_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("CHATGPT_WORKER_DATA_DIR", str(tmp_path))
     assert default_worker_data_dir() == tmp_path
+
+
+def test_direct_worker_resolves_exactly_one_capture(tmp_path):
+    capture = tmp_path / "plus-main" / "chatgpt-request.txt"
+    capture.parent.mkdir()
+    capture.write_text("Request URL: https://chatgpt.com/backend-api/f/conversation\n", encoding="utf-8")
+
+    assert resolve_direct_account(accounts_dir=tmp_path) == "plus-main"
+
+
+def test_direct_worker_dispatches_chat_without_http(tmp_path, monkeypatch):
+    capture = tmp_path / "plus-main" / "chatgpt-request.txt"
+    capture.parent.mkdir()
+    capture.write_text("Request URL: https://chatgpt.com/backend-api/f/conversation\n", encoding="utf-8")
+    calls = []
+
+    async def fake_chat_completion(config, body, router):
+        calls.append((config, body, router))
+        return {"model": body["model"], "choices": [{"message": {"content": "done"}}]}
+
+    monkeypatch.setattr("chatgpt_api.worker.direct._chat_completion", fake_chat_completion)
+    client = DirectWorkerClient(account="plus-main", accounts_dir=tmp_path)
+    payload = cli.asyncio.run(
+        client.request_json(
+            "POST",
+            "/chat/completions",
+            {"model": DEFAULT_AGENT_MODEL, "messages": [{"role": "user", "content": "hello"}]},
+        )
+    )
+
+    assert payload["choices"][0]["message"]["content"] == "done"
+    assert calls[0][0].accounts == ("plus-main",)
+    assert calls[0][0].model_fallback is None
+    assert calls[0][1]["model"] == DEFAULT_AGENT_MODEL
+
+
+def test_auth_import_validates_and_encrypts_capture_without_server(tmp_path, monkeypatch, capsys):
+    capture_file = tmp_path / "capture.txt"
+    capture_file.write_text(
+        """
+URL: https://chatgpt.com/backend-api/f/conversation
+Authorization: Bearer fake-token
+Cookie: oai-did=device-1; __Secure-next-auth.session-token.0=session-1
+OpenAI-Sentinel-Chat-Requirements-Token: req-token
+OpenAI-Sentinel-Proof-Token: proof-token
+OpenAI-Sentinel-Turnstile-Token: turnstile-token
+x-conduit-token: conduit-token
+OAI-Device-Id: device-1
+OAI-Session-Id: session-1
+Request Data: {"action":"next","model":"gpt-5-6-thinking","thinking_effort":"extended"}
+""".strip(),
+        encoding="utf-8",
+    )
+    accounts_dir = tmp_path / "accounts"
+    monkeypatch.setenv("CHATGPT_WORKER_DATA_DIR", str(tmp_path / "worker"))
+
+    assert main(
+        [
+            "auth",
+            "import",
+            "--account",
+            "main",
+            "--accounts-dir",
+            str(accounts_dir),
+            "--capture-file",
+            str(capture_file),
+            "--json",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    encrypted = (accounts_dir / "main" / "chatgpt-request.txt").read_text(encoding="utf-8")
+    assert payload["saved"] is True
+    assert is_encrypted(encrypted)
+    assert "fake-token" not in encrypted
+
+
+def test_setup_captures_saves_and_verifies_without_server(tmp_path, monkeypatch, capsys):
+    capture_text = """
+URL: https://chatgpt.com/backend-api/f/conversation
+Authorization: Bearer fake-token
+Cookie: oai-did=device-1; __Secure-next-auth.session-token.0=session-1
+OpenAI-Sentinel-Chat-Requirements-Token: req-token
+OpenAI-Sentinel-Proof-Token: proof-token
+OpenAI-Sentinel-Turnstile-Token: turnstile-token
+x-conduit-token: conduit-token
+OAI-Device-Id: device-1
+OAI-Session-Id: session-1
+Request Data: {"action":"next","model":"gpt-5-6-thinking","thinking_effort":"extended"}
+""".strip()
+    config_home = tmp_path / "config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("CHATGPT_WORKER_DATA_DIR", str(tmp_path / "worker"))
+    monkeypatch.setattr(
+        cli,
+        "capture_from_local_setup_page",
+        lambda **kwargs: LocalSetupResult(capture_text=capture_text),
+    )
+    monkeypatch.setattr(cli, "_check_account_auth", lambda capture, impersonate: (200, True, None))
+
+    assert main(["setup", "--account", "main", "--yes", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    capture_path = config_home / "gpt-bridge" / "accounts" / "main" / "chatgpt-request.txt"
+    assert payload["ok"] is True
+    assert payload["live_verify"]["auth_ok"] is True
+    assert is_encrypted(capture_path.read_text(encoding="utf-8"))
+
+
+def test_keyboard_interrupt_exits_cleanly_without_traceback(monkeypatch, capsys):
+    async def interrupted(args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "cmd_setup", interrupted)
+
+    assert main(["setup", "--yes"]) == 130
+    stderr = capsys.readouterr().err
+    assert "cancelled=true" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_network_error_exits_cleanly_without_traceback(monkeypatch, capsys):
+    async def failed(args):
+        raise cli.CurlRequestException(
+            "Failed to perform, curl: (6) Could not resolve host: chatgpt.com. "
+            "See https://curl.se/libcurl/c/libcurl-errors.html first for more details."
+        )
+
+    monkeypatch.setattr(cli, "cmd_setup", failed)
+
+    assert main(["setup", "--yes"]) == 2
+    stderr = capsys.readouterr().err
+    assert stderr == "network error: Failed to perform, curl: (6) Could not resolve host: chatgpt.com.\n"
+    assert "Traceback" not in stderr

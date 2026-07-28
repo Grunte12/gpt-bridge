@@ -19,13 +19,20 @@ from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
-from chatgpt_api.api.admin import console_url_for_config
+from chatgpt_api.api.admin import console_url_for_config, save_account_capture_payload
 from chatgpt_api.api.openai_compat import OpenAICompatConfig, run_server
 from chatgpt_api.api.presets import PRESETS
 from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.registry import default_registry
 from chatgpt_api.core.types import ChatRequest, ContentPart, ImageInput, ImageRequest, Message
+from chatgpt_api.image_alpha import TransparencyError, ensure_transparent_png
+from chatgpt_api.integration_installer import (
+    SUPPORTED_TARGETS,
+    install_integrations,
+    print_results as print_integration_results,
+)
 from chatgpt_api.providers import register_builtin_providers
 from chatgpt_api.providers.chatgpt.account_info import (
     detect_account_info,
@@ -39,7 +46,6 @@ from chatgpt_api.providers.chatgpt.accounts import (
     resolve_account_settings_path,
 )
 from chatgpt_api.providers.chatgpt.auth import ChatGPTAuthConfig
-from chatgpt_api.providers.chatgpt.browser_onboarding import capture_from_visible_browser
 from chatgpt_api.providers.chatgpt.crypto import (
     clear_runtime_passphrase,
     encrypt_or_reencrypt_file,
@@ -49,6 +55,7 @@ from chatgpt_api.providers.chatgpt.crypto import (
     is_encrypted,
     set_runtime_passphrase,
 )
+from chatgpt_api.providers.chatgpt.local_setup import capture_from_local_setup_page
 from chatgpt_api.threads import (
     ThreadState,
     compacted_thread,
@@ -60,6 +67,7 @@ from chatgpt_api.threads import (
     thread_path,
     validate_thread_name,
 )
+from chatgpt_api.worker import DEFAULT_AGENT_MODEL, DirectWorkerClient
 from chatgpt_api.worker.client import WorkerClient
 from chatgpt_api.worker.migration import default_legacy_threads_dir, migrate_legacy_threads
 from chatgpt_api.worker.stack import compose_args, default_stack_dir, run_compose
@@ -81,8 +89,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return asyncio.run(args.func(args))
+    except KeyboardInterrupt:
+        print("\ncancelled=true", file=sys.stderr)
+        return 130
     except ProviderError as exc:
-        print(f"provider error: {exc}", file=sys.stderr)
+        print(f"provider error: {_compact_cli_error(exc)}", file=sys.stderr)
+        return 2
+    except (CurlRequestException, httpx.HTTPError) as exc:
+        print(f"network error: {_compact_network_error(exc)}", file=sys.stderr)
         return 2
 
 
@@ -98,6 +112,18 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
 
+    setup = subparsers.add_parser(
+        "setup",
+        help="Open a one-shot local page in your normal browser, save one encrypted account, verify it, and exit",
+    )
+    setup.add_argument("--account", default="main", metavar="ACCOUNT_NAME")
+    setup.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
+    setup.add_argument("--timeout", type=int, default=600, metavar="SECONDS")
+    setup.add_argument("--yes", action="store_true", help="Acknowledge the local-session consent prompt")
+    setup.add_argument("--no-live-verify", action="store_true")
+    setup.add_argument("--json", action="store_true")
+    setup.set_defaults(func=cmd_setup)
+
     menu = subparsers.add_parser("menu", help="Interactive control-plane menu for common admin tasks")
     menu.add_argument("--base-url", default=_admin_base_url_default())
     menu.add_argument("--api-key", default=_admin_api_key_default())
@@ -112,12 +138,15 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
 
     auth = subparsers.add_parser("auth", help="Consent-based local browser onboarding and session lifecycle")
     auth_subparsers = auth.add_subparsers(required=True)
-    auth_login = auth_subparsers.add_parser("login", help="Experimental: open an isolated browser and save one local session after consent")
+    auth_login = auth_subparsers.add_parser(
+        "login",
+        help="Open a one-shot local setup page in the normal browser and save one encrypted session",
+    )
     auth_login.add_argument("--account", metavar="ACCOUNT_NAME", help="Local account alias to create or replace")
     auth_login.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
     auth_login.add_argument("--base-url", default=_admin_base_url_default())
     auth_login.add_argument("--api-key", default=_admin_api_key_default())
-    auth_login.add_argument("--timeout", type=int, default=600, metavar="SECONDS", help="Visible-browser timeout (default: 600)")
+    auth_login.add_argument("--timeout", type=int, default=600, metavar="SECONDS", help="Local setup-page timeout (default: 600)")
     auth_login.add_argument("--yes", action="store_true", help="Acknowledge the local-session consent prompt in non-interactive use")
     auth_login.add_argument("--no-live-verify", action="store_true", help="Skip the post-save local account probe")
     auth_login.add_argument("--json", action="store_true")
@@ -127,6 +156,17 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     auth_status.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
     auth_status.add_argument("--json", action="store_true")
     auth_status.set_defaults(func=cmd_auth_status)
+
+    auth_import = auth_subparsers.add_parser(
+        "import",
+        help="Validate, encrypt, and save one manually captured ChatGPT request without a running server",
+    )
+    auth_import.add_argument("--account", required=True, metavar="ACCOUNT_NAME")
+    auth_import.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
+    auth_import.add_argument("--capture-file", type=Path, metavar="PATH")
+    auth_import.add_argument("--paste", action="store_true")
+    auth_import.add_argument("--json", action="store_true")
+    auth_import.set_defaults(func=cmd_auth_import)
 
     auth_logout = auth_subparsers.add_parser("logout", help="Delete one local session through the local admin API")
     auth_logout.add_argument("--account", required=True, metavar="ACCOUNT_NAME")
@@ -458,9 +498,18 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     api_image.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     api_image.add_argument("--output-dir", default=None)
     api_image.add_argument("--output-path", default=None)
+    api_image.add_argument(
+        "--transparent",
+        action="store_true",
+        help="Create a real transparent PNG using native alpha or safe local matte removal; requires --output-path *.png",
+    )
     api_image.add_argument("--operation-id", default=None)
-    api_image.add_argument("--enhance", action="store_true", help="Expand the image prompt with a preparatory chat call")
-    api_image.add_argument("--enhance-model", default="auto", help="Model used for the optional prompt enhancement")
+    api_image.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Legacy two-call prompt rewrite; costs an extra chat request and is not recommended for agent use",
+    )
+    api_image.add_argument("--enhance-model", default="auto", help="Model used by the legacy prompt rewrite")
     api_image.add_argument("--json", action="store_true")
     _add_api_route_arguments(api_image)
     api_image.set_defaults(func=cmd_api_image)
@@ -475,9 +524,18 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     api_edit.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     api_edit.add_argument("--output-dir", default=None)
     api_edit.add_argument("--output-path", default=None)
+    api_edit.add_argument(
+        "--transparent",
+        action="store_true",
+        help="Create a real transparent PNG using native alpha or safe local matte removal; requires --output-path *.png",
+    )
     api_edit.add_argument("--operation-id", default=None)
-    api_edit.add_argument("--enhance", action="store_true", help="Expand the image-edit prompt with a preparatory chat call")
-    api_edit.add_argument("--enhance-model", default="auto", help="Model used for the optional prompt enhancement")
+    api_edit.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Legacy two-call prompt rewrite; costs an extra chat request and is not recommended for agent use",
+    )
+    api_edit.add_argument("--enhance-model", default="auto", help="Model used by the legacy prompt rewrite")
     api_edit.add_argument("--json", action="store_true")
     _add_api_route_arguments(api_edit)
     api_edit.set_defaults(func=cmd_api_edit)
@@ -553,8 +611,12 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     image.add_argument("--prompt", "-p", required=True)
     image.add_argument("--input-image", type=Path, action="append", default=[])
     image.add_argument("--aspect-ratio", choices=["auto", "1:1", "3:4", "9:16", "4:3", "16:9"], default="auto")
-    image.add_argument("--enhance", action="store_true", help="Expand the image prompt with a preparatory chat call")
-    image.add_argument("--enhance-model", default="auto", help="Model used for the optional prompt enhancement")
+    image.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Legacy two-call prompt rewrite; costs an extra chat request and is not recommended for agent use",
+    )
+    image.add_argument("--enhance-model", default="auto", help="Model used by the legacy prompt rewrite")
     image.add_argument("--out", type=Path, default=None)
     image.add_argument("--account", default=None)
     image.add_argument("--accounts-dir", type=Path, default=None)
@@ -608,7 +670,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     server_command.add_argument(
         "--accounts",
         default=os.environ.get("CHATGPT_ACCOUNTS", ""),
-        help="Optional comma-separated local account aliases. Omit to auto-discover secrets/accounts/*.",
+        help="Optional comma-separated local account aliases. Omit to auto-discover the configured account store.",
     )
     server_command.add_argument("--api-key", default=_admin_api_key_default())
     server_command.add_argument("--host", default=None, help="Override generated server host for the local preset")
@@ -621,28 +683,70 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     _add_serve_arguments(serve)
     serve.set_defaults(func=cmd_serve)
 
+    integrations = subparsers.add_parser(
+        "integrations",
+        help="Install native GPT Bridge adapters for Codex, Claude Code, and OpenCode",
+    )
+    integrations_subparsers = integrations.add_subparsers(required=True)
+    integrations_install = integrations_subparsers.add_parser(
+        "install",
+        help="Register one or more agent-host integrations",
+    )
+    integrations_install.add_argument(
+        "--target",
+        action="append",
+        choices=SUPPORTED_TARGETS,
+        dest="targets",
+        help="Host to install; repeat as needed. Defaults to every supported host.",
+    )
+    integrations_install.add_argument(
+        "--source",
+        default=str(Path(__file__).resolve().parents[1]),
+        help="Local GPT Bridge checkout containing the skill source",
+    )
+    integrations_install.add_argument("--scope", choices=["user", "project"], default="user")
+    integrations_install.add_argument("--project-dir", type=Path, default=Path.cwd())
+    integrations_install.add_argument("--opencode-config", type=Path, default=None)
+    integrations_install.add_argument("--set-opencode-default", action="store_true")
+    integrations_install.add_argument("--dry-run", action="store_true")
+    integrations_install.add_argument("--json", action="store_true")
+    integrations_install.set_defaults(func=cmd_integrations_install)
+
     worker = subparsers.add_parser(
         "worker",
-        help="Use the local Bridge API as an automation worker (never handles browser captures)",
+        help="Use one local ChatGPT account as an automation worker; direct mode needs no Docker or daemon",
+    )
+    worker.add_argument(
+        "--transport",
+        choices=["direct", "http"],
+        default=os.environ.get("GPT_BRIDGE_WORKER_TRANSPORT", "direct"),
+        help="direct calls ChatGPT in-process (default); http calls an already-running local Bridge API",
     )
     worker.add_argument("--base-url", default=_worker_base_url_default())
     worker.add_argument("--api-key", default=_worker_api_key_default())
-    worker.add_argument("--timeout", type=float, default=120.0)
+    worker.add_argument("--timeout", type=float, default=5400.0)
+    worker.add_argument(
+        "--account",
+        dest="worker_account",
+        default=os.environ.get("CHATGPT_ACCOUNT"),
+        help="Single local account alias for direct mode; CHATGPT_ACCOUNT is used when omitted",
+    )
+    worker.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
     worker_subparsers = worker.add_subparsers(required=True)
 
-    worker_status = worker_subparsers.add_parser("status", help="Show local Bridge status in a worker-friendly form")
+    worker_status = worker_subparsers.add_parser("status", help="Show the selected worker transport and local runtime status")
     worker_status.add_argument("--json", action="store_true")
     worker_status.set_defaults(func=cmd_worker_status)
 
-    worker_doctor = worker_subparsers.add_parser("doctor", help="Check local Bridge reachability, health, and models")
+    worker_doctor = worker_subparsers.add_parser("doctor", help="Check the direct account/runtime or optional HTTP gateway")
     worker_doctor.add_argument("--json", action="store_true")
     worker_doctor.set_defaults(func=cmd_worker_doctor)
 
-    worker_chat = worker_subparsers.add_parser("chat", help="Send an automation chat through the local Bridge API")
+    worker_chat = worker_subparsers.add_parser("chat", help="Send an automation chat through the selected worker transport")
     worker_chat.add_argument("--message", "-m", required=True)
     worker_chat.add_argument("--system", default=None)
     worker_chat.add_argument("--preset", choices=sorted(PRESETS), default=None)
-    worker_chat.add_argument("--model", default="auto")
+    worker_chat.add_argument("--model", default=DEFAULT_AGENT_MODEL)
     worker_chat.add_argument("--thinking-effort", default=None)
     worker_chat.add_argument("--agent-mode", choices=["optimized", "opencode"], default=None)
     worker_chat.add_argument("--temperature", type=float, default=None)
@@ -666,13 +770,13 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_report.add_argument("--prompt", "-p", required=True)
     worker_report.add_argument("--title", default=None, help="Optional reader-facing title supplied to the report author")
     worker_report.add_argument("--preset", choices=sorted(PRESETS), default="structured")
-    worker_report.add_argument("--model", default="auto")
+    worker_report.add_argument("--model", default=DEFAULT_AGENT_MODEL)
     worker_report.add_argument("--out", type=Path, default=None, help="Destination .html file (default: worker data reports directory)")
     worker_report.add_argument("--json", action="store_true")
     _add_api_route_arguments(worker_report)
     worker_report.set_defaults(func=cmd_worker_report)
 
-    worker_image = worker_subparsers.add_parser("image", help="Generate an image through the local Bridge API")
+    worker_image = worker_subparsers.add_parser("image", help="Generate an image through the selected worker transport")
     worker_image.add_argument("--prompt", "-p", required=True)
     worker_image.add_argument("--model", default="auto")
     worker_image.add_argument("--size", default=None)
@@ -681,14 +785,61 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_image.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     worker_image.add_argument("--output-dir", default=None)
     worker_image.add_argument("--output-path", default=None)
+    worker_image.add_argument(
+        "--transparent",
+        action="store_true",
+        help="Create a real transparent PNG using native alpha or safe local matte removal; requires --output-path *.png",
+    )
     worker_image.add_argument("--operation-id", default=None)
-    worker_image.add_argument("--enhance", action="store_true")
-    worker_image.add_argument("--enhance-model", default="auto")
+    worker_image.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Legacy two-call prompt rewrite; costs an extra chat request and is not recommended for agent use",
+    )
+    worker_image.add_argument("--enhance-model", default=DEFAULT_AGENT_MODEL, help="Model used by the legacy prompt rewrite")
+    worker_image.add_argument(
+        "--brief",
+        action="store_true",
+        help="Return compact JSON with output locations only, minimizing agent context",
+    )
     worker_image.add_argument("--json", action="store_true")
     _add_api_route_arguments(worker_image)
     worker_image.set_defaults(func=cmd_worker_image)
 
-    worker_research = worker_subparsers.add_parser("research", help="Run ChatGPT Deep Research through the local Bridge API")
+    worker_edit = worker_subparsers.add_parser(
+        "edit",
+        help="Edit, restyle, or composite source images through the selected worker transport",
+    )
+    worker_edit.add_argument("--prompt", "-p", required=True)
+    worker_edit.add_argument("--input-image", type=Path, action="append", default=[], required=True)
+    worker_edit.add_argument("--aspect-ratio", choices=["auto", "1:1", "3:4", "9:16", "4:3", "16:9"], default="auto")
+    worker_edit.add_argument("--model", default="auto")
+    worker_edit.add_argument("--size", default=None)
+    worker_edit.add_argument("--response-format", choices=["url", "b64_json"], default="url")
+    worker_edit.add_argument("--output-dir", default=None)
+    worker_edit.add_argument("--output-path", default=None)
+    worker_edit.add_argument(
+        "--transparent",
+        action="store_true",
+        help="Create a real transparent PNG using native alpha or safe local matte removal; requires --output-path *.png",
+    )
+    worker_edit.add_argument("--operation-id", default=None)
+    worker_edit.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Legacy two-call prompt rewrite; costs an extra chat request and is not recommended for agent use",
+    )
+    worker_edit.add_argument("--enhance-model", default=DEFAULT_AGENT_MODEL, help="Model used by the legacy prompt rewrite")
+    worker_edit.add_argument(
+        "--brief",
+        action="store_true",
+        help="Return compact JSON with output locations only, minimizing agent context",
+    )
+    worker_edit.add_argument("--json", action="store_true")
+    _add_api_route_arguments(worker_edit)
+    worker_edit.set_defaults(func=cmd_worker_edit)
+
+    worker_research = worker_subparsers.add_parser("research", help="Run ChatGPT Deep Research through the selected worker transport")
     worker_research.add_argument("--prompt", "-p", required=True)
     worker_research.add_argument("--model", default="chatgpt-deep-research")
     worker_research.add_argument("--output-dir", default=None)
@@ -735,6 +886,24 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     return parser
 
 
+def _compact_network_error(exc: Exception) -> str:
+    detail = str(exc).strip() or exc.__class__.__name__
+    return detail.split("See https://", 1)[0].strip()
+
+
+async def cmd_integrations_install(args: argparse.Namespace) -> int:
+    results = install_integrations(
+        tuple(args.targets or SUPPORTED_TARGETS),
+        source=args.source,
+        scope=args.scope,
+        project_dir=args.project_dir,
+        opencode_config=args.opencode_config,
+        set_opencode_default=args.set_opencode_default,
+        dry_run=args.dry_run,
+    )
+    return print_integration_results(results, as_json=args.json)
+
+
 def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--interactive",
@@ -755,7 +924,7 @@ def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--accounts",
         default=os.environ.get("CHATGPT_ACCOUNTS", ""),
-        help="Comma-separated local account aliases for routing. Omit to auto-discover captures under secrets/accounts/*.",
+        help="Comma-separated local account aliases for routing. Omit to auto-discover the configured account store.",
     )
     parser.add_argument(
         "--account-strategy",
@@ -923,13 +1092,20 @@ def _worker_threads_dir(args: argparse.Namespace) -> Path:
 
 
 async def cmd_worker_status(args: argparse.Namespace) -> int:
-    payload = await WorkerClient(args.base_url, args.api_key, args.timeout).request_json("GET", "/chatgpt/admin/status")
-    result = {"object": "chatgpt.worker.status", "base_url": args.base_url, "status": payload}
+    payload = await _worker_client(args).request_json("GET", "/chatgpt/admin/status")
+    result = {
+        "object": "chatgpt.worker.status",
+        "transport": args.transport,
+        "base_url": args.base_url if args.transport == "http" else None,
+        "status": payload,
+    }
     if args.json:
         _print_json(result)
         return 0
     print(_headline("Worker Status"))
-    print(f"base_url={args.base_url}")
+    print(f"transport={args.transport}")
+    if args.transport == "http":
+        print(f"base_url={args.base_url}")
     for key in ("status", "accounts", "strategy", "model_fallback"):
         if key in payload:
             print(f"{key}={json.dumps(payload[key], ensure_ascii=False, sort_keys=True)}")
@@ -937,6 +1113,41 @@ async def cmd_worker_status(args: argparse.Namespace) -> int:
 
 
 async def cmd_worker_doctor(args: argparse.Namespace) -> int:
+    if args.transport == "direct":
+        checks: dict[str, dict[str, object]] = {}
+        try:
+            client = _worker_client(args)
+        except ProviderError as exc:
+            checks["account"] = {"ok": False, "detail": str(exc)}
+        else:
+            for name, path in (
+                ("account", "/health"),
+                ("models", "/models"),
+                ("runtime", "/chatgpt/admin/status"),
+            ):
+                try:
+                    checks[name] = {"ok": True, "data": await client.request_json("GET", path)}
+                except ProviderError as exc:
+                    checks[name] = {"ok": False, "detail": str(exc)}
+        ok = all(item["ok"] for item in checks.values())
+        result = {
+            "object": "chatgpt.worker.doctor",
+            "ok": ok,
+            "transport": "direct",
+            "default_model": DEFAULT_AGENT_MODEL,
+            "checks": checks,
+        }
+        if args.json:
+            _print_json(result)
+        else:
+            print(_headline("Worker Doctor"))
+            print("transport=direct")
+            print(f"default_model={DEFAULT_AGENT_MODEL}")
+            for name, item in checks.items():
+                suffix = "ok" if item["ok"] else str(item["detail"])
+                print(f"{name}={suffix}")
+        return 0 if ok else 1
+
     client = WorkerClient(args.base_url, args.api_key, args.timeout)
     root_base = args.base_url.rstrip("/")
     if root_base.endswith("/v1"):
@@ -993,7 +1204,7 @@ async def cmd_worker_report(args: argparse.Namespace) -> int:
     if metadata:
         body["metadata"] = metadata
     _apply_api_route_options(body, args)
-    payload = await WorkerClient(args.base_url, args.api_key, args.timeout).request_json("POST", "/chat/completions", body)
+    payload = await _worker_client(args).request_json("POST", "/chat/completions", body)
     html = _completion_text(payload).strip()
     if not html:
         raise ProviderError("worker report received an empty response")
@@ -1018,6 +1229,10 @@ async def cmd_worker_report(args: argparse.Namespace) -> int:
 
 async def cmd_worker_image(args: argparse.Namespace) -> int:
     return await cmd_api_image(args)
+
+
+async def cmd_worker_edit(args: argparse.Namespace) -> int:
+    return await cmd_api_edit(args)
 
 
 async def cmd_worker_research(args: argparse.Namespace) -> int:
@@ -1111,7 +1326,7 @@ async def cmd_worker_request(args: argparse.Namespace) -> int:
     body = _json_object_arg(args.body_json, "--body-json") if args.body_json else None
     if args.method == "GET" and body is not None:
         raise ProviderError("worker request GET does not accept --body-json")
-    payload = await WorkerClient(args.base_url, args.api_key, args.timeout).request_json(args.method, args.path, body)
+    payload = await _worker_client(args).request_json(args.method, args.path, body)
     if args.json:
         _print_json(payload)
     else:
@@ -1119,9 +1334,24 @@ async def cmd_worker_request(args: argparse.Namespace) -> int:
     return 0
 
 
-def _accounts_dir_default() -> Path | None:
-    value = os.environ.get("CHATGPT_ACCOUNTS_DIR", "").strip()
-    return Path(value) if value else None
+def _worker_client(args: argparse.Namespace) -> WorkerClient | DirectWorkerClient:
+    if getattr(args, "transport", "http") == "direct":
+        routed_accounts = getattr(args, "accounts", None)
+        if isinstance(routed_accounts, str) and routed_accounts.strip():
+            raise ProviderError(
+                "direct worker mode intentionally supports one account; use --account or CHATGPT_ACCOUNT, "
+                "or select `worker --transport http` for account routing"
+            )
+        return DirectWorkerClient(
+            account=getattr(args, "account", None) or getattr(args, "worker_account", None),
+            accounts_dir=getattr(args, "accounts_dir", None),
+            timeout=_request_timeout(args),
+        )
+    return WorkerClient(args.base_url, args.api_key, _request_timeout(args))
+
+
+def _accounts_dir_default() -> Path:
+    return accounts_dir_from_env()
 
 
 async def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1140,7 +1370,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         {
             "name": "account_profiles",
             "ok": bool(profiles),
-            "detail": f"{len(profiles)} profile(s) in {accounts_dir or 'default secrets/accounts'}",
+            "detail": f"{len(profiles)} profile(s) in {accounts_dir or accounts_dir_from_env()}",
         }
     )
     checks.append({"name": "dockerfile", "ok": Path("Dockerfile").exists(), "detail": "Dockerfile"})
@@ -2016,36 +2246,71 @@ async def cmd_admin_save_capture(args: argparse.Namespace) -> int:
     return await _save_capture_with_verification(args)
 
 
+async def cmd_setup(args: argparse.Namespace) -> int:
+    return await _run_local_setup(args, heading="GPT Bridge Setup")
+
+
 async def cmd_auth_login(args: argparse.Namespace) -> int:
+    return await _run_local_setup(args, heading="Local Browser Onboarding")
+
+
+async def _run_local_setup(args: argparse.Namespace, *, heading: str) -> int:
     account = _account_name_from_args(args)
     if args.timeout < 30:
         raise ProviderError("--timeout must be at least 30 seconds")
+    accounts_dir = args.accounts_dir or accounts_dir_from_env()
+    progress_stream = sys.stderr if args.json else sys.stdout
     if not args.yes:
         if not sys.stdin.isatty() or args.json:
-            raise ProviderError("auth login needs --yes in non-interactive or JSON mode")
-        print(_headline("Experimental Local Browser Onboarding"))
-        print("This unofficial flow opens an isolated local Chrome profile.")
-        print("You sign in, complete MFA/challenges, and send one short message yourself.")
+            raise ProviderError("local setup needs --yes in non-interactive or JSON mode")
+        print(_headline(heading))
+        print("This unofficial flow opens a one-shot page in your normal browser and exits after setup.")
+        print("You use your existing ChatGPT tab and copy one conversation request yourself.")
         print("Only the session material required by this local bridge is saved, encrypted locally,")
         print("and it is never uploaded, shared, printed, or included in telemetry.")
         print("The upstream service can reject or change this workflow at any time.")
-        print(f"Storage: {args.accounts_dir or accounts_dir_from_env()}")
+        print(f"Storage: {accounts_dir}")
         if _prompt_choice("Continue", ["no", "yes"], default="no") != "yes":
             print("cancelled=true")
             return 1
-    print("Opening an isolated Chrome window. Sign in yourself, then send one short message in ChatGPT.")
-    print("Nothing is saved until a valid request is found and local validation succeeds.")
-    result = await asyncio.to_thread(
-        capture_from_visible_browser,
-        accounts_dir=args.accounts_dir or accounts_dir_from_env(),
-        timeout_seconds=args.timeout,
+    print(
+        "Opening a private one-shot setup page in your normal browser.",
+        file=progress_stream,
     )
-    if not args.yes:
-        if _prompt_choice("Session recognized. Save locally and close browser?", ["no", "yes"], default="no") != "yes":
-            print("cancelled=true")
-            print("saved=false")
-            return 1
-    return await _save_capture_text_with_verification(args, account, result.capture_text)
+    print(
+        "Paste only inside that local page and click Validate & Save locally; no terminal paste is needed.",
+        file=progress_stream,
+    )
+    result = await asyncio.to_thread(
+        capture_from_local_setup_page,
+        timeout_seconds=args.timeout,
+        announce=lambda message: print(message, file=progress_stream),
+    )
+    status, payload = _save_local_capture(account, result.capture_text, accounts_dir)
+    if status >= 400:
+        return _print_local_capture_result(
+            args,
+            account=account,
+            accounts_dir=accounts_dir,
+            status=status,
+            payload=payload,
+            live_verify=None,
+        )
+
+    live_verify: dict[str, object] | None = None
+    if not getattr(args, "no_live_verify", False):
+        capture_path = resolve_account_capture_path(account, accounts_dir)
+        capture = CapturedRequest.from_file(capture_path)
+        verify_status, auth_ok, detail = await asyncio.to_thread(_check_account_auth, capture, "chrome")
+        live_verify = {"status": verify_status, "auth_ok": auth_ok, "detail": detail}
+    return _print_local_capture_result(
+        args,
+        account=account,
+        accounts_dir=accounts_dir,
+        status=status,
+        payload=payload,
+        live_verify=live_verify,
+    )
 
 
 async def cmd_auth_status(args: argparse.Namespace) -> int:
@@ -2073,6 +2338,86 @@ async def cmd_auth_status(args: argparse.Namespace) -> int:
 
 async def cmd_auth_logout(args: argparse.Namespace) -> int:
     return await cmd_admin_delete_account(args)
+
+
+async def cmd_auth_import(args: argparse.Namespace) -> int:
+    account = _account_name_from_args(args)
+    capture_text = _capture_text_from_args(args)
+    accounts_dir = args.accounts_dir or accounts_dir_from_env()
+    status, payload = _save_local_capture(account, capture_text, accounts_dir)
+    return _print_local_capture_result(
+        args,
+        account=account,
+        accounts_dir=accounts_dir,
+        status=status,
+        payload=payload,
+        live_verify=None,
+    )
+
+
+def _save_local_capture(
+    account: str,
+    capture_text: str,
+    accounts_dir: Path,
+) -> tuple[int, dict[str, object]]:
+    paths = WorkerPaths.default()
+    config = OpenAICompatConfig(
+        account=account,
+        accounts=(account,),
+        accounts_dir=accounts_dir,
+        account_strategy="sticky",
+        model_fallback=None,
+        admin_db_path=paths.root / "worker.db",
+    )
+    return save_account_capture_payload(
+        config,
+        {"account": account, "capture_text": capture_text},
+    )
+
+
+def _print_local_capture_result(
+    args: argparse.Namespace,
+    *,
+    account: str,
+    accounts_dir: Path,
+    status: int,
+    payload: dict[str, object],
+    live_verify: dict[str, object] | None,
+) -> int:
+    verify_ok = live_verify is None or bool(live_verify.get("auth_ok"))
+    result = dict(payload)
+    result.update(
+        {
+            "ok": status < 400 and verify_ok,
+            "account": account,
+            "accounts_dir": str(accounts_dir),
+        }
+    )
+    if live_verify is not None:
+        result["live_verify"] = live_verify
+    if args.json:
+        _print_json(result)
+    elif status < 400:
+        inspection = payload.get("inspection") if isinstance(payload.get("inspection"), dict) else {}
+        print(_headline("GPT Bridge Account Ready"))
+        print("saved=true")
+        print(f"account={account}")
+        print(f"capture_path={payload.get('capture_path') or '-'}")
+        print(f"model={inspection.get('preview', {}).get('request_model') if isinstance(inspection.get('preview'), dict) else '-'}")
+        if live_verify is not None:
+            print(f"live_verify={'ok' if verify_ok else 'failed'}")
+            if live_verify.get("detail"):
+                print(f"live_detail={live_verify['detail']}")
+        print("next=gpt-bridge worker doctor --json")
+    else:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        print(_headline("Account Capture Rejected"))
+        print("saved=false")
+        print(f"account={account}")
+        print(f"error={error.get('message') or 'capture validation failed'}")
+    if status >= 400:
+        return 1
+    return 0 if verify_ok else 2
 
 
 async def _save_capture_with_verification(args: argparse.Namespace) -> int:
@@ -2348,7 +2693,7 @@ async def cmd_admin_presets(args: argparse.Namespace) -> int:
         .format(key=args.api_key, accounts=account_env)
     )
     if not accounts_env:
-        print("  # CHATGPT_ACCOUNTS is optional; omitted means auto-discover every saved capture under secrets/accounts/*.")
+        print("  # CHATGPT_ACCOUNTS is optional; omitted means auto-discover every saved capture in the configured account store.")
     print("\nManage while running:")
     print("  gpt-bridge admin status --base-url http://127.0.0.1:8000/v1 --api-key YOUR_LOCAL_KEY")
     print("  gpt-bridge admin set-limits --upload pro=1 --image pro=3 --research pro=2 --base-url http://127.0.0.1:8000/v1 --api-key YOUR_LOCAL_KEY")
@@ -2431,7 +2776,7 @@ async def _summarize_api_thread(args: argparse.Namespace, state: ThreadState) ->
     if state.compacted_summary:
         transcript["previous_summary"] = state.compacted_summary
     body: dict[str, object] = {
-        "model": "auto",
+        "model": args.model or DEFAULT_AGENT_MODEL,
         "stream": False,
         "messages": [
             {
@@ -2542,10 +2887,34 @@ _IMAGE_EDIT_PROMPT_ENHANCER = (
     "must change from what must stay untouched, and add useful composition or styling detail only when supported "
     "by the request. Do not claim to have inspected an image. Return only the final prompt."
 )
+_IMAGE_ENHANCEMENT_ARTIFACT_MARKERS = (
+    "image generated.",
+    "saved files:",
+    "download links:",
+    "generated_images/",
+    '"local_paths"',
+    '"image_url"',
+)
 
 
 def _image_enhancement_system_prompt(editing: bool) -> str:
     return _IMAGE_EDIT_PROMPT_ENHANCER if editing else _IMAGE_PROMPT_ENHANCER
+
+
+def _image_prompt_enhancement_issue(value: str) -> str | None:
+    stripped = value.strip()
+    if not stripped:
+        return "image prompt enhancement returned an empty response"
+    if re.fullmatch(
+        r"(?:file://)?/(?:users|home|tmp|private|var)/[^\r\n]+?\.(?:avif|gif|jpe?g|png|webp)",
+        stripped,
+        flags=re.IGNORECASE,
+    ):
+        return "image prompt enhancement returned an image file path; using the original prompt"
+    normalized = stripped.lower()
+    if any(marker in normalized for marker in _IMAGE_ENHANCEMENT_ARTIFACT_MARKERS):
+        return "image prompt enhancement returned an image artifact response; using the original prompt"
+    return None
 
 
 async def _enhance_api_image_prompt(
@@ -2568,8 +2937,9 @@ async def _enhance_api_image_prompt(
     try:
         payload = await _api_request_json(args, "POST", "/chat/completions", body)
         enhanced = _completion_text(payload).strip()
-        if not enhanced:
-            raise ProviderError("image prompt enhancement returned an empty response")
+        issue = _image_prompt_enhancement_issue(enhanced)
+        if issue:
+            raise ProviderError(issue)
     except ProviderError as exc:
         return prompt, False, str(exc)
     return enhanced, True, None
@@ -2603,8 +2973,9 @@ async def _enhance_direct_image_prompt(
     except ProviderError as exc:
         return prompt, False, str(exc)
     enhanced = "".join(chunks).strip()
-    if not enhanced:
-        return prompt, False, "image prompt enhancement returned an empty response"
+    issue = _image_prompt_enhancement_issue(enhanced)
+    if issue:
+        return prompt, False, issue
     return enhanced, True, None
 
 
@@ -2629,11 +3000,73 @@ def _print_enhancement_result(prompt: str, applied: bool, error: str | None) -> 
         print(f"prompt_enhancement_warning={error}", file=sys.stderr)
 
 
+def _brief_image_payload(payload: dict[str, object], local_paths: list[Path]) -> dict[str, object]:
+    outputs: list[dict[str, str]] = [{"path": str(path)} for path in local_paths]
+    if not outputs:
+        data = payload.get("data")
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                if isinstance(path, str) and path:
+                    outputs.append({"path": path})
+                    continue
+                url = item.get("download_url") or item.get("url")
+                if isinstance(url, str) and url:
+                    outputs.append({"url": url})
+    return {"ok": bool(outputs), "outputs": outputs}
+
+
+_TRANSPARENT_ASSET_SUFFIX = (
+    "\n\nOutput requirement: return one isolated frontend-ready asset with a truly transparent alpha background, "
+    "not a checkerboard pattern. If native alpha is unavailable, use a perfectly flat solid #FF00FF background "
+    "across the whole canvas with no gradient, texture, vignette, cast shadow, glow, or magenta spill. Keep the "
+    "subject separate from every canvas edge and do not use #FF00FF inside the subject."
+)
+
+
+def _transparent_image_prompt(args: argparse.Namespace, prompt: str) -> str:
+    if not getattr(args, "transparent", False):
+        return prompt
+    output_path = getattr(args, "output_path", None)
+    if not output_path:
+        raise ProviderError("--transparent requires --output-path ending in .png")
+    if Path(output_path).suffix.lower() != ".png":
+        raise ProviderError("--transparent output path must end in .png")
+    return prompt.rstrip() + _TRANSPARENT_ASSET_SUFFIX
+
+
+def _apply_transparent_output(
+    args: argparse.Namespace,
+    paths: list[Path],
+) -> tuple[list[Path], list[dict[str, object]]]:
+    if not getattr(args, "transparent", False):
+        return paths, []
+    if not paths:
+        raise ProviderError("transparent image output was not saved locally")
+    results: list[dict[str, object]] = []
+    converted: list[Path] = []
+    for path in paths:
+        try:
+            result = ensure_transparent_png(path, path)
+        except TransparencyError as exc:
+            raise ProviderError(str(exc)) from exc
+        results.append(result)
+        converted.append(Path(str(result["path"])))
+    return converted, results
+
+
 async def cmd_api_image(args: argparse.Namespace) -> int:
     metadata: dict[str, object] = {}
     if args.operation_id:
         metadata["chatgpt_operation_id"] = args.operation_id
-    prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(args, args.prompt, editing=False)
+    requested_prompt = _transparent_image_prompt(args, args.prompt)
+    prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(
+        args,
+        requested_prompt,
+        editing=False,
+    )
     body = _compact_dict(
         {
             "model": args.model,
@@ -2648,10 +3081,16 @@ async def cmd_api_image(args: argparse.Namespace) -> int:
     _apply_api_route_options(body, args)
     payload = await _api_request_json(args, "POST", "/images/generations", body)
     local_paths = await _save_api_image_outputs(args, payload)
+    local_paths, transparency_results = _apply_transparent_output(args, local_paths)
     if local_paths:
         payload["local_paths"] = [str(path) for path in local_paths]
+    if transparency_results:
+        payload["chatgpt_transparency"] = transparency_results
     if args.enhance:
         _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
+    if getattr(args, "brief", False):
+        print(json.dumps(_brief_image_payload(payload, local_paths), ensure_ascii=False, separators=(",", ":")))
+        return 0
     if args.json:
         _print_json(payload)
         return 0
@@ -2662,10 +3101,17 @@ async def cmd_api_image(args: argparse.Namespace) -> int:
 
 
 async def cmd_api_edit(args: argparse.Namespace) -> int:
+    if not 1 <= len(args.input_image) <= 10:
+        raise ProviderError("image edit requires 1 to 10 --input-image values")
     metadata: dict[str, object] = {}
     if args.operation_id:
         metadata["chatgpt_operation_id"] = args.operation_id
-    prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(args, args.prompt, editing=True)
+    requested_prompt = _transparent_image_prompt(args, args.prompt)
+    prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(
+        args,
+        requested_prompt,
+        editing=True,
+    )
     body = _compact_dict(
         {
             "model": args.model,
@@ -2680,10 +3126,16 @@ async def cmd_api_edit(args: argparse.Namespace) -> int:
     _apply_api_route_options(body, args)
     payload = await _api_request_json(args, "POST", "/images/edits", body)
     local_paths = await _save_api_image_outputs(args, payload)
+    local_paths, transparency_results = _apply_transparent_output(args, local_paths)
     if local_paths:
         payload["local_paths"] = [str(path) for path in local_paths]
+    if transparency_results:
+        payload["chatgpt_transparency"] = transparency_results
     if args.enhance:
         _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
+    if getattr(args, "brief", False):
+        print(json.dumps(_brief_image_payload(payload, local_paths), ensure_ascii=False, separators=(",", ":")))
+        return 0
     if args.json:
         _print_json(payload)
         return 0
@@ -2947,6 +3399,8 @@ async def _api_request_json(
     path: str,
     body: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    if getattr(args, "transport", None) == "direct":
+        return await _worker_client(args).request_json(method, path, body)
     text = await _api_request_text(args, method, path, body)
     try:
         payload = json.loads(text) if text else {}
@@ -2987,6 +3441,12 @@ async def _api_request_text(
 
 
 async def _api_stream_chat(args: argparse.Namespace, body: dict[str, object]) -> str:
+    if getattr(args, "transport", None) == "direct":
+        payload = await _worker_client(args).request_json("POST", "/chat/completions", body)
+        text = _completion_text(payload)
+        if text:
+            print(text)
+        return text
     url = _admin_url(args.base_url, "/chat/completions")
     headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
     if args.api_key:
@@ -3127,6 +3587,12 @@ async def _api_image_item_bytes(args: argparse.Namespace, item: dict[str, object
         except Exception as exc:
             raise ProviderError("image response contained invalid b64_json") from exc
 
+    raw_path = _str_or_none(item.get("path"))
+    if getattr(args, "transport", None) == "direct" and raw_path:
+        path = Path(raw_path).expanduser()
+        if path.is_file():
+            return path.read_bytes(), _str_or_none(item.get("mime_type")) or mimetypes.guess_type(str(path))[0]
+
     raw_url = _str_or_none(item.get("download_url")) or _str_or_none(item.get("url"))
     if raw_url:
         url = _api_absolute_url(args.base_url, raw_url)
@@ -3139,7 +3605,6 @@ async def _api_image_item_bytes(args: argparse.Namespace, item: dict[str, object
             raise ProviderError(f"image download failed: HTTP {response.status_code}: {response.text[:300]}")
         return response.content, response.headers.get("content-type")
 
-    raw_path = _str_or_none(item.get("path"))
     if raw_path:
         path = Path(raw_path).expanduser()
         if path.is_file():
@@ -3154,7 +3619,9 @@ async def _save_api_research_output(args: argparse.Namespace, payload: dict[str,
     raw_url = _str_or_none(payload.get("chatgpt_research_report_download_url"))
     raw_path = _str_or_none(payload.get("chatgpt_research_report_path"))
     content: bytes
-    if raw_url:
+    if getattr(args, "transport", None) == "direct" and raw_path and Path(raw_path).expanduser().is_file():
+        content = Path(raw_path).expanduser().read_bytes()
+    elif raw_url:
         url = _api_absolute_url(args.base_url, raw_url)
         headers: dict[str, str] = {}
         if args.api_key:
@@ -3557,6 +4024,13 @@ def _print_json(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _compact_cli_error(error: object, max_chars: int = 600) -> str:
+    text = re.sub(r"\s+", " ", str(error)).strip() or type(error).__name__
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
 async def cmd_chat(args: argparse.Namespace) -> int:
     capture_path = _resolve_capture_path(args.capture, args.account, args.accounts_dir)
     provider = _provider_from_chat_args(args, capture_path)
@@ -3786,7 +4260,7 @@ def _apply_interactive_serve_args(args: argparse.Namespace) -> None:
     default_accounts = args.accounts or ",".join(profiles) or args.account
 
     print(_headline("Bridge Server Launch"))
-    print("Account values are local aliases stored under secrets/accounts, not ChatGPT plan names.")
+    print("Account values are aliases in the configured local account store, not ChatGPT plan names.")
     accounts_csv = _prompt_accounts_csv("routed account aliases", default=default_accounts, profiles=profiles)
     args.accounts = accounts_csv
     args.account = accounts_csv.split(",", 1)[0] if accounts_csv else _prompt_account_name("primary account alias", default=args.account)

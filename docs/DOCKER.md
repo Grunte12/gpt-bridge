@@ -1,4 +1,9 @@
-# Docker: local Console and Worker
+# Docker: optional local API and Console
+
+Docker is not required for `gpt-bridge worker`. The default direct worker calls
+one selected account in-process and exits after each task. Use this stack only
+when you need an always-on OpenAI-compatible HTTP endpoint, account routing, or
+the Console.
 
 The default Docker experience is intentionally small:
 
@@ -7,7 +12,7 @@ The default Docker experience is intentionally small:
   `127.0.0.1:8080`.
 
 Neither port is published to the LAN by default. The API is implementation
-plumbing for the Console and `gpt-bridge worker`, not a public service.
+plumbing for the Console and optional HTTP clients, not a public service.
 
 > ภาษาไทย: Docker default เปิดเฉพาะ API และ Console บนเครื่องนี้เท่านั้น
 > ไม่เปิดให้เครื่องอื่นใน LAN เรียกได้
