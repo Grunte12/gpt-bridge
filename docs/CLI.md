@@ -44,6 +44,8 @@ Bridge or handles browser credentials.
 
 ```sh
 gpt-bridge worker doctor --json
+gpt-bridge worker tools --json
+gpt-bridge worker tools --query "transparent website asset" --json
 gpt-bridge worker chat --message "Summarize these notes" --json
 gpt-bridge worker chat --message "Continue the analysis" --thread analysis --json
 gpt-bridge worker thread list
@@ -63,6 +65,11 @@ gpt-bridge worker research --prompt "Compare these options with sources" --json
 The worker defaults to direct, one-account execution and exits after the
 command. A `worker thread` is local JSON state. `worker web` instead works with
 normal conversations already visible in the signed-in ChatGPT Web account:
+
+`worker tools` is a local, network-free capability index. Without a query it
+returns only top-level names and summaries. With `--query`, it returns a small
+ranked route including the exact skill references the agent should load. Agents
+should not scan or preload every reference file.
 
 - `web list` returns title/id/date metadata only so an agent can select safely;
 - `web show` reads the current branch with message/character limits, or exports

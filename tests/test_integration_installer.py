@@ -32,6 +32,7 @@ def test_codex_installer_copies_skill_without_marketplace(tmp_path):
     destination = tmp_path / ".codex" / "skills" / "gpt-bridge-worker" / "SKILL.md"
     assert result.ok is True
     assert destination.is_file()
+    assert "worker tools --query" in destination.read_text(encoding="utf-8")
     assert result.commands == []
 
 
@@ -41,6 +42,7 @@ def test_claude_installer_copies_project_skill_without_marketplace(tmp_path):
     destination = tmp_path / ".claude" / "skills" / "gpt-bridge-worker" / "SKILL.md"
     assert result.ok is True
     assert destination.is_file()
+    assert "worker tools --query" in destination.read_text(encoding="utf-8")
     assert result.commands == []
 
 

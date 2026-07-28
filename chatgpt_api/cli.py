@@ -68,6 +68,7 @@ from chatgpt_api.threads import (
     validate_thread_name,
 )
 from chatgpt_api.worker import DEFAULT_AGENT_MODEL, DirectWorkerClient
+from chatgpt_api.worker.capabilities import search_capabilities
 from chatgpt_api.worker.client import WorkerClient
 from chatgpt_api.worker.migration import default_legacy_threads_dir, migrate_legacy_threads
 from chatgpt_api.worker.stack import compose_args, default_stack_dir, run_compose
@@ -752,6 +753,15 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_doctor.add_argument("--json", action="store_true")
     worker_doctor.set_defaults(func=cmd_worker_doctor)
 
+    worker_tools = worker_subparsers.add_parser(
+        "tools",
+        help="List compact agent capabilities or search for the best task-specific route",
+    )
+    worker_tools.add_argument("--query", "-q", default=None, help="Natural-language task or capability search")
+    worker_tools.add_argument("--limit", type=int, default=3)
+    worker_tools.add_argument("--json", action="store_true")
+    worker_tools.set_defaults(func=cmd_worker_tools)
+
     worker_chat = worker_subparsers.add_parser("chat", help="Send an automation chat through the selected worker transport")
     worker_chat.add_argument("--message", "-m", required=True)
     worker_chat.add_argument("--system", default=None)
@@ -1319,6 +1329,20 @@ async def cmd_worker_edit(args: argparse.Namespace) -> int:
 
 async def cmd_worker_research(args: argparse.Namespace) -> int:
     return await cmd_api_research(args)
+
+
+async def cmd_worker_tools(args: argparse.Namespace) -> int:
+    if not 1 <= args.limit <= 20:
+        raise ProviderError("--limit must be between 1 and 20")
+    result = search_capabilities(args.query, limit=args.limit)
+    if args.json:
+        _print_json(result)
+        return 0
+    items = result.get("matches") or result.get("capabilities") or []
+    for item in items:
+        print(f"{item['id']}\t{item['summary']}")
+    print(result["hint"], file=sys.stderr)
+    return 0
 
 
 async def cmd_worker_thread(args: argparse.Namespace) -> int:

@@ -38,6 +38,35 @@ their supported commands forward to the Python worker.
 > worker แบบ direct เป็นทางหลักสำหรับ agent หนึ่งบัญชี ส่วน API/Console/Docker
 > เป็นทางเลือกเมื่อจำเป็นต้องใช้ HTTP หรือหน้าจัดการ
 
+## How agents discover and run GPT Bridge
+
+GitHub renders this flow directly. The detailed
+[agent capability map](docs/AGENT_CAPABILITY_MAP.md) lists every command,
+reference group, script, host adapter, and session rule.
+
+```mermaid
+flowchart TD
+    Host["Codex / Claude Code / OpenCode"] --> Metadata["Skill name + short description"]
+    Metadata --> Router["Compact SKILL.md router"]
+    Router --> Choice{"Route already obvious?"}
+    Choice -- "No / mixed task" --> Search["worker tools --query TASK<br/>local and network-free"]
+    Search --> References["Load only returned references"]
+    Choice -- "Yes" --> CLI["gpt-bridge worker CLI"]
+    References --> CLI
+    CLI --> Local["Local threads and saved artifacts"]
+    CLI --> Direct["DirectWorkerClient<br/>one account, no daemon"]
+    Direct --> Provider["ChatGPTProvider + Web transport"]
+    Provider --> Web["Signed-in ChatGPT Web"]
+    Web --> Cleanup{"Clearly one-shot image/edit?"}
+    Cleanup -- "Saved successfully" --> Delete["Soft-delete exact generated session"]
+    Cleanup -- "Iterative or failed" --> Keep["Keep session for continuation/recovery"]
+```
+
+Only skill metadata is available before activation. The router loads after the
+skill triggers, and detailed references load only when selected by
+`worker tools --query`. The capability search itself does not use the account
+or network.
+
 ## Important boundaries
 
 - This is not an official OpenAI product or API.
@@ -215,9 +244,16 @@ python -m pip install -e ".[dev]"
 Check the direct runtime:
 
 ```powershell
+gpt-bridge worker tools --query "describe the task" --json
 gpt-bridge worker doctor --json
 gpt-bridge worker status --json
 ```
+
+`worker tools` is a network-free discovery index for agents. It returns only a
+compact capability list by default, or a few matching routes and exact
+on-demand reference paths for `--query`. Codex and Claude therefore receive the
+skill description first, the short router only when triggered, and detailed
+guides only for the selected task.
 
 Use chat with an optional durable local task thread:
 
@@ -468,7 +504,7 @@ credential refresh issue, not a Docker readiness issue.
 
 ```text
 chatgpt_api/                 Python Bridge API, providers, worker, compatibility CLI
-chatgpt_api/worker/          Loopback client, storage, migration, stack controls
+chatgpt_api/worker/          Direct client, capability search, storage, migration, stack controls
 chatgpt_api/assets/opencode/ Native OpenCode worker tools
 apps/bridge-console/         Svelte operator console
 plugins/gpt-bridge/          Shared Codex and Claude Code plugin/skill
@@ -482,6 +518,7 @@ tests/                       Python regression suite
 
 ## Documentation
 
+- [Agent capability map and structure](docs/AGENT_CAPABILITY_MAP.md)
 - [CLI reference](docs/CLI.md)
 - [OpenAI compatibility](docs/OPENAI_COMPATIBILITY.md)
 - [Architecture](docs/ARCHITECTURE.md)
