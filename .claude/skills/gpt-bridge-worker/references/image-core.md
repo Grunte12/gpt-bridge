@@ -24,6 +24,15 @@ constraints. Preserve detailed user requirements; add only details that
 materially improve a vague request. Use short labeled sections instead of one
 long paragraph so a failed result can be debugged one requirement at a time.
 
+For multiple variants, use `--count N` (2-10) with one `--output-path` stem.
+Use `--level instant` for cheap drafts (max 4), `medium` (default) for normal
+stills, and `high` for a hero/final. ChatGPT Web still returns one image per
+request. Bridge reuses one conversation: the first call sends the full brief,
+later calls send a short "same brief, variant i/N" follow-up, then writes
+`stem-01.png` through `stem-N.png`. If a follow-up cannot continue the
+session, that variant starts a new conversation with the full brief. Do not
+put "generate N images" in the prompt instead of `--count`.
+
 Before generating, write acceptance checks for content, composition, text,
 factual correctness, and forbidden elements. After each attempt, compare only
 the latest output against those checks. A polished image that communicates the

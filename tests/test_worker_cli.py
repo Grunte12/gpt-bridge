@@ -43,6 +43,22 @@ def test_worker_agent_commands_default_to_verified_sol_high():
 
     assert chat.model == DEFAULT_AGENT_MODEL
     assert report.model == DEFAULT_AGENT_MODEL
+    assert chat.level is None
+
+
+def test_worker_chat_instant_sets_fast_model_and_token_cap(monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append(body)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(["worker", "chat", "--message", "hello", "--level", "instant", "--json"]) == 0
+
+    assert calls[0]["model"] == "gpt-5-5"
+    assert calls[0]["max_tokens"] == 1200
 
 
 def test_worker_chat_reuses_router_and_worker_thread_location(tmp_path, monkeypatch, capsys):

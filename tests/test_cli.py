@@ -546,6 +546,251 @@ def test_worker_edit_brief_returns_only_output_location(tmp_path, monkeypatch, c
     )
 
 
+def test_worker_image_count_saves_numbered_variants(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append(body)
+        index = body["metadata"]["chatgpt_variant_index"]
+        return {
+            "chatgpt_conversation_id": "conv-shared",
+            "chatgpt_message_id": f"msg-{index}",
+            "data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    stem = tmp_path / "ring.png"
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "image",
+            "--prompt",
+            "studio ring",
+            "--output-path",
+            str(stem),
+            "--count",
+            "3",
+            "--brief",
+        ]
+    ) == 0
+
+    assert len(calls) == 3
+    assert [body["metadata"]["chatgpt_variant_index"] for body in calls] == [1, 2, 3]
+    assert "Variant 1 of 3" in calls[0]["prompt"]
+    assert "studio ring" in calls[0]["prompt"]
+    assert "chatgpt_conversation_id" not in calls[0]["metadata"]
+    assert calls[1]["metadata"]["chatgpt_conversation_id"] == "conv-shared"
+    assert calls[1]["metadata"]["chatgpt_parent_message_id"] == "msg-1"
+    assert calls[2]["metadata"]["chatgpt_parent_message_id"] == "msg-2"
+    assert "studio ring" not in calls[1]["prompt"]
+    assert "Same brief" in calls[1]["prompt"]
+    assert "Variant 3 of 3" in calls[2]["prompt"]
+    expected = [tmp_path / "ring-01.png", tmp_path / "ring-02.png", tmp_path / "ring-03.png"]
+    for path in expected:
+        assert path.read_bytes() == b"png-bytes"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert [item["path"] for item in payload["outputs"]] == [str(path.resolve()) for path in expected]
+
+
+def test_worker_image_instant_rejects_count_over_cap(capsys):
+    assert main(
+        ["worker", "image", "--prompt", "draft", "--count", "5", "--level", "instant", "--brief"]
+    ) == 2
+    assert "instant cap 4" in capsys.readouterr().err
+
+
+def test_worker_image_instant_marks_draft_and_short_variant(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append(body)
+        index = body["metadata"]["chatgpt_variant_index"]
+        return {
+            "chatgpt_conversation_id": "conv-draft",
+            "chatgpt_message_id": f"msg-{index}",
+            "data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    stem = tmp_path / "draft.png"
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "image",
+            "--prompt",
+            "studio ring",
+            "--output-path",
+            str(stem),
+            "--count",
+            "2",
+            "--level",
+            "instant",
+            "--brief",
+        ]
+    ) == 0
+
+    assert "Draft quality is enough" in calls[0]["prompt"]
+    assert "Variant 1/2." in calls[0]["prompt"]
+    assert "produce a distinct image" not in calls[0]["prompt"]
+    assert "Same brief. Variant 2/2." in calls[1]["prompt"]
+    assert "Draft quality" not in calls[1]["prompt"]
+    assert calls[0]["metadata"]["chatgpt_image_level"] == "instant"
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_worker_image_high_asks_for_fidelity(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append(body)
+        return {"data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "image",
+            "--prompt",
+            "hero shot",
+            "--output-path",
+            str(tmp_path / "hero.png"),
+            "--level",
+            "high",
+            "--brief",
+        ]
+    ) == 0
+    assert "Maximum fidelity" in calls[0]["prompt"]
+    assert calls[0]["metadata"]["chatgpt_image_level"] == "high"
+
+
+def test_worker_image_count_rejects_over_ten(capsys):
+    assert main(["worker", "image", "--prompt", "too many", "--count", "11", "--brief"]) == 2
+    assert "1 to 10" in capsys.readouterr().err
+
+
+def test_worker_edit_count_makes_sequential_variants(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append((path, body))
+        return {"data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    stem = tmp_path / "edited.png"
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "edit",
+            "--prompt",
+            "new angle",
+            "--input-image",
+            str(source),
+            "--output-path",
+            str(stem),
+            "--count",
+            "2",
+            "--brief",
+        ]
+    ) == 0
+
+    assert [path for path, _body in calls] == ["/images/edits", "/images/edits"]
+    assert (tmp_path / "edited-01.png").read_bytes() == b"png-bytes"
+    assert (tmp_path / "edited-02.png").read_bytes() == b"png-bytes"
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["outputs"]) == 2
+
+
+def test_worker_image_count_cleanup_deletes_shared_session(tmp_path, monkeypatch, capsys):
+    deleted = []
+
+    async def fake_api_request_json(args, method, path, body):
+        requested = (body.get("metadata") or {}).get("chatgpt_conversation_id")
+        return {
+            "chatgpt_conversation_id": requested or "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee01",
+            "chatgpt_message_id": "msg-1",
+            "data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}],
+        }
+
+    class FakeWebClient:
+        async def delete_web_conversation(self, requested_conversation):
+            deleted.append(requested_conversation)
+            return {"ok": True, "soft_deleted": True}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    monkeypatch.setattr(cli, "_direct_web_client", lambda args: FakeWebClient())
+    stem = tmp_path / "shot.png"
+
+    assert main(
+        [
+            "worker",
+            "image",
+            "--prompt",
+            "batch",
+            "--output-path",
+            str(stem),
+            "--count",
+            "2",
+            "--cleanup-session",
+            "--brief",
+        ]
+    ) == 0
+
+    assert deleted == ["aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee01"]
+    assert json.loads(capsys.readouterr().out)["session_cleanup"] == "soft_deleted"
+
+
+def test_worker_image_count_retries_without_session_if_continue_fails(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_api_request_json(args, method, path, body):
+        calls.append(body)
+        if (body.get("metadata") or {}).get("chatgpt_session_reused"):
+            raise cli.ProviderError("conversation not found")
+        return {
+            "chatgpt_conversation_id": f"conv-{len(calls)}",
+            "chatgpt_message_id": f"msg-{len(calls)}",
+            "data": [{"b64_json": "cG5nLWJ5dGVz", "mime_type": "image/png"}],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "image",
+            "--prompt",
+            "studio ring",
+            "--output-path",
+            str(tmp_path / "ring.png"),
+            "--count",
+            "2",
+            "--brief",
+        ]
+    ) == 0
+
+    assert len(calls) == 3
+    assert calls[1]["metadata"]["chatgpt_session_reused"] is True
+    assert "chatgpt_session_reused" not in calls[2]["metadata"]
+    assert "studio ring" in calls[2]["prompt"]
+
+
 def test_worker_edit_rejects_more_than_ten_inputs(tmp_path, capsys):
     argv = ["worker", "edit", "--prompt", "composite", "--brief"]
     for index in range(11):
@@ -857,6 +1102,39 @@ def test_api_vision_sends_data_url_input_image(tmp_path, monkeypatch):
     assert calls["path"] == "/chatgpt/vision"
     assert calls["body"]["input_images"][0]["name"] == "sample.png"
     assert calls["body"]["input_images"][0]["data_url"].startswith("data:image/png;base64,")
+
+
+def test_worker_vision_describe_sends_images(tmp_path, monkeypatch, capsys):
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["path"] = path
+        calls["body"] = body
+        return {"text": "a ring", "mode": "describe", "choices": [{"message": {"content": "a ring"}}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    assert main(
+        [
+            "worker",
+            "--transport",
+            "http",
+            "vision",
+            "--mode",
+            "describe",
+            "--input-image",
+            str(image_path),
+            "--json",
+        ]
+    ) == 0
+
+    assert calls["path"] == "/chatgpt/vision"
+    assert calls["body"]["mode"] == "describe"
+    assert calls["body"]["model"] == "gpt-5-5-thinking-standard"
+    assert calls["body"]["input_images"][0]["name"] == "sample.png"
+    assert json.loads(capsys.readouterr().out)["text"] == "a ring"
 
 
 def test_account_info_from_account_profile(tmp_path, capsys):
