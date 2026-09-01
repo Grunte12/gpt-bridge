@@ -509,6 +509,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     api_image.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     api_image.add_argument("--output-dir", default=None)
     api_image.add_argument("--output-path", default=None)
+    _add_image_count_argument(api_image)
     api_image.add_argument(
         "--transparent",
         action="store_true",
@@ -535,6 +536,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     api_edit.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     api_edit.add_argument("--output-dir", default=None)
     api_edit.add_argument("--output-path", default=None)
+    _add_image_count_argument(api_edit)
     api_edit.add_argument(
         "--transparent",
         action="store_true",
@@ -766,6 +768,12 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_chat.add_argument("--message", "-m", required=True)
     worker_chat.add_argument("--system", default=None)
     worker_chat.add_argument("--preset", choices=sorted(PRESETS), default=None)
+    worker_chat.add_argument(
+        "--level",
+        choices=("instant", "medium", "high"),
+        default=None,
+        help="Chat effort: instant is lookup, medium is analysis, high is architecture. Sets model and --max-tokens unless those flags are explicit.",
+    )
     worker_chat.add_argument("--model", default=DEFAULT_AGENT_MODEL)
     worker_chat.add_argument("--thinking-effort", default=None)
     worker_chat.add_argument("--agent-mode", choices=["optimized", "opencode"], default=None)
@@ -805,6 +813,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_image.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     worker_image.add_argument("--output-dir", default=None)
     worker_image.add_argument("--output-path", default=None)
+    _add_image_count_argument(worker_image)
     worker_image.add_argument(
         "--transparent",
         action="store_true",
@@ -843,6 +852,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_edit.add_argument("--response-format", choices=["url", "b64_json"], default="url")
     worker_edit.add_argument("--output-dir", default=None)
     worker_edit.add_argument("--output-path", default=None)
+    _add_image_count_argument(worker_edit)
     worker_edit.add_argument(
         "--transparent",
         action="store_true",
@@ -868,6 +878,27 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
     worker_edit.add_argument("--json", action="store_true")
     _add_api_route_arguments(worker_edit)
     worker_edit.set_defaults(func=cmd_worker_edit)
+
+    worker_vision = worker_subparsers.add_parser(
+        "vision",
+        help="OCR, describe, or ask about up to 10 images through ChatGPT Web",
+    )
+    worker_vision.add_argument("--input-image", type=Path, action="append", default=[], required=True)
+    worker_vision.add_argument("--mode", choices=["ocr", "describe", "custom"], default="custom")
+    worker_vision.add_argument("--prompt", "-p", default=None)
+    worker_vision.add_argument(
+        "--level",
+        choices=("instant", "medium", "high"),
+        default="medium",
+        help="Vision effort: instant, medium (default), or high. Sets --model unless --model is explicit.",
+    )
+    worker_vision.add_argument("--model", default="auto")
+    worker_vision.add_argument("--thinking-effort", default=None)
+    worker_vision.add_argument("--temporary-chat", action=argparse.BooleanOptionalAction, default=True)
+    worker_vision.add_argument("--output", type=Path, default=None, help="Write response text to a file")
+    worker_vision.add_argument("--json", action="store_true")
+    _add_api_route_arguments(worker_vision)
+    worker_vision.set_defaults(func=cmd_worker_vision)
 
     worker_research = worker_subparsers.add_parser("research", help="Run ChatGPT Deep Research through the selected worker transport")
     worker_research.add_argument("--prompt", "-p", required=True)
@@ -1270,6 +1301,7 @@ async def cmd_worker_doctor(args: argparse.Namespace) -> int:
 
 async def cmd_worker_chat(args: argparse.Namespace) -> int:
     """Worker chat is intentionally the same router-aware call as ``api chat``."""
+    _apply_chat_level(args)
     if args.thread:
         args.threads_dir = _worker_threads_dir(args)
     return await cmd_api_chat(args)
@@ -1325,6 +1357,11 @@ async def cmd_worker_image(args: argparse.Namespace) -> int:
 
 async def cmd_worker_edit(args: argparse.Namespace) -> int:
     return await cmd_api_edit(args)
+
+
+async def cmd_worker_vision(args: argparse.Namespace) -> int:
+    _apply_chat_level(args)
+    return await cmd_api_vision(args)
 
 
 async def cmd_worker_research(args: argparse.Namespace) -> int:
@@ -3312,6 +3349,196 @@ def _print_enhancement_result(prompt: str, applied: bool, error: str | None) -> 
         print(f"prompt_enhancement_warning={error}", file=sys.stderr)
 
 
+MAX_SEQUENTIAL_IMAGES = 10
+CHAT_LEVELS = {
+    "instant": {"model": "gpt-5-5", "max_tokens": 1200},
+    "medium": {"model": "gpt-5-5-thinking-standard", "max_tokens": 2500},
+    "high": {"model": "gpt-5-6-sol-high", "max_tokens": 4000},
+}
+IMAGE_LEVELS = {
+    "instant": {
+        "max_count": 4,
+        "suffix": "Draft quality is enough: simpler composition, fewer fine details, no extra polish.",
+        "short_variants": True,
+    },
+    "medium": {
+        "max_count": 10,
+        "suffix": "",
+        "short_variants": False,
+    },
+    "high": {
+        "max_count": 10,
+        "suffix": "Maximum fidelity: precise materials, lighting, edges, and any exact text.",
+        "short_variants": False,
+    },
+}
+
+
+def _add_image_count_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Save N sequential ChatGPT Web images (1-10). Each request still "
+            "returns one image; files are named stem-01.png, stem-02.png, ..."
+        ),
+    )
+    parser.add_argument(
+        "--level",
+        choices=tuple(IMAGE_LEVELS),
+        default="medium",
+        help=(
+            "Image effort: instant is a cheap draft (max 4); medium is the default; "
+            "high asks for maximum fidelity. ChatGPT Web still returns one image per request."
+        ),
+    )
+
+
+def _image_level(args: argparse.Namespace) -> str:
+    level = getattr(args, "level", None) or "medium"
+    if level not in IMAGE_LEVELS:
+        raise ProviderError("--level must be instant, medium, or high")
+    return level
+
+
+def _apply_chat_level(args: argparse.Namespace) -> None:
+    level = getattr(args, "level", None)
+    if not level:
+        return
+    if level not in CHAT_LEVELS:
+        raise ProviderError("--level must be instant, medium, or high")
+    tier = CHAT_LEVELS[level]
+    current = getattr(args, "model", None)
+    if current in {None, "auto", DEFAULT_AGENT_MODEL}:
+        args.model = str(tier["model"])
+    if "max_tokens" in vars(args) and args.max_tokens is None:
+        args.max_tokens = int(tier["max_tokens"])
+
+
+def _image_count(args: argparse.Namespace) -> int:
+    count = getattr(args, "count", 1)
+    if not isinstance(count, int) or not 1 <= count <= MAX_SEQUENTIAL_IMAGES:
+        raise ProviderError(f"--count must be an integer from 1 to {MAX_SEQUENTIAL_IMAGES}")
+    level = _image_level(args)
+    cap = int(IMAGE_LEVELS[level]["max_count"])
+    if count > cap:
+        raise ProviderError(f"--count {count} exceeds {level} cap {cap}; raise --level or lower --count")
+    return count
+
+
+def _level_image_prompt(prompt: str, level: str) -> str:
+    suffix = str(IMAGE_LEVELS[level]["suffix"])
+    if not suffix:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{suffix}"
+
+
+def _variant_image_prompt(
+    prompt: str,
+    index: int,
+    count: int,
+    level: str = "medium",
+    *,
+    continue_session: bool = False,
+) -> str:
+    if count == 1:
+        return prompt
+    if continue_session:
+        if IMAGE_LEVELS[level]["short_variants"]:
+            return f"Same brief. Variant {index}/{count}."
+        return (
+            "Same brief as the previous image in this thread. "
+            f"Variant {index} of {count}: produce a distinct image, not a duplicate."
+        )
+    if IMAGE_LEVELS[level]["short_variants"]:
+        text = f"{prompt.rstrip()}\n\nVariant {index}/{count}."
+    else:
+        text = (
+            f"{prompt.rstrip()}\n\n"
+            f"Variant {index} of {count}: produce a distinct image, not a duplicate of the other variants."
+        )
+    if index == 1:
+        text += " Later variants will continue in this same conversation."
+    return text
+
+
+def _session_from_image_payload(payload: dict[str, object]) -> tuple[str | None, str | None]:
+    conversation_id = payload.get("chatgpt_conversation_id")
+    message_id = payload.get("chatgpt_message_id")
+    session = conversation_id if isinstance(conversation_id, str) and conversation_id else None
+    parent = message_id if isinstance(message_id, str) and message_id else None
+    return session, parent
+
+
+def _variant_output_args(args: argparse.Namespace, index: int, count: int) -> argparse.Namespace:
+    if count == 1:
+        return args
+    clone = argparse.Namespace(**vars(args))
+    if getattr(args, "output_path", None):
+        target = Path(str(args.output_path)).expanduser()
+        clone.output_path = str(target.with_name(f"{target.stem}-{index:02d}{target.suffix}"))
+        clone.output_dir = None
+        return clone
+    if getattr(args, "output_dir", None):
+        directory = Path(str(args.output_dir)).expanduser()
+        clone.output_path = str(directory / f"image-{index:02d}.png")
+        clone.output_dir = None
+    return clone
+
+
+def _conversation_ids_from_payload(payload: dict[str, object]) -> list[str]:
+    ids: list[str] = []
+    raw_ids = payload.get("chatgpt_conversation_ids")
+    if isinstance(raw_ids, list):
+        for item in raw_ids:
+            if isinstance(item, str) and item and item not in ids:
+                ids.append(item)
+    conversation_id = payload.get("chatgpt_conversation_id")
+    if isinstance(conversation_id, str) and conversation_id and conversation_id not in ids:
+        ids.append(conversation_id)
+    return ids
+
+
+def _merge_image_payloads(payloads: list[dict[str, object]], local_paths: list[Path]) -> dict[str, object]:
+    if not payloads:
+        raise ProviderError("image request returned no payload")
+    if len(payloads) == 1:
+        payload = dict(payloads[0])
+        if local_paths:
+            payload["local_paths"] = [str(path) for path in local_paths]
+        return payload
+    data: list[dict[str, object]] = []
+    conversations: list[str] = []
+    for payload in payloads:
+        items = payload.get("data")
+        if isinstance(items, list):
+            data.extend(item for item in items if isinstance(item, dict))
+        conversations.extend(_conversation_ids_from_payload(payload))
+    last = payloads[-1]
+    merged: dict[str, object] = {
+        "created": last.get("created"),
+        "model": last.get("model"),
+        "data": data,
+        "chatgpt_variant_count": len(payloads),
+    }
+    account = last.get("chatgpt_account")
+    if account:
+        merged["chatgpt_account"] = account
+    if conversations:
+        unique = list(dict.fromkeys(conversations))
+        merged["chatgpt_conversation_ids"] = unique
+        merged["chatgpt_conversation_id"] = unique[-1]
+        web_url = last.get("chatgpt_web_url")
+        merged["chatgpt_web_url"] = web_url or f"https://chatgpt.com/c/{unique[-1]}"
+        if len(payloads) > 1 and len(unique) == 1:
+            merged["chatgpt_session_reused"] = True
+    if local_paths:
+        merged["local_paths"] = [str(path) for path in local_paths]
+    return merged
+
+
 def _brief_image_payload(payload: dict[str, object], local_paths: list[Path]) -> dict[str, object]:
     outputs: list[dict[str, str]] = [{"path": str(path)} for path in local_paths]
     if not outputs:
@@ -3389,50 +3616,127 @@ async def _cleanup_one_shot_image_session(
         return
     if not local_paths:
         raise ProviderError("--cleanup-session requires --output-path or --output-dir so the artifact is saved first")
-    conversation_id = payload.get("chatgpt_conversation_id")
-    if not isinstance(conversation_id, str) or not conversation_id:
+    conversation_ids = _conversation_ids_from_payload(payload)
+    if not conversation_ids:
         raise ProviderError("image response did not expose a ChatGPT Web conversation to clean up")
-    result = await _direct_web_client(args).delete_web_conversation(conversation_id)
-    if not result.get("ok"):
-        raise ProviderError("ChatGPT Web conversation cleanup was not confirmed")
+    client = _direct_web_client(args)
+    for conversation_id in conversation_ids:
+        result = await client.delete_web_conversation(conversation_id)
+        if not result.get("ok"):
+            raise ProviderError("ChatGPT Web conversation cleanup was not confirmed")
     payload["chatgpt_session_cleanup"] = {
-        "conversation_id": conversation_id,
+        "conversation_id": conversation_ids[-1],
+        "conversation_ids": conversation_ids,
         "soft_deleted": True,
     }
 
 
-async def cmd_api_image(args: argparse.Namespace) -> int:
-    metadata: dict[str, object] = {}
+async def _execute_counted_image_request(
+    args: argparse.Namespace,
+    *,
+    endpoint: str,
+    editing: bool,
+    extra_body: dict[str, object],
+) -> tuple[dict[str, object], list[Path], str, bool, str | None]:
+    count = _image_count(args)
+    level = _image_level(args)
+    metadata: dict[str, object] = {"chatgpt_image_level": level}
     if args.operation_id:
         metadata["chatgpt_operation_id"] = args.operation_id
-    requested_prompt = _transparent_image_prompt(args, args.prompt)
+    requested_prompt = _transparent_image_prompt(args, _level_image_prompt(args.prompt, level))
     prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(
         args,
         requested_prompt,
-        editing=False,
+        editing=editing,
     )
-    body = _compact_dict(
-        {
-            "model": args.model,
-            "prompt": prompt,
-            "size": args.size,
-            "quality": args.quality,
-            "style": args.style,
-            "response_format": args.response_format,
-            "metadata": metadata or None,
-        }
-    )
-    _apply_api_route_options(body, args)
-    payload = await _api_request_json(args, "POST", "/images/generations", body)
-    local_paths = await _save_api_image_outputs(args, payload)
-    local_paths, transparency_results = _apply_transparent_output(args, local_paths)
-    if local_paths:
-        payload["local_paths"] = [str(path) for path in local_paths]
+    payloads: list[dict[str, object]] = []
+    local_paths: list[Path] = []
+    transparency_results: list[dict[str, object]] = []
+    session_id: str | None = None
+    parent_id: str | None = None
+    for index in range(1, count + 1):
+        variant_args = _variant_output_args(args, index, count)
+        variant_metadata = dict(metadata)
+        if count > 1:
+            variant_metadata["chatgpt_variant_index"] = index
+            variant_metadata["chatgpt_variant_count"] = count
+        continue_session = bool(session_id and parent_id)
+        if continue_session:
+            variant_metadata["chatgpt_conversation_id"] = session_id
+            variant_metadata["chatgpt_parent_message_id"] = parent_id
+            variant_metadata["chatgpt_session_reused"] = True
+        body = _compact_dict(
+            {
+                "model": args.model,
+                "prompt": _variant_image_prompt(
+                    prompt, index, count, level, continue_session=continue_session
+                ),
+                **extra_body,
+                "response_format": args.response_format,
+                "metadata": variant_metadata or None,
+            }
+        )
+        _apply_api_route_options(body, args)
+        try:
+            payload = await _api_request_json(args, "POST", endpoint, body)
+        except ProviderError:
+            if not continue_session:
+                raise
+            session_id = None
+            parent_id = None
+            retry_metadata = {
+                key: value
+                for key, value in variant_metadata.items()
+                if key
+                not in {
+                    "chatgpt_conversation_id",
+                    "chatgpt_parent_message_id",
+                    "chatgpt_session_reused",
+                }
+            }
+            body = _compact_dict(
+                {
+                    "model": args.model,
+                    "prompt": _variant_image_prompt(prompt, index, count, level),
+                    **extra_body,
+                    "response_format": args.response_format,
+                    "metadata": retry_metadata or None,
+                }
+            )
+            _apply_api_route_options(body, args)
+            payload = await _api_request_json(args, "POST", endpoint, body)
+        next_session, next_parent = _session_from_image_payload(payload)
+        if next_session:
+            session_id = next_session
+        if next_parent:
+            parent_id = next_parent
+        saved = await _save_api_image_outputs(variant_args, payload)
+        saved, variant_transparency = _apply_transparent_output(variant_args, saved)
+        local_paths.extend(saved)
+        transparency_results.extend(variant_transparency)
+        payloads.append(payload)
+    merged = _merge_image_payloads(payloads, local_paths)
     if transparency_results:
-        payload["chatgpt_transparency"] = transparency_results
-    await _cleanup_one_shot_image_session(args, payload, local_paths)
+        merged["chatgpt_transparency"] = transparency_results
+    await _cleanup_one_shot_image_session(args, merged, local_paths)
     if args.enhance:
-        _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
+        _add_enhancement_payload(merged, prompt, enhancement_applied, enhancement_error)
+    return merged, local_paths, prompt, enhancement_applied, enhancement_error
+
+
+async def cmd_api_image(args: argparse.Namespace) -> int:
+    payload, local_paths, prompt, enhancement_applied, enhancement_error = await _execute_counted_image_request(
+        args,
+        endpoint="/images/generations",
+        editing=False,
+        extra_body=_compact_dict(
+            {
+                "size": args.size,
+                "quality": args.quality,
+                "style": args.style,
+            }
+        ),
+    )
     if getattr(args, "brief", False):
         print(json.dumps(_brief_image_payload(payload, local_paths), ensure_ascii=False, separators=(",", ":")))
         return 0
@@ -3448,37 +3752,18 @@ async def cmd_api_image(args: argparse.Namespace) -> int:
 async def cmd_api_edit(args: argparse.Namespace) -> int:
     if not 1 <= len(args.input_image) <= 10:
         raise ProviderError("image edit requires 1 to 10 --input-image values")
-    metadata: dict[str, object] = {}
-    if args.operation_id:
-        metadata["chatgpt_operation_id"] = args.operation_id
-    requested_prompt = _transparent_image_prompt(args, args.prompt)
-    prompt, enhancement_applied, enhancement_error = await _enhance_api_image_prompt(
+    payload, local_paths, prompt, enhancement_applied, enhancement_error = await _execute_counted_image_request(
         args,
-        requested_prompt,
+        endpoint="/images/edits",
         editing=True,
+        extra_body=_compact_dict(
+            {
+                "input_images": [_image_reference_for_api(path) for path in args.input_image],
+                "aspect_ratio": args.aspect_ratio,
+                "size": args.size,
+            }
+        ),
     )
-    body = _compact_dict(
-        {
-            "model": args.model,
-            "prompt": prompt,
-            "input_images": [_image_reference_for_api(path) for path in args.input_image],
-            "aspect_ratio": args.aspect_ratio,
-            "size": args.size,
-            "response_format": args.response_format,
-            "metadata": metadata or None,
-        }
-    )
-    _apply_api_route_options(body, args)
-    payload = await _api_request_json(args, "POST", "/images/edits", body)
-    local_paths = await _save_api_image_outputs(args, payload)
-    local_paths, transparency_results = _apply_transparent_output(args, local_paths)
-    if local_paths:
-        payload["local_paths"] = [str(path) for path in local_paths]
-    if transparency_results:
-        payload["chatgpt_transparency"] = transparency_results
-    await _cleanup_one_shot_image_session(args, payload, local_paths)
-    if args.enhance:
-        _add_enhancement_payload(payload, prompt, enhancement_applied, enhancement_error)
     if getattr(args, "brief", False):
         print(json.dumps(_brief_image_payload(payload, local_paths), ensure_ascii=False, separators=(",", ":")))
         return 0

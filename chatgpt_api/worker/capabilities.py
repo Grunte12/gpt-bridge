@@ -17,8 +17,8 @@ _CORE_CAPABILITIES: tuple[dict[str, Any], ...] = (
     {
         "id": "chat",
         "summary": "Ask ChatGPT for a compact answer or coding artifact.",
-        "command": 'gpt-bridge worker chat --message "..." --json',
-        "keywords": "ask chat code review critique explain answer",
+        "command": 'gpt-bridge worker chat --message "..." --level medium --json',
+        "keywords": "ask chat code review critique explain answer instant medium high",
         "session_policy": "temporary by default",
     },
     {
@@ -52,22 +52,29 @@ _CORE_CAPABILITIES: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "image-generate",
-        "summary": "Generate a ChatGPT Image with compact output.",
-        "command": 'gpt-bridge worker image --prompt "..." --output-path image.png --brief',
-        "keywords": "image generate visual graphic picture art",
+        "summary": "Generate one ChatGPT Image, or --count sequential variants in one session at --level instant/medium/high.",
+        "command": 'gpt-bridge worker image --prompt "..." --output-path image.png --count 4 --level medium --brief',
+        "keywords": "image generate visual graphic picture art count batch variants multiple series instant medium high draft session",
         "references": ["references/image-core.md"],
-        "session_policy": "use --cleanup-session only for clearly one-shot work",
+        "session_policy": "variants reuse one ChatGPT conversation; --cleanup-session only for clearly one-shot work",
     },
     {
         "id": "image-edit",
-        "summary": "Edit, restyle, localize, or composite up to 10 source images.",
-        "command": 'gpt-bridge worker edit --prompt "..." --input-image source.png --output-path edited.png --brief',
-        "keywords": "image edit restyle composite reference preserve localize",
+        "summary": "Edit or composite up to 10 sources; --count variants reuse one session at --level instant/medium/high.",
+        "command": 'gpt-bridge worker edit --prompt "..." --input-image source.png --output-path edited.png --count 4 --level medium --brief',
+        "keywords": "image edit restyle composite reference preserve localize count batch variants multiple instant medium high draft session",
         "references": [
             "references/image-core.md",
             "references/risks/reference-edit-consistency.md",
         ],
-        "session_policy": "use --cleanup-session only for clearly one-shot work",
+        "session_policy": "variants reuse one ChatGPT conversation; --cleanup-session only for clearly one-shot work",
+    },
+    {
+        "id": "vision",
+        "summary": "OCR, describe, or ask about up to 10 images through ChatGPT Web.",
+        "command": 'gpt-bridge worker vision --mode describe --input-image shot.png --json',
+        "keywords": "vision ocr describe read image screenshot inspect qa text extract",
+        "session_policy": "temporary by default",
     },
 )
 

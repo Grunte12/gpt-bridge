@@ -19,6 +19,7 @@ def test_capability_index_is_compact_and_omits_reference_details():
         "deep-research",
         "image-generate",
         "image-edit",
+        "vision",
     }
     assert all(set(item) == {"id", "summary"} for item in payload["capabilities"])
 

@@ -444,7 +444,7 @@ class ChatGPTWebTransport:
             system_hints.append("picture_v2")
         payload: dict[str, Any] = {
             "action": "next",
-            "parent_message_id": "client-created-root",
+            "parent_message_id": request.parent_message_id or "client-created-root",
             "model": request.model or str(template.get("model") or "auto"),
             "client_prepare_state": "success",
             "timezone_offset_min": timezone_payload["timezone_offset_min"],
@@ -459,6 +459,8 @@ class ChatGPTWebTransport:
             "force_parallel_switch": template.get("force_parallel_switch", "auto"),
             "messages": [_image_message_to_chatgpt(request.prompt, uploaded_files)],
         }
+        if request.conversation_id:
+            payload["conversation_id"] = request.conversation_id
         return payload
 
     def _upload_file(
