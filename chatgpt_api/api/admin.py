@@ -13,6 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from chatgpt_api.api.admin_store import BridgeAdminStore
 from chatgpt_api.api.artifacts import guess_download_content_type
@@ -326,7 +327,7 @@ def save_account_capture_payload(config: OpenAICompatConfig, body: dict[str, Any
     failed_checks = [
         check["name"]
         for check in inspection.get("checks", [])
-        if check.get("level") in {"required", "recommended"} and not check.get("ok")
+        if check.get("level") == "required" and not check.get("ok")
     ]
     if failed_checks and not force:
         return 400, {
@@ -375,11 +376,18 @@ def inspect_account_capture(
         checks.append(admin_check("parse", "required", False, _public_status_error(exc)))
 
     url = capture.url if capture else None
+    parsed_url = urlparse(url) if url else None
+    url_ok = bool(
+        parsed_url
+        and parsed_url.scheme == "https"
+        and parsed_url.hostname in {"chatgpt.com", "www.chatgpt.com"}
+        and "/backend-api/" in parsed_url.path
+    )
     request_json = capture.request_json if capture else None
     headers = capture.headers if capture else {}
     cookies = capture.cookies if capture else {}
     is_prepare_capture = bool(url and "/backend-api/f/conversation/prepare" in url)
-    add_admin_check(checks, "url", "required", bool(url and "chatgpt.com" in url), url or "missing")
+    add_admin_check(checks, "url", "required", url_ok, url or "missing")
     add_admin_check(
         checks,
         "authorization",
@@ -396,7 +404,7 @@ def inspect_account_capture(
         if is_prepare_capture
         else "missing Request Data JSON"
     )
-    add_admin_check(checks, "request_json", "required", request_json_ok, request_json_detail)
+    add_admin_check(checks, "request_json", "recommended", request_json_ok, request_json_detail)
     add_admin_check(
         checks,
         "model",

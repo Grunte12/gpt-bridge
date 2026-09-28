@@ -147,7 +147,7 @@ mapping is intentionally different from the official API spelling
 #### Primary one-shot local setup
 
 ```powershell
-gpt-bridge setup
+gpt-bridge setup --account main
 ```
 
 Read the consent text and choose **yes**. The command opens a tokenized
@@ -156,6 +156,11 @@ instructions, paste one complete Copy-as-cURL request into that page, and click
 Save. The command never prints the session, stores it only through the
 encrypted local account store, verifies it, and exits. `gpt-bridge auth login
 --account main` is the equivalent lifecycle command.
+
+For multiple ChatGPT logins, use a different local alias for each capture—for
+example, `--account personal` and `--account work`. Missing optional browser
+headers are warnings; only replay-critical fields block saving, followed by a
+separate live verification.
 
 > ภาษาไทย: วิธีนี้ใช้ browser ปกติที่ login อยู่แล้ว หน้า setup เปิดเฉพาะ
 > `127.0.0.1` และรับ capture หนึ่งครั้งก่อนปิด ระบบไม่แสดงหรืออัปโหลด session

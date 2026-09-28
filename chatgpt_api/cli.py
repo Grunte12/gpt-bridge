@@ -2626,6 +2626,11 @@ async def _run_local_setup(args: argparse.Namespace, *, heading: str) -> int:
         "Opening a private one-shot setup page in your normal browser.",
         file=progress_stream,
     )
+    capture_path = resolve_account_capture_path(account, accounts_dir)
+    target_mode = "replace existing capture" if capture_path.exists() else "create new capture"
+    print(f"Target local account: {account} ({target_mode}).", file=progress_stream)
+    if account == "main":
+        print("To keep another account separately, rerun with --account <local-alias>.", file=progress_stream)
     print(
         "Paste only inside that local page and click Validate & Save locally; no terminal paste is needed.",
         file=progress_stream,
@@ -2648,7 +2653,6 @@ async def _run_local_setup(args: argparse.Namespace, *, heading: str) -> int:
 
     live_verify: dict[str, object] | None = None
     if not getattr(args, "no_live_verify", False):
-        capture_path = resolve_account_capture_path(account, accounts_dir)
         capture = CapturedRequest.from_file(capture_path)
         verify_status, auth_ok, detail = await asyncio.to_thread(_check_account_auth, capture, "chrome")
         live_verify = {"status": verify_status, "auth_ok": auth_ok, "detail": detail}
@@ -2753,6 +2757,9 @@ def _print_local_capture_result(
         print(f"account={account}")
         print(f"capture_path={payload.get('capture_path') or '-'}")
         print(f"model={inspection.get('preview', {}).get('request_model') if isinstance(inspection.get('preview'), dict) else '-'}")
+        warnings = inspection.get("warnings") if isinstance(inspection.get("warnings"), list) else []
+        if warnings:
+            print(f"warnings={_csv_or_dash(warnings)}")
         if live_verify is not None:
             print(f"live_verify={'ok' if verify_ok else 'failed'}")
             if live_verify.get("detail"):
@@ -2764,6 +2771,10 @@ def _print_local_capture_result(
         print("saved=false")
         print(f"account={account}")
         print(f"error={error.get('message') or 'capture validation failed'}")
+        print(f"failed={_csv_or_dash(error.get('failed') or [])}")
+        print(f"missing={_csv_or_dash(error.get('missing') or [])}")
+        for warning in error.get("warnings") or []:
+            print(f"warning={warning}")
     if status >= 400:
         return 1
     return 0 if verify_ok else 2
@@ -2887,7 +2898,7 @@ def _failed_capture_checks(inspection: dict[str, object]) -> list[str]:
     for check in checks:
         if not isinstance(check, dict):
             continue
-        if check.get("level") in {"required", "recommended"} and not check.get("ok"):
+        if check.get("level") == "required" and not check.get("ok"):
             failed.append(str(check.get("name") or "unknown"))
     return failed
 

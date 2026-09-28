@@ -18,6 +18,41 @@ from chatgpt_api.providers.chatgpt.crypto import (
 )
 
 
+def test_failed_capture_checks_ignore_recommended_warnings():
+    inspection = {
+        "checks": [
+            {"name": "authorization", "level": "required", "ok": True},
+            {"name": "openai-sentinel-proof-token", "level": "recommended", "ok": False},
+        ]
+    }
+
+    assert cli._failed_capture_checks(inspection) == []
+
+
+def test_local_capture_rejection_prints_safe_diagnostics(tmp_path, capsys):
+    exit_code = cli._print_local_capture_result(
+        argparse.Namespace(json=False),
+        account="second",
+        accounts_dir=tmp_path,
+        status=400,
+        payload={
+            "error": {
+                "message": "capture did not pass validation",
+                "failed": ["authorization"],
+                "missing": ["authorization"],
+                "warnings": ["x-conduit-token"],
+            }
+        },
+        live_verify=None,
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "failed=authorization" in output
+    assert "missing=authorization" in output
+    assert "warning=x-conduit-token" in output
+
+
 def test_inspect_capture_redacts_secret_headers(tmp_path, capsys):
     capture_path = tmp_path / "request.txt"
     capture_path.write_text(
