@@ -6,7 +6,7 @@ machine; never commit, share, log, or paste it into an issue or chat.
 ## Preferred path: one-shot local setup page
 
 ```powershell
-gpt-bridge setup
+gpt-bridge setup --account personal
 ```
 
 Read the consent prompt. GPT Bridge opens a random tokenized page on
@@ -16,6 +16,27 @@ tools, paste it into the large local form, and click Save. The command does not
 print or upload the session; it saves through the encrypted account store,
 verifies the session, closes the temporary server, and exits. No Docker,
 persistent local API, automated browser, or bundled Chromium is required.
+
+`--account` is a local alias, not the ChatGPT login or plan name. Use a
+different alias for each login so a new capture does not replace an existing
+one:
+
+```powershell
+gpt-bridge setup --account work
+gpt-bridge auth status --json
+```
+
+Validation happens in two stages:
+
+1. Structural validation requires a ChatGPT backend URL, Authorization, and
+   cookies. Missing payload templates or observed browser-proof headers are
+   reported as warnings because the bridge can rebuild or refresh them.
+2. Live verification checks whether the saved session works now. A successful
+   parse does not guarantee that ChatGPT will accept an expired or revoked
+   session.
+
+Diagnostics contain field names and safe status categories only. They never
+print captured values.
 
 ```powershell
 gpt-bridge auth status --json
@@ -62,8 +83,10 @@ passphrase-backed secret configuration where appropriate.
 
 ## ภาษาไทย
 
-วิธีหลักคือ `gpt-bridge setup` ซึ่งเปิดหน้า tokenized บน `127.0.0.1` ใน browser
+วิธีหลักคือ `gpt-bridge setup --account <ชื่อเรียกในเครื่อง>` ซึ่งเปิดหน้า
+tokenized บน `127.0.0.1` ใน browser
 ปกติ ใช้ ChatGPT tab ที่ login อยู่แล้ว copy request เป็น cURL มา paste ในกล่อง
 ของหน้า local แล้วกด Save หากใช้ไม่ได้จึงค่อย import จากไฟล์ส่วนตัว Capture
 เทียบเท่ารหัสผ่าน ห้ามแชร์หรือ commit และ restart Docker ไม่ได้ทำให้ session
-กลับมาใช้ได้
+กลับมาใช้ได้ หากมีหลาย account ให้ตั้งชื่อ local alias คนละชื่อ เช่น `personal`
+และ `work` เพื่อไม่ให้ capture ใหม่เขียนทับของเดิม

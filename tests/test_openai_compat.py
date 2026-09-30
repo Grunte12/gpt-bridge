@@ -225,7 +225,7 @@ def test_provider_error_payload_for_missing_account_capture():
     assert payload["error"]["chatgpt_account"] == "free"
 
 
-def test_admin_save_capture_requires_recommended_fields(tmp_path):
+def test_admin_save_capture_allows_missing_recommended_fields(tmp_path):
     capture_text = """
 URL: https://chatgpt.com/backend-api/f/conversation
 Authorization: Bearer fake-token
@@ -243,10 +243,78 @@ Request Data: {"action":"next","model":"auto"}
         {"account": "pro", "capture_text": capture_text},
     )
 
+    assert status == 200
+    assert payload["saved"] is True
+    assert payload["inspection"]["ok"] is True
+    assert "openai-sentinel-proof-token" in payload["inspection"]["warnings"]
+    assert (tmp_path / "accounts" / "pro" / "chatgpt-request.txt").exists()
+
+
+def test_admin_save_capture_still_rejects_missing_required_fields(tmp_path):
+    capture_text = """
+URL: https://chatgpt.com/backend-api/f/conversation
+Cookie: oai-did=device-1; __Secure-next-auth.session-token.0=session-1
+Request Data: {"action":"next","model":"auto"}
+"""
+    config = OpenAICompatConfig(
+        account="pro",
+        accounts_dir=tmp_path / "accounts",
+        admin_db_path=tmp_path / "admin.sqlite",
+    )
+
+    status, payload = compat._save_account_capture_payload(
+        config,
+        {"account": "pro", "capture_text": capture_text},
+    )
+
     assert status == 400
     assert payload["error"]["type"] == "invalid_request_error"
-    assert "openai-sentinel-proof-token" in payload["error"]["failed"]
+    assert payload["error"]["failed"] == ["authorization"]
+    assert payload["error"]["missing"] == ["authorization"]
     assert not (tmp_path / "accounts" / "pro" / "chatgpt-request.txt").exists()
+
+
+def test_admin_save_capture_allows_missing_request_json(tmp_path):
+    capture_text = """
+URL: https://chatgpt.com/backend-api/f/conversation
+Authorization: Bearer fake-token
+Cookie: oai-did=device-1; __Secure-next-auth.session-token.0=session-1
+"""
+    config = OpenAICompatConfig(
+        account="pro",
+        accounts_dir=tmp_path / "accounts",
+        admin_db_path=tmp_path / "admin.sqlite",
+    )
+
+    status, payload = compat._save_account_capture_payload(
+        config,
+        {"account": "pro", "capture_text": capture_text},
+    )
+
+    assert status == 200
+    assert payload["inspection"]["ok"] is True
+    assert "request_json" in payload["inspection"]["warnings"]
+
+
+def test_admin_save_capture_rejects_lookalike_chatgpt_host(tmp_path):
+    capture_text = """
+URL: https://chatgpt.com.attacker.example/backend-api/f/conversation
+Authorization: Bearer fake-token
+Cookie: oai-did=device-1; __Secure-next-auth.session-token.0=session-1
+"""
+    config = OpenAICompatConfig(
+        account="pro",
+        accounts_dir=tmp_path / "accounts",
+        admin_db_path=tmp_path / "admin.sqlite",
+    )
+
+    status, payload = compat._save_account_capture_payload(
+        config,
+        {"account": "pro", "capture_text": capture_text},
+    )
+
+    assert status == 400
+    assert payload["error"]["failed"] == ["url"]
 
 
 def test_admin_save_capture_writes_only_after_full_validation(tmp_path):

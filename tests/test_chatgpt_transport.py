@@ -304,6 +304,25 @@ def test_build_image_payload_uses_picture_hint_and_multimodal_attachment():
     assert message["content"]["parts"][1] == "translate this image"
     assert message["metadata"]["attachments"][0]["id"] == "file_123"
     assert "history_and_training_disabled" not in payload
+    assert "conversation_id" not in payload
+    assert payload["parent_message_id"] == "client-created-root"
+
+
+def test_build_image_payload_reuses_conversation_and_parent():
+    transport = ChatGPTWebTransport(ChatGPTAuthConfig(access_token="fake"))
+
+    payload = transport._build_image_chat_payload(
+        ImageRequest(
+            prompt="Same brief. Variant 2/3.",
+            model="auto",
+            conversation_id="conv-shared",
+            parent_message_id="msg-1",
+        ),
+        [],
+    )
+
+    assert payload["conversation_id"] == "conv-shared"
+    assert payload["parent_message_id"] == "msg-1"
 
 
 def test_build_chat_payload_uploads_image_bytes_for_multimodal_message(monkeypatch):

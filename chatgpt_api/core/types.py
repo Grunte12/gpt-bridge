@@ -85,6 +85,8 @@ class ImageRequest:
     image_mime_type: str = "image/png"
     input_images: list["ImageInput"] = field(default_factory=list)
     model: str | None = None
+    conversation_id: str | None = None
+    parent_message_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

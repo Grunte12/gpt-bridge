@@ -1453,6 +1453,18 @@ async def _stop_chatgpt_conversation_after_disconnect(
         return
 
 
+def _image_session_from_body(body: dict[str, Any], request_metadata: dict[str, Any]) -> tuple[str | None, str | None]:
+    conversation_id = _str_or_none(body.get("conversation_id")) or _str_or_none(
+        request_metadata.get("chatgpt_conversation_id")
+    )
+    parent_message_id = (
+        _str_or_none(body.get("parent_message_id"))
+        or _str_or_none(request_metadata.get("chatgpt_parent_message_id"))
+        or _str_or_none(request_metadata.get("chatgpt_message_id"))
+    )
+    return conversation_id, parent_message_id
+
+
 async def _image_generation(
     config: OpenAICompatConfig,
     body: dict[str, Any],
@@ -1476,11 +1488,14 @@ async def _image_generation(
         request_metadata.get("chatgpt_operation_id")
     )
     operation = _create_chatgpt_operation("image", operation_id)
+    conversation_id, parent_message_id = _image_session_from_body(body, request_metadata)
     metadata = {
         "size": body.get("size"),
         "quality": body.get("quality"),
         "style": body.get("style"),
         "response_format": body.get("response_format"),
+        "conversation_id": conversation_id,
+        "parent_message_id": parent_message_id,
     }
     router = _router_for_request(config, router, body)
     response_format = _str_or_none(body.get("response_format")) or "url"
@@ -1491,7 +1506,13 @@ async def _image_generation(
         account, image_response = await _generate_image_with_accounts(
             config,
             router,
-            ImageRequest(prompt=prompt, model=model_slug, metadata=metadata),
+            ImageRequest(
+                prompt=prompt,
+                model=model_slug,
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
+                metadata=metadata,
+            ),
             requested_model,
             model_slug,
             operation_id=operation.operation_id,
@@ -1551,12 +1572,15 @@ async def _image_edit(
         request_metadata.get("chatgpt_operation_id")
     )
     operation = _create_chatgpt_operation("image", operation_id)
+    conversation_id, parent_message_id = _image_session_from_body(body, request_metadata)
     metadata = {
         "source": "images_edits",
         "response_format": body.get("response_format"),
         "aspect_ratio": aspect_ratio,
         "input_image_count": len(input_images),
         "aspect_ratio_warning": IMAGE_EDIT_ASPECT_RATIO_WARNING,
+        "conversation_id": conversation_id,
+        "parent_message_id": parent_message_id,
     }
     router = _router_for_request(config, router, body)
     response_format = _str_or_none(body.get("response_format")) or "url"
@@ -1571,6 +1595,8 @@ async def _image_edit(
                 prompt=edit_prompt,
                 input_images=input_images,
                 model=model_slug,
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
                 metadata=metadata,
             ),
             requested_model,
@@ -1848,6 +1874,8 @@ def _image_request_with_operation_hooks(request: ImageRequest, operation_id: str
         image_mime_type=request.image_mime_type,
         input_images=request.input_images,
         model=request.model,
+        conversation_id=request.conversation_id,
+        parent_message_id=request.parent_message_id,
         metadata=metadata,
     )
 
