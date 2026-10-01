@@ -184,6 +184,10 @@ refresh ChatGPT credentials.
 
 ## Install agent integrations
 
+For agents on another machine, see [Private MCP over Tailscale](docs/PRIVATE_MCP.md).
+The optional adapter exposes three discovery/job tools, with detailed schemas
+loaded on demand. Local agents can continue using the CLI.
+
 The repository ships native adapters for Codex, Claude Code, and OpenCode.
 Python 3.11 or newer is required. From a checkout, preview the changes and then
 install the Python runtime plus every available host integration:
