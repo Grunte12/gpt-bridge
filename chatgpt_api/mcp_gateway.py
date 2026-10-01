@@ -256,7 +256,32 @@ class BearerAuth:
         await self.app(scope, receive, send)
 
 
-def http_app(gateway: Gateway, server, token: str):
+class TailscaleAuth:
+    """Trust Serve identity headers only from the local reverse proxy.
+
+    Local processes are trusted; never bind this backend to a network interface.
+    Tagged nodes without user identity must use bearer mode instead.
+    """
+
+    def __init__(self, app, allowed_hosts: list[str]):
+        self.app, self.allowed_hosts = app, set(allowed_hosts)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            peer = (scope.get("client") or ("", 0))[0]
+            host = headers.get(b"host", b"").decode("latin-1")
+            if (peer not in {"127.0.0.1", "::1"}
+                    or host not in self.allowed_hosts | {h + ":443" for h in self.allowed_hosts}
+                    or not headers.get(b"tailscale-user-login", b"").strip()
+                    or b"tailscale-funnel-request" in headers):
+                from starlette.responses import JSONResponse
+                await JSONResponse({"error": "tailscale_serve_identity_required"}, status_code=401)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def http_app(gateway: Gateway, server, token: str | None, allowed_hosts: list[str] | None = None):
     from starlette.responses import FileResponse, JSONResponse
     from starlette.routing import Route
 
@@ -271,6 +296,10 @@ def http_app(gateway: Gateway, server, token: str):
 
     app = server.streamable_http_app()
     app.routes.append(Route("/artifacts/{job_id}/{name}", download))
+    if token is None:
+        if not allowed_hosts:
+            raise ValueError("Tailscale authentication requires an exact Serve hostname")
+        return TailscaleAuth(app, allowed_hosts)
     return BearerAuth(app, token)
 
 
@@ -283,8 +312,11 @@ def main() -> None:
     parser.add_argument("--test-commands", type=Path, help="JSON object of names to fixed argv lists")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".local/share/gpt-bridge/mcp")
     parser.add_argument("--allowed-host", action="append", default=[], help="Exact tailnet HTTPS hostname")
+    parser.add_argument("--auth", choices=["bearer", "tailscale"], default="bearer", help="HTTP authentication; tailscale trusts local Serve identity headers")
     parser.add_argument("--token-file", type=Path, help="Private bearer-token file; generated if missing (HTTP only)")
     args = parser.parse_args()
+    if args.auth == "tailscale" and (args.transport != "http" or not args.allowed_host):
+        parser.error("--auth tailscale requires --transport http and --allowed-host")
     tests = json.loads(args.test_commands.read_text()) if args.test_commands else {}
     if not isinstance(tests, dict) or any(not isinstance(v, list) or not v or any(not isinstance(x, str) for x in v) for v in tests.values()):
         parser.error("test commands must be nonempty argv lists")
@@ -293,6 +325,10 @@ def main() -> None:
     if args.transport == "stdio":
         server.run(transport="stdio")
     else:
+        if args.auth == "tailscale":
+            import uvicorn
+            uvicorn.run(http_app(gateway, server, None, args.allowed_host), host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False)
+            return
         token = os.environ.get("GPT_BRIDGE_MCP_TOKEN", "")
         if not token:
             token_path = args.token_file or gateway.root / "access-token"
@@ -308,7 +344,7 @@ def main() -> None:
         if len(token) < 32 or not token.isascii():
             parser.error("bearer token must contain at least 32 ASCII characters")
         import uvicorn
-        uvicorn.run(http_app(gateway, server, token), host="127.0.0.1", port=args.port, access_log=False)
+        uvicorn.run(http_app(gateway, server, token), host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False)
 
 
 if __name__ == "__main__":

@@ -93,3 +93,27 @@ def test_http_requires_bearer_and_supports_mcp_initialize(tmp_path):
         assert client.get("/artifacts/demo/image.png").status_code == 401
         assert client.get("/artifacts/demo/image.png", headers=headers).content == b"image-bytes"
         assert client.get("/artifacts/demo/stderr.log", headers=headers).status_code == 404
+
+
+def test_tailscale_auth_requires_local_serve_identity(tmp_path):
+    from starlette.testclient import TestClient
+    gateway = Gateway(tmp_path, "main")
+    host = "test.tailnet.ts.net"
+    app = http_app(gateway, create_server(gateway, [host]), None, [host])
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    headers = {"Tailscale-User-Login": "owner@example.com", "Accept": "application/json, text/event-stream"}
+    with TestClient(app, base_url="https://" + host, client=("127.0.0.1", 1234)) as client:
+        assert client.post("/mcp", json=body).status_code == 401
+        assert client.post("/mcp", json=body, headers=headers).status_code == 200
+        assert client.post("/mcp", json=body, headers={**headers, "Tailscale-Funnel-Request": "true"}).status_code == 401
+        assert client.post("/mcp", json=body, headers={**headers, "Host": "wrong.ts.net"}).status_code == 401
+        gateway.jobs["demo"] = {"state": "completed"}
+        (tmp_path / "demo").mkdir()
+        (tmp_path / "demo/image.png").write_bytes(b"image")
+        assert client.get("/artifacts/demo/image.png").status_code == 401
+        assert client.get("/artifacts/demo/image.png", headers=headers).content == b"image"
+    app = http_app(gateway, create_server(gateway, [host]), None, [host])
+    with TestClient(app, base_url="https://" + host, client=("100.64.0.2", 1234)) as client:
+        assert client.post("/mcp", json=body, headers=headers).status_code == 401
+    with pytest.raises(ValueError):
+        http_app(gateway, create_server(gateway, []), None)

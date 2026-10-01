@@ -28,6 +28,27 @@ Tailscale Serve stays within your tailnet; do not enable Funnel. Restrict tailne
 access to the intended caller using Tailscale grants/ACLs. Each server instance
 has one explicit ChatGPT account; credentials remain local.
 
+## Token-free Tailscale mode
+
+For a personal tailnet where every permitted device should have access:
+
+```bash
+gpt-bridge-mcp --transport http --account main --auth tailscale \
+  --allowed-host macbook.your-tailnet.ts.net
+tailscale serve --bg http://127.0.0.1:8766
+```
+
+Connect to the same HTTPS `/mcp` URL without an Authorization header. The
+adapter checks the loopback proxy, exact hostname, and Serve's
+`Tailscale-User-Login` header; it rejects missing identity and Funnel requests.
+Serve removes caller-supplied identity headers before adding its own.
+See [Tailscale's identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers).
+
+Keep the backend on loopback and do not enable Funnel. Local processes are
+trusted and can impersonate these headers. Tailnet grants/ACLs decide which
+devices can reach Serve. Tagged nodes without a user identity should use the
+default bearer mode instead. This mode neither reads nor generates a token.
+
 ## Agent instructions (on demand)
 
 Only three tools are advertised: `search_tools`, `call_tool`, and `job_status`.
@@ -81,6 +102,6 @@ Example operator-owned test configuration:
 {"mcpServers":{"gpt-bridge":{"command":"gpt-bridge-mcp","args":["--account","main"]}}}
 ```
 
-Stdio uses the client's local process boundary. HTTP requires the bearer token
-even over Tailscale. Use CLI locally when your host already supports it; MCP is
+Stdio uses the client's local process boundary. HTTP defaults to bearer auth;
+token-free mode requires Tailscale Serve as described above. Use CLI locally when your host already supports it; MCP is
 an additional adapter, not a replacement.
