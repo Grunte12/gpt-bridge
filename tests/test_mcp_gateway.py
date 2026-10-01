@@ -93,6 +93,9 @@ def test_http_requires_bearer_and_supports_mcp_initialize(tmp_path):
         assert client.get("/artifacts/demo/image.png").status_code == 401
         assert client.get("/artifacts/demo/image.png", headers=headers).content == b"image-bytes"
         assert client.get("/artifacts/demo/stderr.log", headers=headers).status_code == 404
+        assert client.get("/healthz").status_code == 401
+        health = client.get("/healthz", headers=headers).json()
+        assert health["status"] == "ready" and health["provider_verified"] is False
 
 
 def test_tailscale_auth_requires_local_serve_identity(tmp_path):
@@ -117,3 +120,46 @@ def test_tailscale_auth_requires_local_serve_identity(tmp_path):
         assert client.post("/mcp", json=body, headers=headers).status_code == 401
     with pytest.raises(ValueError):
         http_app(gateway, create_server(gateway, []), None)
+
+
+def test_job_recovery_after_restart(tmp_path):
+    async def scenario():
+        first = Gateway(tmp_path / "jobs", "main", tmp_path, {"ok": [sys.executable, "-c", "print('saved')"]})
+        job = await first.call("workspace.test", {"name": "ok"})
+        assert (await first.status(job["job_id"], wait_seconds=10))["state"] == "completed"
+        assert not first.tasks and not first.jobs
+        second = Gateway(tmp_path / "jobs", "main")
+        status = await second.status(job["job_id"])
+        assert status["state"] == "completed"
+        assert all(not a["name"].startswith(".") for a in status["artifacts"])
+        assert second.read_artifact(job["job_id"], "result.txt")["data"] == "saved\n"
+        with pytest.raises(ValueError):
+            second.read_artifact(job["job_id"], ".job-state.json")
+        stale = "a" * 32
+        (first.root / stale).mkdir()
+        first.jobs[stale] = {"job_id": stale, "state": "running", "tool": "bridge.image"}
+        first.save_job(stale)
+        interrupted = await second.status(stale)
+        assert interrupted["state"] == "interrupted"
+        assert interrupted["error_code"] == "server_restarted"
+        assert not second.tasks
+        with pytest.raises(ValueError):
+            await second.status("../escape")
+        queued = await first.call("workspace.test", {"name": "ok"})
+        assert (await first.status(queued["job_id"], cancel=True))["state"] == "cancelled"
+    asyncio.run(scenario())
+
+
+def test_macos_service_configuration_is_private_and_explicit(tmp_path):
+    from pathlib import Path
+    from chatgpt_api.mcp_service import service_plist
+    config = service_plist(Path(sys.executable), "second", "mac.example.ts.net", tmp_path)
+    argv = config["ProgramArguments"]
+    assert argv[argv.index("--account") + 1] == "second"
+    assert argv[argv.index("--auth") + 1] == "tailscale"
+    assert config["KeepAlive"] and config["RunAtLoad"]
+    assert "--workspace" not in argv
+    assert not any("TOKEN" in key for key in config["EnvironmentVariables"])
+    for host in ["https://mac.ts.net", "mac.ts.net:443", "public.example.com"]:
+        with pytest.raises(ValueError):
+            service_plist(Path(sys.executable), "main", host, tmp_path)

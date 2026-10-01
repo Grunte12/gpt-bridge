@@ -67,12 +67,48 @@ targeted refinements. ChatGPT Web continuation uses its existing server-side
 context rather than replaying a transcript. Automatic conversation deletion
 is opt-in; destructive account/admin endpoints are not exposed.
 
-Jobs run one at a time, expire after 90 minutes, and have a 100-job per-process
-limit. Job IDs are in memory: restarting the server loses job lookup, but files
-remain in the data directory. Cancellation stops the local worker; already
+Jobs run one at a time, have a 90-minute execution timeout, and at most 100
+active/queued jobs. Compact job metadata is saved atomically with private
+permissions. After restart, completed job IDs and artifacts remain readable;
+unfinished jobs become `interrupted`, never automatically replayed. Inspect
+artifacts and ChatGPT history before retrying interrupted work. Metadata and
+artifacts are retained on disk; there is no automatic retention cleanup yet.
+One server per data directory is enforced on macOS/Linux.
+Cancellation stops the local worker; already
 submitted ChatGPT work may still finish. Raw stderr stays local and is excluded
 from remote artifacts. No timing or model-token savings percentage is claimed;
 measure comparable tasks in the target client.
+
+## macOS service (operator setup, not an agent tool)
+
+Stop any manually running server on port 8766 before installation:
+
+```bash
+gpt-bridge-mcp-service install --account YOUR_ACCOUNT \
+  --allowed-host macbook.your-tailnet.ts.net
+gpt-bridge-mcp-service status
+gpt-bridge-mcp-service restart
+gpt-bridge-mcp-service stop
+```
+
+This installs one user LaunchAgent, starts it at login, and restarts it after
+exit. It requires a logged-in macOS user; it is not a boot-time system daemon.
+Mac sleep/offline still makes the endpoint unavailable. `stop` unloads the
+service now but leaves the plist for the next login. To change account/host,
+rerun `install` with explicit `--replace`. No credentials are put in the plist.
+Workspace access stays disabled. Service logs stay in the private data
+directory. The service does not enable Tailscale, alter DNS/routes, configure
+Serve, or install anything inside Muse.
+
+`GET /healthz` uses the same authentication as `/mcp` and reports server
+readiness and active jobs only. `provider_verified=false` is intentional:
+server health does not prove that a saved ChatGPT session still works.
+Use local `gpt-bridge account-check --account YOUR_ACCOUNT` separately.
+
+For hosted agents, verify their supported private-network integration before
+joining a tailnet. Do not change a managed runtime's DNS/default route just to
+reach this endpoint. If private connectivity is unsupported, this deployment
+cannot be reached by that client; do not make it public as a workaround.
 
 ## Optional workspace tools
 

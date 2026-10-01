@@ -27,6 +27,7 @@ dev = [
 chatgpt-api = "chatgpt_api.cli:main"
 gpt-bridge = "chatgpt_api.cli:main"
 gpt-bridge-mcp = "chatgpt_api.mcp_gateway:main"
+gpt-bridge-mcp-service = "chatgpt_api.mcp_service:main"
 web-chat-bridge = "chatgpt_api.legacy_cli:main"
 wcbridge = "chatgpt_api.legacy_cli:main"
 

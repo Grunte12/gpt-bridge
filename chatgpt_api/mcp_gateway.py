@@ -57,6 +57,30 @@ class Gateway:
         self.processes: dict[str, asyncio.subprocess.Process] = {}
         self.semaphore = asyncio.Semaphore(1)
 
+    def save_job(self, job_id: str) -> None:
+        directory = self.root / job_id
+        temporary = directory / ".job-state.tmp"
+        temporary.write_text(json.dumps(self.jobs[job_id]))
+        temporary.chmod(0o600)
+        temporary.replace(directory / ".job-state.json")
+
+    def restore_job(self, job_id: str) -> None:
+        if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+            raise ValueError("unknown job")
+        path = self.root / job_id / ".job-state.json"
+        if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+            raise ValueError("unknown job")
+        if path.stat().st_size > 16000:
+            raise ValueError("invalid job state")
+        record = json.loads(path.read_text())
+        if not isinstance(record, dict) or record.get("job_id") != job_id:
+            raise ValueError("invalid job state")
+        self.jobs[job_id] = record
+        if record.get("state") in {"running", "queued"}:
+            record.update(state="interrupted", error_code="server_restarted",
+                          next_action="Inspect saved artifacts and ChatGPT history before retrying; upstream work may have completed")
+            self.save_job(job_id)
+
     def search(self, query: str = "", detail: str = "brief", limit: int = 5) -> dict:
         words = query.lower().split()
         candidates = [(sum(w in (name + " " + desc).lower() for w in words), name, desc, spec)
@@ -101,8 +125,8 @@ class Gateway:
                 raise ValueError("old text must match exactly once")
             path.write_text(text.replace(arguments["old"], arguments["new"], 1))
             return {"updated": arguments["path"]}
-        if len(self.jobs) >= 100:
-            raise ValueError("job capacity reached; restart gateway after collecting artifacts")
+        if sum(not task.done() for task in self.tasks.values()) >= 100:
+            raise ValueError("active job capacity reached; wait for pending work")
         job_id = uuid.uuid4().hex
         directory = self.root / job_id
         directory.mkdir()
@@ -117,6 +141,7 @@ class Gateway:
             argv = self.worker_argv(name, arguments, directory)
             cwd = directory
         self.jobs[job_id] = {"job_id": job_id, "state": "queued", "tool": name}
+        self.save_job(job_id)
         self.tasks[job_id] = asyncio.create_task(self.run_job(job_id, argv, cwd, directory))
         return dict(self.jobs[job_id])
 
@@ -151,6 +176,7 @@ class Gateway:
         try:
             async with self.semaphore:
                 self.jobs[job_id]["state"] = "running"
+                self.save_job(job_id)
                 # Logs stay local, never dumped into model context automatically.
                 with (directory / "result.txt").open("wb") as out, (directory / "stderr.log").open("wb") as err:
                     process = await asyncio.create_subprocess_exec(*argv, cwd=cwd, stdout=out, stderr=err)
@@ -185,30 +211,47 @@ class Gateway:
             self.jobs[job_id].update(state="failed", error="execution failed; inspect local logs")
         finally:
             self.processes.pop(job_id, None)
+            self.save_job(job_id)
+            # Completed metadata remains on disk, not in the long-lived server cache.
+            self.tasks.pop(job_id, None)
+            self.jobs.pop(job_id, None)
 
     async def status(self, job_id: str, wait_seconds: int = 0, cancel: bool = False) -> dict:
         if job_id not in self.jobs:
-            raise ValueError("unknown job")
-        task = self.tasks[job_id]
-        if cancel and not task.done():
+            self.restore_job(job_id)
+        task = self.tasks.get(job_id)
+        if cancel and task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            if job_id not in self.jobs:
+                self.restore_job(job_id)
             self.jobs[job_id]["state"] = "cancelled"
-        elif not task.done() and wait_seconds:
+            self.save_job(job_id)
+            self.tasks.pop(job_id, None)
+        elif task is not None and not task.done() and wait_seconds:
             await asyncio.wait([task], timeout=min(max(wait_seconds, 0), 30))
+        if job_id not in self.jobs:
+            self.restore_job(job_id)
         result = dict(self.jobs[job_id])
         directory = self.root / job_id
         result["artifacts"] = [{"name": p.name, "bytes": p.stat().st_size,
                                 "download_path": f"/artifacts/{job_id}/{p.name}"}
-                               for p in directory.iterdir() if p.is_file() and p.name != "stderr.log"]
+                               for p in directory.iterdir() if p.is_file() and not p.is_symlink() and not p.name.startswith(".") and p.name != "stderr.log"]
+        if task is None or task.done():
+            self.jobs.pop(job_id, None)
         if cancel:
             result["note"] = "local worker cancelled; upstream work may still complete"
         return result
 
     def read_artifact(self, job_id: str, name: str, offset: int = 0, limit: int = 4000, encoding: str = "text") -> dict:
-        if job_id not in self.jobs or Path(name).name != name or name == "stderr.log":
+        if job_id not in self.jobs:
+            self.restore_job(job_id)
+            self.jobs.pop(job_id, None)
+        if Path(name).name != name or name == "stderr.log" or name.startswith("."):
             raise ValueError("unknown artifact")
         path = self.root / job_id / name
+        if path.is_symlink():
+            raise ValueError("unknown artifact")
         with path.open("rb") as source:
             source.seek(offset)
             chunk = source.read(limit)
@@ -287,7 +330,13 @@ def http_app(gateway: Gateway, server, token: str | None, allowed_hosts: list[st
 
     async def download(request):
         job_id, name = request.path_params["job_id"], request.path_params["name"]
-        if job_id not in gateway.jobs or Path(name).name != name or name == "stderr.log":
+        if job_id not in gateway.jobs:
+            try:
+                gateway.restore_job(job_id)
+                gateway.jobs.pop(job_id, None)
+            except (ValueError, OSError):
+                return JSONResponse({"error": "unknown artifact"}, status_code=404)
+        if Path(name).name != name or name == "stderr.log" or name.startswith("."):
             return JSONResponse({"error": "unknown artifact"}, status_code=404)
         path = gateway.root / job_id / name
         if not path.is_file() or path.is_symlink():
@@ -295,6 +344,9 @@ def http_app(gateway: Gateway, server, token: str | None, allowed_hosts: list[st
         return FileResponse(path, filename=name, headers={"Cache-Control": "no-store"})
 
     app = server.streamable_http_app()
+    async def health(request):
+        return JSONResponse({"status": "ready", "service": "gpt-bridge-mcp", "active_jobs": sum(not t.done() for t in gateway.tasks.values()), "provider_verified": False}, headers={"Cache-Control": "no-store"})
+    app.routes.append(Route("/healthz", health))
     app.routes.append(Route("/artifacts/{job_id}/{name}", download))
     if token is None:
         if not allowed_hosts:
@@ -321,6 +373,16 @@ def main() -> None:
     if not isinstance(tests, dict) or any(not isinstance(v, list) or not v or any(not isinstance(x, str) for x in v) for v in tests.values()):
         parser.error("test commands must be nonempty argv lists")
     gateway = Gateway(args.data_dir, args.account, args.workspace, tests)
+    # One server owns a data directory; otherwise recovery could mistake live
+    # jobs in another process for interrupted work.
+    lock = None
+    if os.name == "posix":
+        import fcntl
+        lock = (gateway.root / ".server.lock").open("a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error("another MCP server already owns this data directory")
     server = create_server(gateway, args.allowed_host)
     if args.transport == "stdio":
         server.run(transport="stdio")
