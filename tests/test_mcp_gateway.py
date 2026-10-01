@@ -50,6 +50,7 @@ def test_job_result_chunking_and_cancellation(tmp_path):
         gateway = Gateway(tmp_path / "jobs", "main", tmp_path, {
             "ok": [sys.executable, "-c", "print('hello')"],
             "slow": [sys.executable, "-c", "import time; time.sleep(60)"],
+            "auth": [sys.executable, "-c", "import sys; print('401 session expired SECRET',file=sys.stderr); sys.exit(2)"],
         })
         job = await gateway.call("workspace.test", {"name": "ok"})
         status = await gateway.status(job["job_id"], wait_seconds=10)
@@ -62,6 +63,10 @@ def test_job_result_chunking_and_cancellation(tmp_path):
         await asyncio.sleep(0.05)
         assert (await gateway.status(job["job_id"], cancel=True))["state"] == "cancelled"
         assert not gateway.processes
+        job = await gateway.call("workspace.test", {"name": "auth"})
+        status = await gateway.status(job["job_id"], wait_seconds=10)
+        assert status["error_code"] == "account_auth_rejected"
+        assert "SECRET" not in json.dumps(status)
     asyncio.run(scenario())
 
 

@@ -166,6 +166,18 @@ class Gateway:
                                 process.kill()
                                 await process.wait()
                 self.jobs[job_id].update(state="completed" if code == 0 else "failed", exit_code=code)
+                if code:
+                    # Classify only known markers; never return stderr or token values.
+                    with (directory / "stderr.log").open("rb") as source:
+                        diagnostic = source.read(16000).decode("utf-8", errors="replace").lower()
+                    if any(marker in diagnostic for marker in ("token_invalidated", "401", "session expired", "token expired")):
+                        self.jobs[job_id].update(error_code="account_auth_rejected", next_action=f"Refresh local capture with gpt-bridge setup --account {self.account}")
+                    elif "not configured" in diagnostic or "missing account" in diagnostic:
+                        self.jobs[job_id].update(error_code="account_not_configured", next_action="Configure the selected local account")
+                    elif "429" in diagnostic or "rate limit" in diagnostic:
+                        self.jobs[job_id].update(error_code="upstream_rate_limit", next_action="Wait before retrying")
+                    else:
+                        self.jobs[job_id].update(error_code="worker_failed", next_action="Inspect local stderr.log")
         except asyncio.CancelledError:
             self.jobs[job_id]["state"] = "cancelled"
             raise
