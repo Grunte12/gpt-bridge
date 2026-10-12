@@ -516,6 +516,17 @@ Generate/edit and continuation requests forward the selected effort, but this
 does not guarantee that the upstream image renderer honors the preset or that
 likeness improves. Model discovery does not generate media.
 
+MCP `bridge.image` / `bridge.edit` accept `model`, `thinking_effort`, and
+`level`; OpenCode image tools use `model`, `thinkingEffort`, and `level`.
+All forward to the shared worker CLI. These optional fields preserve existing
+defaults when omitted.
+
+Local editable installations share the source checkout: each new CLI process
+reads its current code. Running MCP/API processes must restart to load changes;
+installed plugin snapshots and copied host adapters require an explicit upgrade.
+Updating GitHub alone does not update another machine's checkout. Do not install
+a separate runtime per agent or silently restart active jobs.
+
 ## Conservative stack controls
 
 For an existing Compose checkout, the worker can control only known lifecycle

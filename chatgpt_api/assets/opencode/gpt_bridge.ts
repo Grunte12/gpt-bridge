@@ -163,6 +163,9 @@ export const research = tool({
 export const image = tool({
   description: "Generate a ChatGPT Image with compact output; repeat calls as needed for quality.",
   args: {
+    model: tool.schema.string().optional().describe("Exact model from the account's live picker"),
+    thinkingEffort: tool.schema.string().optional().describe("Native thinking effort supported by that model; not image resolution"),
+    level: tool.schema.enum(["instant", "medium", "high"]).optional().describe("Prompt fidelity; separate from native thinking effort"),
     prompt: tool.schema.string().describe(
       "Give a self-contained labeled artifact spec: deliverable/use; canvas/composition; content/relationships; visual direction; exact quoted text; constraints. The installed gpt-bridge-worker skill provides mode and risk guides.",
     ),
@@ -178,6 +181,9 @@ export const image = tool({
   },
   async execute(args, context) {
     const command = ["image", "--prompt", args.prompt, "--brief"]
+    if (args.model) command.push("--model", args.model)
+    if (args.thinkingEffort) command.push("--thinking-effort", args.thinkingEffort)
+    if (args.level) command.push("--level", args.level)
     if (args.outputPath) command.push("--output-path", outputPath(context.worktree, args.outputPath))
     if (args.transparent) {
       if (!args.outputPath) throw new Error("transparent image generation requires outputPath")
@@ -195,6 +201,9 @@ export const image = tool({
 export const image_edit = tool({
   description: "Edit, restyle, localize, or composite up to 10 source images with compact output.",
   args: {
+    model: tool.schema.string().optional().describe("Exact model from the account's live picker"),
+    thinkingEffort: tool.schema.string().optional().describe("Native thinking effort supported by that model; not image resolution"),
+    level: tool.schema.enum(["instant", "medium", "high"]).optional().describe("Prompt fidelity; separate from native thinking effort"),
     prompt: tool.schema.string().describe(
       "State source roles, the requested change, exact preservation invariants, exact quoted text, and forbidden changes",
     ),
@@ -226,6 +235,9 @@ export const image_edit = tool({
     for (const inputPath of args.inputPaths) {
       command.push("--input-image", outputPath(context.worktree, inputPath))
     }
+    if (args.model) command.push("--model", args.model)
+    if (args.thinkingEffort) command.push("--thinking-effort", args.thinkingEffort)
+    if (args.level) command.push("--level", args.level)
     if (args.transparent) command.push("--transparent")
     if (args.cleanupSession) command.push("--cleanup-session")
     const payload = await runWorker(command)

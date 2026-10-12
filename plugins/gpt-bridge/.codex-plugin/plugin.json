@@ -1,6 +1,6 @@
 {
   "name": "gpt-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Use a user-managed local GPT Bridge worker for chat, research, images, and rich reports.",
   "author": {
     "name": "Local developer"

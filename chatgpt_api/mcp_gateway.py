@@ -30,8 +30,8 @@ LEVEL = {"type": "string", "enum": ["instant", "medium", "high"]}
 CATALOG = {
     "bridge.chat": ("Ask ChatGPT; optional local task thread.", schema({"message": TEXT, "thread": PATH, "level": LEVEL}, ["message"])),
     "bridge.report": ("Generate an HTML report saved as an artifact.", schema({"prompt": TEXT}, ["prompt"])),
-    "bridge.image": ("Generate a PNG; optional alpha and one-shot cleanup.", schema({"prompt": TEXT, "transparent": {"type": "boolean"}, "cleanup_session": {"type": "boolean"}}, ["prompt"])),
-    "bridge.edit": ("Edit/composite up to ten workspace images.", schema({"prompt": TEXT, "input_images": {"type": "array", "items": PATH, "minItems": 1, "maxItems": 10}, "transparent": {"type": "boolean"}, "cleanup_session": {"type": "boolean"}}, ["prompt", "input_images"])),
+    "bridge.image": ("Generate a PNG; explicit model/effort, optional alpha and cleanup.", schema({"prompt": TEXT, "model": PATH, "thinking_effort": PATH, "level": LEVEL, "transparent": {"type": "boolean"}, "cleanup_session": {"type": "boolean"}}, ["prompt"])),
+    "bridge.edit": ("Edit/composite up to ten workspace images; explicit model/effort.", schema({"prompt": TEXT, "model": PATH, "thinking_effort": PATH, "level": LEVEL, "input_images": {"type": "array", "items": PATH, "minItems": 1, "maxItems": 10}, "transparent": {"type": "boolean"}, "cleanup_session": {"type": "boolean"}}, ["prompt", "input_images"])),
     "bridge.research": ("Long-running sourced research saved locally.", schema({"prompt": TEXT}, ["prompt"])),
     "bridge.web_list": ("Find existing ChatGPT conversations by title.", schema({"query": TEXT, "limit": {"type": "integer", "minimum": 1, "maximum": 20}})),
     "bridge.web_read": ("Export an existing conversation to an artifact.", schema({"conversation": TEXT}, ["conversation"])),
@@ -156,6 +156,9 @@ class Gateway:
             if key in args:
                 argv += [flag, str(args[key])]
         if action in {"image", "edit"}:
+            for key, flag in {"model": "--model", "thinking_effort": "--thinking-effort"}.items():
+                if key in args:
+                    argv += [flag, str(args[key])]
             argv += ["--output-path", str(directory / "image.png"), "--brief"]
             for key, flag in {"transparent": "--transparent", "cleanup_session": "--cleanup-session"}.items():
                 if args.get(key):
