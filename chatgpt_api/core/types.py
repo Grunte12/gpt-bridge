@@ -88,6 +88,7 @@ class ImageRequest:
     conversation_id: str | None = None
     parent_message_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    thinking_effort: str | None = None
 
 
 @dataclass(slots=True)

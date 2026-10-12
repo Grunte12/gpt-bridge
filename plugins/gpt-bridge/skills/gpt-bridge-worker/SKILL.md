@@ -5,6 +5,22 @@ description: "Use the user's local GPT Bridge CLI for one-account chat, research
 
 # GPT Bridge Worker
 
+## Highest-quality image requests
+
+When the user prioritizes final-image quality, use `--level high` for prompt
+fidelity and set the native model/effort explicitly. These are separate controls.
+Read `worker doctor --live-models --json` once for the selected direct account
+(or `account-models --account <alias> --json`) to discover current presets.
+Default doctor model lists may be inferred from an older capture.
+
+The GPT-6 High preset verified on 2026-10-13 is
+`--model gpt-6-thinking --thinking-effort extended --level high`.
+Use it only when that account's live picker confirms support. Do not invent
+`highest`/`max` effort values, silently downgrade, or equate reasoning effort
+with image-rendering quality. Generation still requires the user's task scope.
+Correct forwarding is not a likeness guarantee; inspect the saved image.
+
+
 ## Preflight
 
 1. Run `command -v gpt-bridge` (or `Get-Command gpt-bridge` in PowerShell).

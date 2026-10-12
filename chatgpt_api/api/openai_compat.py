@@ -1481,7 +1481,7 @@ async def _image_generation(
 
     requested_model = _str_or_none(body.get("model")) or "auto"
     model, _ = _split_model_agent_mode(requested_model)
-    model_slug, _ = _resolve_model_alias(model, None)
+    model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     model_slug = _resolve_image_model_alias(model_slug)
     request_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     operation_id = _str_or_none(body.get("chatgpt_operation_id")) or _str_or_none(
@@ -1491,6 +1491,7 @@ async def _image_generation(
     conversation_id, parent_message_id = _image_session_from_body(body, request_metadata)
     metadata = {
         "size": body.get("size"),
+        "thinking_effort": thinking_effort,
         "quality": body.get("quality"),
         "style": body.get("style"),
         "response_format": body.get("response_format"),
@@ -1509,6 +1510,7 @@ async def _image_generation(
             ImageRequest(
                 prompt=prompt,
                 model=model_slug,
+                thinking_effort=thinking_effort,
                 conversation_id=conversation_id,
                 parent_message_id=parent_message_id,
                 metadata=metadata,
@@ -1565,7 +1567,7 @@ async def _image_edit(
 
     requested_model = _str_or_none(body.get("model")) or "auto"
     model, _ = _split_model_agent_mode(requested_model)
-    model_slug, _ = _resolve_model_alias(model, None)
+    model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     model_slug = _resolve_image_model_alias(model_slug)
     request_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     operation_id = _str_or_none(body.get("chatgpt_operation_id")) or _str_or_none(
@@ -1575,6 +1577,7 @@ async def _image_edit(
     conversation_id, parent_message_id = _image_session_from_body(body, request_metadata)
     metadata = {
         "source": "images_edits",
+        "thinking_effort": thinking_effort,
         "response_format": body.get("response_format"),
         "aspect_ratio": aspect_ratio,
         "input_image_count": len(input_images),
@@ -1595,6 +1598,7 @@ async def _image_edit(
                 prompt=edit_prompt,
                 input_images=input_images,
                 model=model_slug,
+                thinking_effort=thinking_effort,
                 conversation_id=conversation_id,
                 parent_message_id=parent_message_id,
                 metadata=metadata,
@@ -1702,7 +1706,7 @@ async def _maybe_handle_chat_image_request(
     if not _latest_user_requests_image_generation(latest):
         return None
     model, _ = _split_model_agent_mode(requested_model)
-    model_slug, _ = _resolve_model_alias(model, None)
+    model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     model_slug = _resolve_image_model_alias(model_slug)
     output_path = _image_output_path_from_text(latest)
 
@@ -1710,7 +1714,10 @@ async def _maybe_handle_chat_image_request(
         account, image_response = await _generate_image_with_accounts(
             config,
             router,
-            ImageRequest(prompt=latest, model=model_slug, metadata={"source": "chat_completion_image_intercept"}),
+            ImageRequest(
+                prompt=latest, model=model_slug, thinking_effort=thinking_effort,
+                metadata={"source": "chat_completion_image_intercept"},
+            ),
             requested_model,
             model_slug,
         )
@@ -1752,7 +1759,7 @@ async def _maybe_handle_chat_image_request(
             model_slug,
             latest,
             output_path=output_path,
-            metadata={"source": "chat_completion_image_intercept"},
+            metadata={"source": "chat_completion_image_intercept", "thinking_effort": thinking_effort},
         ),
         produce,
     )
@@ -1877,6 +1884,7 @@ def _image_request_with_operation_hooks(request: ImageRequest, operation_id: str
         conversation_id=request.conversation_id,
         parent_message_id=request.parent_message_id,
         metadata=metadata,
+        thinking_effort=request.thinking_effort,
     )
 
 
@@ -1895,7 +1903,7 @@ async def _generate_image_with_accounts(
         config,
         router,
         model_slug,
-        None,
+        request.thinking_effort,
         _image_usage_requirements(input_image_count),
     ):
         provider = _provider_for_account(config, account)

@@ -499,12 +499,22 @@ Model aliases reflect what the local account/router exposes. Inspect them
 instead of hard-coding assumptions:
 
 ```powershell
-gpt-bridge worker doctor --json
-gpt-bridge admin models --json --base-url http://127.0.0.1:8000/v1 --api-key YOUR_LOCAL_KEY
+gpt-bridge worker doctor --live-models --json
+gpt-bridge account-models --account personal-main --json
 ```
 
 > ภาษาไทย: ชื่อ account เช่น `personal-main` เป็น alias ในเครื่อง ไม่ใช่ plan
-> ของ ChatGPT และ model ที่ใช้ได้จริงควรดูจาก `worker doctor` หรือ `admin models`
+> ของ ChatGPT รายการ `/models` ปกติอาจอนุมานจาก capture เก่า ไม่ใช่รายการสด
+> ใช้ `worker doctor --live-models` (direct) หรือ `account-models` ดูโมเดลและ effort ปัจจุบัน
+
+Image `--level high` sets prompt fidelity, not reasoning effort. Discover the
+selected account's native presets before requesting the highest available tier.
+GPT-6 High observed on 2026-10-13 uses
+`--model gpt-6-thinking --thinking-effort extended --level high`.
+Do not invent a `highest` or `max` value when the live picker does not list it.
+Generate/edit and continuation requests forward the selected effort, but this
+does not guarantee that the upstream image renderer honors the preset or that
+likeness improves. Model discovery does not generate media.
 
 ## Conservative stack controls
 
