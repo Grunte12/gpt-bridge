@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "GPT Bridge Image Worker (experimental)",
+  "version": "0.1.6",
+  "description": "Owner-paired ChatGPT image jobs. No cookie/token access or browser-control service.",
+  "permissions": ["storage", "activeTab", "alarms"],
+  "host_permissions": ["http://127.0.0.1:18767/*"],
+  "background": {"service_worker": "worker.js"},
+  "action": {"default_popup": "popup.html"},
+  "content_scripts": [{"matches": ["https://chatgpt.com/*"], "js": ["content.js"], "run_at": "document_idle"}]
+}

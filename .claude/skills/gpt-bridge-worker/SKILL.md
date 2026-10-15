@@ -5,6 +5,34 @@ description: "Use the user's local GPT Bridge CLI for one-account chat, research
 
 # GPT Bridge Worker
 
+## Native image generation — extension 0.1.6
+
+For the owner's current image-generation tasks, prefer the `gpt-bridge-extension`
+MCP tools over the legacy direct CLI image commands below. Test/use only `second`;
+do not call `main`, refresh captures, or silently fall back to direct HTTP.
+
+1. Call `extension_status()`. Require `account=second`, `extension_online=true`
+   and `tab_ready=true` before submitting.
+2. Call `extension_image(prompt=..., expected_model="Create image")` once.
+3. Poll `extension_status(job_id=...)`. Success requires `state=complete` with a
+   saved image path, dimensions and hash; inspect that image.
+4. On interruption, failure or uncertainty, inspect the existing ChatGPT work;
+   never resend automatically. `extension_resolve` releases local work only after
+   that inspection and does not cancel upstream generation.
+
+One local worker owns the paired tab. Other agent hosts must launch the same
+module with `--account second --connect`, not another owning worker. Clients
+share the existing worker and do not add listeners or queue files. The owner
+worker must remain running. The extension reuses its saved local pairing after
+restarts; do not ask for ChatGPT cookies/tokens or repeat initial pairing.
+
+A fresh normal ChatGPT chat with native Create image selected is needed for each
+new image. Use browser control only for missing setup actions, not submission or
+polling. This route does not yet support reference edits/batches or guarantee
+GPT-6 Pro/High, highest quality, or original-download resolution. If its MCP tools
+are missing, reload/reconnect that host's MCP at a safe point; do not restart busy
+sessions or run old image commands as a substitute.
+
 ## Preflight
 
 1. Run `command -v gpt-bridge` (or `Get-Command gpt-bridge` in PowerShell).

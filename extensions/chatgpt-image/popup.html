@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPT Bridge</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#fff; --text:#202124; --muted:#5c626b; --line:#d9dce1; --accent:#245bc2; --hover:#f1f4f8; --good:#167245; --warn:#946200; --bad:#b3332b; }
+    @media (prefers-color-scheme:dark) { :root { --bg:#202124; --text:#f0f1f3; --muted:#b5bac3; --line:#484d55; --accent:#a7c7ff; --hover:#30343a; --good:#85d5a6; --warn:#f3c77e; --bad:#ffa69e; } }
+    * { box-sizing:border-box; }
+    body { width:360px; margin:0; padding:20px; background:var(--bg); color:var(--text); font:14px/1.55 system-ui,sans-serif; }
+    [hidden] { display:none!important; }
+    ::selection { background:var(--accent); color:var(--bg); }
+    h1 { margin:0; font-size:16px; font-weight:650; }
+    h2 { margin:0 0 6px; font-size:20px; line-height:1.45; font-weight:650; overflow-wrap:anywhere; }
+    p { margin:0; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:24px; }
+    #identity { color:var(--muted); font-size:12px; }
+    #connection { margin-bottom:20px; }
+    #connection-title { display:flex; align-items:baseline; gap:9px; }
+    #connection-title::before { content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--muted); }
+    body[data-state="ready"] #connection-title::before, body[data-state="complete"] #connection-title::before { background:var(--good); }
+    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="interrupted"] #connection-title::before { background:var(--warn); }
+    body[data-state="failed"] #connection-title::before, body[data-state="needs_pairing"] #connection-title::before { background:var(--bad); }
+    #connection-detail, #last-job, .hint { color:var(--muted); }
+    #last-job { margin-top:10px; font-size:12px; }
+    form { margin:0 0 20px; }
+    label { display:block; margin-top:14px; }
+    input[type="password"] { width:100%; margin-top:6px; padding:10px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font:inherit; caret-color:var(--accent); }
+    input::placeholder { color:var(--muted); }
+    .confirm { display:flex; gap:9px; align-items:flex-start; margin-bottom:16px; }
+    input[type="checkbox"] { width:17px; height:17px; flex:none; margin:3px 0 0; accent-color:var(--accent); }
+    button { min-height:40px; border:1px solid var(--line); border-radius:8px; padding:8px 12px; background:var(--bg); color:var(--text); font:inherit; font-weight:550; cursor:pointer; }
+    button:hover { background:var(--hover); }
+    button:active { background:var(--line); }
+    button:disabled { opacity:.5; cursor:default; }
+    button:focus-visible, input:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    #pair { width:100%; border-color:var(--accent); background:var(--accent); color:var(--bg); }
+    #pair:hover { filter:brightness(.92); }
+    #refresh { width:100%; }
+    .hint { font-size:12px; margin-top:10px; }
+    details { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); }
+    summary { color:var(--muted); cursor:pointer; }
+    .options { display:grid; gap:8px; margin-top:12px; }
+    .options button { text-align:left; border-color:transparent; }
+    #disconnect { color:var(--bad); }
+    #notice { margin-top:14px; color:var(--bad); overflow-wrap:anywhere; }
+  </style>
+</head>
+<body data-state="checking">
+  <header><h1>GPT Bridge</h1><span id="identity" hidden>บัญชี second</span></header>
+  <section id="connection" role="status" aria-live="polite" aria-atomic="true">
+    <h2 id="connection-title">กำลังตรวจการเชื่อมต่อ</h2>
+    <p id="connection-detail">รอสักครู่</p>
+    <p id="last-job" hidden></p>
+  </section>
+  <form id="pair-form" hidden>
+    <p>เปิดแชตปกติใหม่ใน ChatGPT แล้วเลือก <strong>Create image</strong></p>
+    <label id="token-row">รหัสจับคู่ในเครื่อง
+      <input id="token" type="password" autocomplete="off" placeholder="ใช้เฉพาะการเชื่อมครั้งแรก">
+    </label>
+    <label class="confirm"><input id="confirm-account" type="checkbox" required><span>แท็บนี้เป็นบัญชี second ไม่ใช่ main</span></label>
+    <button id="pair" type="submit">เชื่อมแท็บนี้</button>
+    <p class="hint" id="pair-hint">รหัสนี้ไม่ใช่รหัสผ่านหรือโทเคน ChatGPT บัญชีที่ใช้ต้องตรวจด้วยตัวคุณเอง</p>
+  </form>
+  <button id="refresh" type="button" hidden>ตรวจการเชื่อมต่ออีกครั้ง</button>
+  <details id="advanced" hidden>
+    <summary>ตัวเลือก</summary>
+    <div class="options">
+      <button id="relink" type="button">เชื่อมแท็บนี้แทน — ใช้รหัสเดิม</button>
+      <button id="collect" type="button" hidden>รับภาพจากงานเดิม ไม่สร้างซ้ำ</button>
+      <button id="disconnect" type="button">ลืมการจับคู่</button>
+    </div>
+    <p class="hint">เปิดแท็บที่เชื่อมไว้ค้างไว้ ไม่เปลี่ยนบัญชีระหว่างทำงาน</p>
+  </details>
+  <p id="notice" role="alert" hidden></p>
+  <script src="popup.js"></script>
+</body>
+</html>
