@@ -43,8 +43,10 @@ No additional daemon, tunnel, pairing file or batch queue was added.
 
 ### Multiple agent hosts: one worker, shared clients
 
-Keep exactly one owning MCP command (without `--connect`) running, currently
-Codex on this machine. Configure Claude Code, Cursor, Antigravity and OpenCode
+Keep exactly one owning MCP command (without `--connect`) running. This machine
+now keeps that command in one foreground terminal so it is not tied to a single
+agent chat. The terminal must remain open; no login/background daemon is installed.
+Configure Codex, Claude Code, Cursor, Antigravity and OpenCode
 with the same Python/module plus `--account second --connect`. These lightweight
 stdio MCP clients use the existing authenticated loopback worker; they never
 open another listener, lock/reload queue state, or interrupt running work.
@@ -108,15 +110,15 @@ remains conservative.
 
 ## One-time setup on this machine
 
-The new MCP can be registered without restarting an existing Bridge service:
+With the one owning worker running, register a shared MCP client:
 
 ```sh
-codex mcp add gpt-bridge-extension -- /Users/grunte/Workspace/repos/gpt-bridge/.venv/bin/python -m chatgpt_api.extension_bridge --account second
+codex mcp add gpt-bridge-extension -- /Users/grunte/Workspace/repos/gpt-bridge/.venv/bin/python -m chatgpt_api.extension_bridge --account second --connect
 ```
 
 Reload the MCP connection if the host does not discover newly registered servers.
 It exposes only `extension_status`, `extension_image`, and `extension_resolve`.
-The server listens on `127.0.0.1:18767` while its MCP connection is open. It is a
+The owning worker listens on `127.0.0.1:18767` while it remains running. It is a
 separate process/data directory; existing direct Bridge jobs are unaffected.
 
 Host lifecycle is separate from extension reconnection: an enabled configuration
