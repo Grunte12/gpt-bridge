@@ -30,7 +30,8 @@ function validateImages(job) {
   for (const [index, image] of images.entries()) {
     if (!image || image.order !== index + 1 || !["source", "reference"].includes(image.role) ||
         typeof image.description !== "string" || !image.description.trim() || image.description.length > 200 ||
-        !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) ||
+        !(job.preflight_cleanup_only ? /^input-\d{3,}(?:-[a-f0-9]{32})?(?:\([1-9]\d{0,5}\))?\.(png|jpg|webp)$/ :
+          /^input-\d{3,}(?:-[a-f0-9]{32})?\.(png|jpg|webp)$/).test(image.name) ||
         !["image/png", "image/jpeg", "image/webp"].includes(image.mime) ||
         !Number.isInteger(image.bytes) || image.bytes <= 0 || image.bytes > maxInputBytes ||
         (job.preflight_cleanup_only ? image.data_base64 !== undefined :
@@ -338,6 +339,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         await chrome.storage.local.remove("active");
         await connection(message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", message.error
           ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
+          : result.uploads_cleared ? "นำไฟล์แนบของงานที่หยุดก่อนส่งออกแล้ว แท็บว่าง ไม่ได้เจนภาพ"
           : active.job?.preflight_only ? result.preflight_uploads_cleared
             ? "ตรวจอัปโหลดผ่านและนำไฟล์แนบทดสอบออกแล้ว แท็บว่าง ไม่มีการส่งหรือเจนภาพ"
             : "ตรวจอัปโหลดพร้อมแล้ว ยังไม่ส่งและไม่เจนภาพ ดราฟต์ทดสอบยังอยู่ในแท็บเดิม"

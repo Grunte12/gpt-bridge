@@ -1,6 +1,7 @@
 """Offline tests for local reference images in the native extension queue."""
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -303,7 +304,7 @@ def test_clear_preflight_requires_strict_matching_clear_receipt(tmp_path, invali
     assert "chat_path" not in receipt
     assert "auto_delete_saved_chat" not in queue.jobs[submitted["job_id"]]
     assert not list((queue.root / submitted["job_id"]).glob("image.*"))
-    assert (queue.root / submitted["job_id"] / "input-001.png").read_bytes() == raw
+    assert (queue.root / submitted["job_id"] / submitted["images"][0]["name"]).read_bytes() == raw
 
 
 @pytest.mark.parametrize("preflight_only", [False, True])
@@ -408,7 +409,9 @@ def test_create_accepts_zero_or_multiple_ordered_references_and_compact_status(t
     assert [item["order"] for item in metadata] == [1, 2, 3]
     assert [item["role"] for item in metadata] == ["reference"] * 3
     assert [item["description"] for item in metadata] == descriptions
-    assert [item["name"] for item in metadata] == [f"input-{index:03d}.png" for index in range(1, 4)]
+    assert [item["name"] for item in metadata] == [
+        f"input-{index:03d}-{submitted['job_id']}.png" for index in range(1, 4)
+    ]
     assert all({"bytes", "sha256", "mime", "dimensions"} <= item.keys() for item in metadata)
     assert all("path" not in item and "data_base64" not in item for item in metadata)
     assert all(str(path) not in repr(submitted) for path in paths)
@@ -417,6 +420,37 @@ def test_create_accepts_zero_or_multiple_ordered_references_and_compact_status(t
         assert snapshot.read_bytes() == raw
         assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
     assert stat.S_IMODE((queue.root / submitted["job_id"]).stat().st_mode) == 0o700
+
+
+def test_queue_snapshot_names_are_unique_per_job_and_preserve_digest_bytes(tmp_path):
+    queue = _paired_queue(tmp_path / "queue")
+    source = tmp_path / "same-source.png"
+
+    first_raw = _write_image(source, color=(190, 30, 40))
+    first = queue.submit("Use the first source snapshot.", "Create image", images=[
+        _input(source, "visual reference"),
+    ])
+    first_image = first["images"][0]
+    assert first_image["name"] == f"input-001-{first['job_id']}.png"
+    assert first_image["sha256"] == hashlib.sha256(first_raw).hexdigest()
+    assert (queue.root / first["job_id"] / first_image["name"]).read_bytes() == first_raw
+    first_claim = queue.claim(CLIENT_ID)
+    assert base64.b64decode(first_claim["images"][0]["data_base64"]) == first_raw
+    assert first_claim["images"][0]["sha256"] == first_image["sha256"]
+    queue.result(CLIENT_ID, first["job_id"], error="finish the first snapshot test job")
+
+    second_raw = _write_image(source, color=(20, 160, 70))
+    second = queue.submit("Use the second source snapshot.", "Create image", images=[
+        _input(source, "visual reference"),
+    ])
+    second_image = second["images"][0]
+    assert second_image["name"] == f"input-001-{second['job_id']}.png"
+    assert second_image["name"] != first_image["name"]
+    assert second_image["sha256"] == hashlib.sha256(second_raw).hexdigest()
+    assert (queue.root / second["job_id"] / second_image["name"]).read_bytes() == second_raw
+    second_claim = queue.claim(CLIENT_ID)
+    assert base64.b64decode(second_claim["images"][0]["data_base64"]) == second_raw
+    assert second_claim["images"][0]["sha256"] == second_image["sha256"]
 
 
 def test_edit_requires_source_and_create_rejects_source_role(tmp_path):
@@ -587,7 +621,7 @@ def test_valid_jpeg_and_static_webp_are_accepted(tmp_path, fmt, suffix, mime):
         _input(path, "visual reference"),
     ])
 
-    assert submitted["images"][0]["name"] == f"input-001.{suffix}"
+    assert submitted["images"][0]["name"] == f"input-001-{submitted['job_id']}.{suffix}"
     assert submitted["images"][0]["mime"] == mime
     assert submitted["images"][0]["dimensions"] == [9, 7]
 

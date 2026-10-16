@@ -149,9 +149,12 @@ class ExtensionClient:
                                               for item in (images or [])], "preflight_only": preflight_only,
                                    **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {})})
 
-    def resolve(self, job_id: str, clear_preflight_uploads: bool = False) -> dict:
+    def resolve(self, job_id: str, clear_preflight_uploads: bool = False,
+                clear_failed_uploads: bool = False, native_upload_names: list[str] | None = None) -> dict:
         return self.call("resolve", {"job_id": job_id, "inspected_chatgpt": True,
-                                    **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {})})
+                                    **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {}),
+                                    **({"clear_failed_uploads": clear_failed_uploads} if clear_failed_uploads is not False else {}),
+                                    **({"native_upload_names": native_upload_names} if native_upload_names is not None else {})})
 
     def confirm_delete(self, job_id: str, owner_confirmed: bool = False) -> dict:
         return self.call("confirm-delete", {"job_id": job_id, "owner_confirmed": owner_confirmed})
@@ -286,6 +289,8 @@ class ExtensionQueue:
                 directory = self.root / job["job_id"]
                 directory.mkdir(mode=0o700)
                 for metadata, raw in inputs:
+                    stem, suffix = metadata["name"].rsplit(".", 1)
+                    metadata["name"] = f"{stem}-{job['job_id']}.{suffix}"
                     descriptor = os.open(directory / metadata["name"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(descriptor, "wb") as output:
                         output.write(raw)
@@ -314,7 +319,11 @@ class ExtensionQueue:
                     self._save(job)  # Persist BEFORE delivery. Never repeat on uncertain response.
                     claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed") if k in job}
                     if job.get("preflight_cleanup_only"):
-                        claimed["images"] = [dict(metadata) for metadata in job["images"]]
+                        names = job.get("native_upload_names", [image["name"] for image in job["images"]])
+                        claimed["images"] = [{**metadata, "name": names[index]}
+                                             for index, metadata in enumerate(job["images"])]
+                        if job.get("failed_upload_cleanup"):
+                            claimed.update(preflight_only=True, clear_preflight_uploads=True)
                         return claimed  # Existing uploads only: never deliver image bytes again.
                     if job.get("images"):
                         claimed["images"] = []
@@ -344,10 +353,16 @@ class ExtensionQueue:
             job = self.jobs.get(job_id)
             if not job or job["client_id"] != client_id or job["state"] != "claimed":
                 raise ValueError("job is not claimed by this extension; result was not accepted")
-            if preflight_uploads_cleared and not job.get("clear_preflight_uploads"):
+            if preflight_uploads_cleared and not (job.get("clear_preflight_uploads") or job.get("failed_upload_cleanup")):
                 raise ValueError("preflight upload clearing was not requested")
             if error is not None:
                 job.update(state="failed", error=str(error)[:500])
+            elif job.get("failed_upload_cleanup"):
+                if not preflight_ready or not preflight_uploads_cleared or image_base64 or cleanup_pending or chat_path:
+                    raise ValueError("failed-upload cleanup requires only an empty-composer no-Send receipt")
+                job.update(state="failed", error=job["original_upload_error"], uploads_cleared=True,
+                           submitted=False, generated=False, cleanup_status="not_requested",
+                           draft_note="Inspected failed-job uploads removed; composer empty. Original image request was not completed.")
             elif job.get("preflight_only"):
                 if not preflight_ready or image_base64 or cleanup_pending or chat_path:
                     raise ValueError("preflight accepts only a no-Send readiness receipt, never media or cleanup")
@@ -475,13 +490,41 @@ class ExtensionQueue:
                 raise ValueError("job does not belong to this extension")
             return self.status(job_id)
 
-    def resolve(self, job_id: str, clear_preflight_uploads: bool = False) -> dict:
+    def resolve(self, job_id: str, clear_preflight_uploads: bool = False,
+                clear_failed_uploads: bool = False, native_upload_names: list[str] | None = None) -> dict:
         """Explicit operator action after inspecting the upstream conversation."""
         with self.lock:
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
             if type(clear_preflight_uploads) is not bool:
                 raise ValueError("clear_preflight_uploads must be a boolean")
+            if type(clear_failed_uploads) is not bool or (clear_failed_uploads and clear_preflight_uploads):
+                raise ValueError("choose one boolean upload cleanup action")
+            if native_upload_names is not None and not clear_failed_uploads:
+                raise ValueError("native_upload_names requires inspected failed-upload cleanup")
+            if clear_failed_uploads:
+                job = self.jobs[job_id]
+                if (job["state"] != "failed" or job.get("preflight_only") or job.get("failed_upload_cleanup") or
+                        not job.get("images") or not job.get("error", "").startswith("Not submitted. Native uploads not verified ready;")):
+                    raise ValueError("only an inspected unsent generation upload failure can be cleared once")
+                if (not isinstance(native_upload_names, list) or len(native_upload_names) != len(job["images"]) or
+                        any(not isinstance(name, str) or not re.fullmatch(
+                            re.escape(image["name"].rsplit(".", 1)[0]) + r"(?:\([1-9][0-9]{0,5}\))?\." +
+                            re.escape(image["name"].rsplit(".", 1)[1]), name)
+                            for name, image in zip(native_upload_names, job["images"])) or
+                        len(set(native_upload_names)) != len(native_upload_names)):
+                    raise ValueError("inspected native filenames must exactly match the original ordered names or numeric duplicate suffixes")
+                if (not self.client or time.monotonic() - self.client["seen"] > 90 or
+                        self.client.get("input_protocol", 0) < 4 or self.client["client_id"] != job["client_id"]):
+                    raise ValueError("original paired extension with protocol 4 is required")
+                if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
+                    raise ValueError("finish existing work before failed-upload cleanup")
+                if max(self.jobs, key=lambda key: (self.root / key / "state.json").stat().st_mtime_ns) != job_id:
+                    raise ValueError("only the latest inspected upload failure may clear existing uploads")
+                job.update(state="queued", preflight_cleanup_only=True, failed_upload_cleanup=True,
+                           native_upload_names=list(native_upload_names), original_upload_error=job.pop("error"))
+                self._save(job)
+                return self.status(job_id)
             if clear_preflight_uploads:
                 job = self.jobs[job_id]
                 resume = (job.get("preflight_cleanup_only") is True and
@@ -584,7 +627,8 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 elif self.path == "/agent/resolve":
                     if data.get("inspected_chatgpt") is not True:
                         raise ValueError("inspect ChatGPT before resolving uncertain work")
-                    result = queue.resolve(data["job_id"], data.get("clear_preflight_uploads", False))
+                    result = queue.resolve(data["job_id"], data.get("clear_preflight_uploads", False),
+                                           data.get("clear_failed_uploads", False), data.get("native_upload_names"))
                 else:
                     return self.reply(404, {"error": "unknown route"})
                 self.reply(200, result)
@@ -615,10 +659,13 @@ def create_mcp(queue):
         return queue.confirm_delete(job_id, owner_confirmed)
 
     @server.tool()
-    def extension_resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False) -> dict:
-        """Release uncertain work ONLY after inspection. With owner approval, clear_preflight_uploads=true verifies/removes this failed preflight's existing uploads (protocol 4); one explicit resume is supported for the known asynchronous-removal failure. No re-upload, text insertion, Send, generation or chat deletion. Refuses unknown/changed drafts. Otherwise does not cancel/resend upstream work."""
+    def extension_resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False,
+                          clear_failed_uploads: StrictBool = False, native_upload_names: list[str] | None = None) -> dict:
+        """Release uncertain work ONLY after inspection. With owner approval, clear_preflight_uploads=true removes a failed preflight's uploads; one explicit resume handles the known async-removal failure. For a normal generation that failed upload readiness BEFORE Send, clear_failed_uploads=true requires all exact inspected native_upload_names (numeric duplicate suffixes allowed). That request remains failed after its attachments are cleared; never resend automatically. Protocol 4, same client/latest job only. No re-upload, text, Send, generation or chat deletion. Refuses changed drafts."""
         if inspected_chatgpt is not True:
             raise ValueError("inspect ChatGPT before resolving uncertain work")
+        if clear_failed_uploads or native_upload_names is not None:
+            return queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names)
         return queue.resolve(job_id, clear_preflight_uploads)
 
     return server

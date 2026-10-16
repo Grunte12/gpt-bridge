@@ -283,3 +283,12 @@ test('preflight completion is labeled as unsent and not as a saved image', async
   assert.doesNotMatch(h.elements['last-job'].textContent, /ภาพ.*บันทึก/);
   assert.equal(h.elements.collect.hidden, true);
 });
+
+test('cleared failed uploads are not labeled as a generated image', async () => {
+  const h = harness({configured: true, account: 'second', tabId: 7,
+    connection: {state: 'ready'}, active: null,
+    lastJob: {job_id: 'failed-job', state: 'failed', uploads_cleared: true, submitted: false, generated: false}});
+  await settle();
+  assert.match(h.elements['last-job'].textContent, /นำไฟล์แนบ.*หยุดก่อนส่ง.*ไม่ได้เจนภาพ/);
+  assert.doesNotMatch(h.elements['last-job'].textContent, /ภาพ.*บันทึก/);
+});

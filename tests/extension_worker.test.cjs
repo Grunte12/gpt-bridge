@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.18 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.18');
+test('0.1.19 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.19');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -848,6 +848,7 @@ test('protocol-4 heartbeat dispatches inspected cleanup resume metadata without 
   const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
   const job = metadataOnly(cleanupOnlyPreflight([referenceImage(1, 'source'), referenceImage(2, 'reference')]));
   job.preflight_cleanup_resumed = true;
+  for (const image of job.images) image.name = image.name.replace('.png', '(1).png');
   const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: job});
   Object.assign(h.storage, {config});
 
@@ -999,9 +1000,30 @@ test('interrupted preflight is never replayed after worker restart', async () =>
   assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
 });
 
-test('create mode accepts three reference-only images without a source role', async () => {
+test('failed-upload cleanup keeps the original failed receipt and reports an empty draft', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = metadataOnly(cleanupOnlyPreflight([referenceImage(1, 'reference')]));
+  job.mode = 'create';
+  const receipt = {job_id: job.job_id, state: 'failed', uploads_cleared: true,
+    submitted: false, generated: false, cleanup_status: 'not_requested'};
+  const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true},
+    next: job, responses: {result: receipt}});
+  Object.assign(h.storage, {config});
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+  const result = await send(h, {type: 'image-result', jobId: job.job_id,
+    preflightReady: true, preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+  assert.equal(result.ok, true);
+  assert.deepEqual(h.storage.lastJob, receipt);
+  assert.equal(h.storage.active, undefined);
+  assert.match(h.storage.connection.detail, /แท็บว่าง.*ไม่ได้เจนภาพ/);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('create mode accepts three uniquely named reference-only images without a source role', async () => {
   const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
   const job = {...imageJob([referenceImage(1, 'reference'), referenceImage(2, 'reference'), referenceImage(3, 'reference')]), mode: 'create'};
+  for (const image of job.images) image.name = image.name.replace('.png', '-0123456789abcdef0123456789abcdef.png');
   const h = harness({next: job});
   Object.assign(h.storage, {config});
 
@@ -1020,6 +1042,7 @@ test('malformed edit image payloads fail before content dispatch', async t => {
     ['nonsequential order', images => { images[1].order = 3; }],
     ['invalid role', images => { images[1].role = 'background'; }],
     ['unsafe local filename', images => { images[0].name = '../../source.png'; }],
+    ['duplicate alias is cleanup-only', images => { images[0].name = 'input-001(1).png'; }],
     ['edit without source image', images => { images.forEach(image => { image.role = 'reference'; }); }]
   ];
   for (const [name, mutate] of cases) await t.test(name, async () => {

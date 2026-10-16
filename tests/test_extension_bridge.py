@@ -1,5 +1,6 @@
 """Offline tests for the opt-in localhost image-extension queue."""
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -10,7 +11,7 @@ import uuid
 import pytest
 from PIL import Image
 
-from chatgpt_api.extension_bridge import ExtensionQueue, MAX_IMAGE, main, make_handler
+from chatgpt_api.extension_bridge import ExtensionQueue, MAX_IMAGE, create_mcp, main, make_handler
 
 
 ACCOUNT = "second"
@@ -60,6 +61,26 @@ def _failed_upload_preflight(tmp_path, *, protocol=4, clear=True, error="Not sub
         assert "data_base64" in original_claim["images"][0]
     queue.result(CLIENT_ID, job_id, error=error)
     return queue, job_id, original_claim
+
+
+def _failed_generation_upload(tmp_path, *, protocol=4,
+                              error="Not submitted. Native uploads not verified ready; Native image file input missing."):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=protocol)
+    inputs = []
+    for order, color in enumerate(((50, 90, 130), (180, 70, 40)), 1):
+        path = tmp_path / f"generation-reference-{order}.png"
+        Image.new("RGB", (512, 512), color).save(path, format="PNG")
+        inputs.append({"path": str(path), "role": "reference", "description": f"reference {order}"})
+    submitted = queue.submit("Generate with two references.", "Create image", images=inputs)
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, submitted["job_id"], error=error)
+    return queue, submitted["job_id"], submitted["images"], error
+
+
+def _native_duplicate_name(name, number):
+    stem, extension = name.rsplit(".", 1)
+    return f"{stem}({number}).{extension}"
 
 
 def _call_post(handler_type, path, payload, *, token=TOKEN, origin=EXTENSION_ORIGIN,
@@ -1014,6 +1035,148 @@ def test_failed_preflight_cleanup_recovery_after_restart_is_not_replayed(tmp_pat
     assert restarted.status(job_id)["original_preflight_error"] == original_error
     restarted.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
     assert restarted.claim(CLIENT_ID) == {}
+
+
+def test_inspected_failed_generation_cleanup_accepts_exact_ordered_numeric_aliases_via_mcp(tmp_path):
+    queue, job_id, images, original_error = _failed_generation_upload(tmp_path)
+    original = queue.jobs[job_id]
+    native_names = [_native_duplicate_name(images[0]["name"], 1), images[1]["name"]]
+    server = create_mcp(queue)
+
+    response = asyncio.run(server.call_tool("extension_resolve", {
+        "job_id": job_id,
+        "inspected_chatgpt": True,
+        "clear_failed_uploads": True,
+        "native_upload_names": native_names,
+    }))
+
+    assert "queued" in response[0].text
+    queued = queue.status(job_id)
+    assert queued["failed_upload_cleanup"] is True
+    assert queued["native_upload_names"] == native_names
+    assert queued["original_upload_error"] == original_error
+    assert "data_base64" not in json.dumps(queued)
+    # This remains the original normal generation job, not a preflight job.
+    assert "preflight_only" not in original
+    assert "clear_preflight_uploads" not in original
+
+    claim = queue.claim(CLIENT_ID)
+    assert claim["job_id"] == job_id
+    assert claim["preflight_only"] is True  # Delivery-only cleanup protocol flags.
+    assert claim["clear_preflight_uploads"] is True
+    assert [image["name"] for image in claim["images"]] == native_names
+    assert all("data_base64" not in image for image in claim["images"])
+    assert queue.claim(CLIENT_ID) == {}
+
+    finished = queue.result(CLIENT_ID, job_id, preflight_ready=True, preflight_uploads_cleared=True)
+    assert finished["state"] == "failed"
+    assert finished["error"] == original_error
+    assert finished["uploads_cleared"] is True
+    assert finished["submitted"] is False
+    assert finished["generated"] is False
+    assert "image_base64" not in finished and "chat_path" not in finished
+    with pytest.raises(ValueError, match="only an inspected unsent generation upload failure"):
+        queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=native_names)
+
+
+@pytest.mark.parametrize("case", [
+    "missing_names",
+    "reordered",
+    "foreign_name",
+    "nonnumeric_suffix",
+    "zero_suffix",
+    "leading_zero_suffix",
+    "oversized_suffix",
+])
+def test_inspected_failed_generation_cleanup_requires_exact_ordered_native_names(tmp_path, case):
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path)
+    valid = [image["name"] for image in images]
+    if case == "missing_names":
+        names = None
+    elif case == "reordered":
+        names = list(reversed(valid))
+    elif case == "foreign_name":
+        names = ["other.png", valid[1]]
+    elif case == "nonnumeric_suffix":
+        names = [valid[0].replace(".png", "(x).png"), valid[1]]
+    elif case == "zero_suffix":
+        names = [valid[0].replace(".png", "(0).png"), valid[1]]
+    elif case == "leading_zero_suffix":
+        names = [valid[0].replace(".png", "(01).png"), valid[1]]
+    else:
+        names = [valid[0].replace(".png", "(1000000).png"), valid[1]]
+
+    with pytest.raises(ValueError, match="inspected native filenames must exactly match"):
+        queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id).get("failed_upload_cleanup") is not True
+
+
+@pytest.mark.parametrize("receipt", [
+    {"preflight_uploads_cleared": False},
+    {"preflight_ready": False},
+    {"image_base64": "not-a-media-receipt"},
+    {"cleanup_pending": True},
+    {"chat_path": "/c/123e4567-e89b-12d3-a456-426614174000"},
+])
+def test_inspected_failed_generation_cleanup_rejects_nonempty_or_incomplete_receipts(tmp_path, receipt):
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path)
+    names = [image["name"] for image in images]
+    queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    queue.claim(CLIENT_ID)
+    invalid_receipt = {"preflight_ready": True, "preflight_uploads_cleared": True, **receipt}
+
+    with pytest.raises(ValueError, match="failed-upload cleanup requires only an empty-composer no-Send receipt"):
+        queue.result(CLIENT_ID, job_id, **invalid_receipt)
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+def test_inspected_failed_generation_cleanup_requires_protocol_four_original_client(tmp_path):
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path, protocol=3)
+    names = [image["name"] for image in images]
+    with pytest.raises(ValueError, match="original paired extension with protocol 4"):
+        queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    assert queue.status(job_id)["state"] == "failed"
+
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path / "replacement-client")
+    replacement_id = "223e4567-e89b-12d3-a456-426614174000"
+    queue.pair(replacement_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+    with pytest.raises(ValueError, match="original paired extension with protocol 4"):
+        queue.resolve(job_id, clear_failed_uploads=True,
+                      native_upload_names=[image["name"] for image in images])
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_inspected_failed_generation_cleanup_requires_latest_failure_and_exact_readiness_error(tmp_path):
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path)
+    names = [image["name"] for image in images]
+    newer = queue.submit("Later independent job.", "Create image")
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, newer["job_id"], error="Explicit later work failed.")
+    with pytest.raises(ValueError, match="only the latest inspected upload failure"):
+        queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    assert queue.status(job_id)["state"] == "failed"
+
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path / "wrong-error", error="Not submitted. Changed draft.")
+    with pytest.raises(ValueError, match="only an inspected unsent generation upload failure"):
+        queue.resolve(job_id, clear_failed_uploads=True,
+                      native_upload_names=[image["name"] for image in images])
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_inspected_failed_generation_cleanup_is_not_replayed_after_restart(tmp_path):
+    queue, job_id, images, _error = _failed_generation_upload(tmp_path)
+    names = [image["name"] for image in images]
+    queue.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    queue.claim(CLIENT_ID)
+
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+    assert restarted.status(job_id)["state"] == "interrupted"
+    restarted.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    assert restarted.claim(CLIENT_ID) == {}
+    with pytest.raises(ValueError, match="only an inspected unsent generation upload failure"):
+        restarted.resolve(job_id, clear_failed_uploads=True, native_upload_names=names)
+    assert restarted.status(job_id)["state"] == "interrupted"
 
 
 def test_local_http_handler_rejects_bad_auth_host_and_origin(tmp_path):

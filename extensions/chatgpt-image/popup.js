@@ -47,7 +47,9 @@ function render(status) {
   $("#disconnect").disabled = !!status.active || busy;
   $("#reload").disabled = !!status.active || busy;
   $("#latest-job").hidden = !job;
-  $("#last-job").textContent = !job ? "" : job.preflight_ready
+  $("#last-job").textContent = !job ? "" : job.uploads_cleared
+    ? "นำไฟล์แนบของงานที่หยุดก่อนส่งออกแล้ว · ไม่ได้เจนภาพ"
+    : job.preflight_ready
     ? job.preflight_uploads_cleared
       ? "ตรวจอัปโหลดผ่าน · คืนแท็บว่างแล้ว · ไม่ได้เจนภาพ"
       : "อัปโหลดพร้อมแล้ว · ยังไม่ส่งและไม่เจนภาพ"

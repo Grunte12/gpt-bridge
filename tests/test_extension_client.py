@@ -301,6 +301,8 @@ def test_mcp_resolve_requires_inspection_before_calling_client(arguments):
     {"job_id": "synthetic", "inspected_chatgpt": "true"},
     {"job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": 1},
     {"job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": "true"},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "clear_failed_uploads": 1},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "clear_failed_uploads": "true"},
 ])
 def test_mcp_resolve_rejects_non_boolean_inspection_and_cleanup_flags(arguments):
     from chatgpt_api.extension_bridge import create_mcp
@@ -338,6 +340,21 @@ def test_mcp_resolve_calls_client_only_after_explicit_inspection():
     }))
     assert calls == [("synthetic", False), ("synthetic", True)]
     assert "interrupted" in result[0].text
+
+
+def test_mcp_failed_upload_cleanup_forwards_only_explicit_inspected_names():
+    from chatgpt_api.extension_bridge import create_mcp
+
+    client = ExtensionClient(TOKEN)
+    calls = []
+    client.resolve = lambda *args: calls.append(args) or {"state": "queued"}
+    server = create_mcp(client)
+    names = ["input-001(1).png", "input-002(1).png"]
+    asyncio.run(server.call_tool("extension_resolve", {
+        "job_id": "synthetic", "inspected_chatgpt": True,
+        "clear_failed_uploads": True, "native_upload_names": names,
+    }))
+    assert calls == [("synthetic", False, True, names)]
 
 
 def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval(tmp_path):

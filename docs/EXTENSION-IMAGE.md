@@ -776,6 +776,63 @@ found). Source references:
 [DOM adapter](https://github.com/BossDever/chatgpt-chrome-mcp-project/blob/main/src/chatgpt-dom-adapter.mjs),
 [CDP client](https://github.com/BossDever/chatgpt-chrome-mcp-project/blob/main/src/cdp-client.mjs).
 
+### 0.1.19 repeated-filename collision repair
+
+A normal Shopee production request then exposed a separate real readiness
+failure: native ChatGPT displayed `input-001(1).png` and `input-002(1).png`, while
+Bridge expected its original exact names. Read-only accessibility inspection
+confirmed both renamed cards and an empty unsent composer. The readiness failure
+was therefore an exact-name mismatch, not proof that the upload was absent or a
+reason to increase timeouts blindly. The 0.1.18 cleanup acceptance did not prove
+normal reference generation.
+
+New uploads now use `input-NNN-<job-id>.png` (or the actual JPG/WebP extension),
+unique across jobs; snapshots, metadata and native upload all use that exact name.
+Strict filename verification remains. Old queued metadata stays readable.
+
+An operator may explicitly clear only a failed, latest, original-client normal
+request with the exact `Not submitted. Native uploads not verified ready;`
+error, after inspecting the unchanged empty draft:
+
+```text
+extension_resolve(job_id=..., inspected_chatgpt=true,
+  clear_failed_uploads=true,
+  native_upload_names=["input-001(1).png", "input-002(1).png"])
+```
+
+Names must be the original ordered names, optionally with a numeric duplicate
+suffix before the extension. Metadata-only delivery checks the full exact native
+set before Remove; no arbitrary subset, new upload, text, Send or generation.
+The action is single-use. The original generation job remains **failed** with its
+original error and `uploads_cleared=true`, never a false image-complete receipt.
+It cannot be automatically retried. This is an explicit inspected compatibility
+recovery, not a fuzzy matching policy for normal uploads or proof of native file
+content hashes. The original local files remain intact.
+
+Live inspected recovery on `second` (2026-10-16) cleared job
+`a6b0f6eecde040c9a90bd10e3b6be9dd` through one standard stdio MCP
+`extension_resolve` call, using the two observed `(1)` filenames above. The
+receipt preserved `state=failed` and the original error, with
+`uploads_cleared=true`, `submitted=false`, and `generated=false`. A subsequent
+extension heartbeat confirmed zero attachment cards, `tab_ready=true`,
+`tab_idle=true`, and no tab error on worker 0.1.19 / content protocol 4. No CUA
+attachment removal, re-upload, Send, generation, or chat deletion was used.
+
+An isolated export of the 0.1.19 release paths passed 486 Python tests
+(3 skipped) and 297 Node extension tests. The review covered ordered-name
+validation, same-client/latest-job gates, metadata-only cleanup delivery,
+no-Send receipts, duplicate aliases, and restart/no-replay behavior.
+
+The follow-up live preflight `7f2ee719fb9e4df09ccb0065e2d154cc` uploaded the
+same two owner-authorized references via MCP with exact names
+`input-001-7f2ee719fb9e4df09ccb0065e2d154cc.png` and
+`input-002-7f2ee719fb9e4df09ccb0065e2d154cc.png`. It completed with
+`preflight_ready=true`, `preflight_uploads_cleared=true`, `submitted=false`,
+and `generated=false`. Upload readiness and removal were performed by the
+extension, not CUA. This verifies the unique-name upload/preflight path, not
+image generation or reference likeness. The next heartbeat again confirmed
+zero attachment cards, ready/idle true, and no tab error on `second`.
+
 ## One bounded smoke test
 
 Call `extension_status` first. When `account=second`, `paired=true` and `extension_online=true`, call

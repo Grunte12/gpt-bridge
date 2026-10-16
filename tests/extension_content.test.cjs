@@ -860,6 +860,40 @@ test('one-image upload preserves the actual File bytes, name, MIME type, and eve
   assert.match(h.editor.value, /Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1/);
 });
 
+test('upload preflight accepts and clears the exact per-job snapshot filename', async () => {
+  const jobId = 'a'.repeat(32);
+  const image = imageInput(1);
+  image.name = `input-001-${jobId}.png`;
+  const h = contentHarness({nativeUploadCards: true, reactClearsInputFiles: true});
+  await startContent(h, {job_id: jobId, expected_model: 'Create image', mode: 'create', prompt: 'draw a cat',
+    images: [image], preflight_only: true, clear_preflight_uploads: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipt?.preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, [image.name]);
+  assert.deepEqual(h.uploadedFiles, []);
+  assert.deepEqual(h.fileInputs[0].files, []);
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+});
+
+test('ordinary upload rejects a duplicate-name alias accepted only by cleanup inspection', async () => {
+  const image = imageInput(1);
+  image.name = 'input-001(1).png';
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-normal-upload-rejects-alias', expected_model: 'Create image', mode: 'create',
+    prompt: 'draw a cat', images: [image], preflight_only: true});
+  await waitForContentResult(h);
+
+  assert.match(h.sent.at(-1).error, /Invalid ordered image input/);
+  assert.deepEqual(h.inputEvents, []);
+  assert.equal(h.removeClicks, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+});
+
 test('three-image edit uploads source then references in order and waits for all attachments before Send', async () => {
   const images = [
     imageInput(1, 'source', [1, 2, 3]),
@@ -1336,6 +1370,27 @@ test('cleanup-only preflight removes matching inspected native cards without upl
   assert.equal(h.insertTextCalls, 0);
   assert.equal(h.fetchCalls, 0);
   assert.equal(h.fileReaderReads, 0);
+  assert.equal(h.sent.some(message => message.type === 'image-result' && message.imageBase64), false);
+});
+
+test('cleanup-only accepts exact legacy ChatGPT duplicate-name aliases and removes both without Send', async () => {
+  const sourceImages = [imageInput(1), imageInput(2)];
+  const names = ['input-001(1).png', 'input-002(1).png'];
+  const images = sourceImages.map(({data_base64, ...metadata}, index) => ({...metadata, name: names[index]}));
+  const h = contentHarness({nativeUploadCards: true, nativeAttachmentNames: names, chatPath: '/'});
+  await startContent(h, {job_id: 'job-native-cleanup-legacy-aliases', expected_model: 'Create image', mode: 'create',
+    prompt: 'validate already attached references', images, preflight_only: true, clear_preflight_uploads: true,
+    preflight_cleanup_only: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipt?.preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, names);
+  assert.deepEqual(h.uploadedFiles, []);
+  assert.deepEqual(h.inputEvents, [], 'legacy aliases are inspected and removed, never re-uploaded');
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
   assert.equal(h.sent.some(message => message.type === 'image-result' && message.imageBase64), false);
 });
 

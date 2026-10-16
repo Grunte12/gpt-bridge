@@ -208,7 +208,7 @@
     for (const [index, image] of images.entries()) {
       if (image.order !== index + 1 || !["source", "reference"].includes(image.role) ||
           typeof image.description !== "string" || !image.description.trim() || image.description.length > 200 ||
-          !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) ||
+          !/^input-\d{3,}(?:-[a-f0-9]{32})?\.(png|jpg|webp)$/.test(image.name) ||
           !["image/png", "image/jpeg", "image/webp"].includes(image.mime) ||
           !Number.isInteger(image.bytes) || image.bytes < 1 || image.bytes > 8 * 1024 * 1024 ||
           typeof image.data_base64 !== "string" || image.data_base64.length !== 4 * Math.ceil(image.bytes / 3))
@@ -237,7 +237,7 @@
         new URL(location.href).searchParams.get("temporary-chat") === "true" ||
         hasTurns() || busy() || !visible(editor) || !scope || promptText(editor) !== "" ||
         images.some((image, index) => image.order !== index + 1 || image.data_base64 !== undefined ||
-          !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) || !/^[a-f0-9]{64}$/.test(image.sha256)) ||
+          !/^input-\d{3,}(?:-[a-f0-9]{32})?(?:\([1-9]\d{0,5}\))?\.(png|jpg|webp)$/.test(image.name) || !/^[a-f0-9]{64}$/.test(image.sha256)) ||
         new Set(images.map(image => image.name)).size !== images.length)
       throw new Error("Inspected preflight draft changed; nothing was uploaded or removed");
     const count = attachmentCards(scope).filter(visible).length;
