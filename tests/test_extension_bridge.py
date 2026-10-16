@@ -17,6 +17,16 @@ ACCOUNT = "second"
 CLIENT_ID = "123e4567-e89b-12d3-a456-426614174000"
 TOKEN = "synthetic-local-token-with-enough-length"
 EXTENSION_ORIGIN = "chrome-extension://" + "a" * 32
+UPLOAD_DOM = {
+    "editor_form": True,
+    "file_inputs": 3,
+    "form_file_inputs": 2,
+    "image_inputs": 2,
+    "form_image_inputs": 1,
+    "multiple_image_inputs": 1,
+    "unrestricted_inputs": 0,
+    "attachment_cards": 1,
+}
 
 
 def _paired_queue(tmp_path, *, account=ACCOUNT, client_id=CLIENT_ID):
@@ -30,6 +40,26 @@ def _png_base64(size=(512, 512)):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii"), buffer.getvalue()
+
+
+def _local_reference(tmp_path):
+    path = tmp_path / "preflight-reference.png"
+    Image.new("RGB", (512, 512), (40, 90, 180)).save(path, format="PNG")
+    return [{"path": str(path), "role": "reference", "description": "color reference"}]
+
+
+def _failed_upload_preflight(tmp_path, *, protocol=4, clear=True, error="Not submitted. Native uploads not verified ready; Native image file input missing.", images=True):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=protocol)
+    inputs = _local_reference(tmp_path) if images else []
+    submitted = queue.submit("Verify the uploaded reference.", "Create image", images=inputs,
+                             preflight_only=True, clear_preflight_uploads=clear)
+    job_id = submitted["job_id"]
+    original_claim = queue.claim(CLIENT_ID)
+    if inputs:
+        assert "data_base64" in original_claim["images"][0]
+    queue.result(CLIENT_ID, job_id, error=error)
+    return queue, job_id, original_claim
 
 
 def _call_post(handler_type, path, payload, *, token=TOKEN, origin=EXTENSION_ORIGIN,
@@ -76,6 +106,16 @@ def test_pair_status_reports_owner_confirmed_visible_model(tmp_path):
     assert queue.status()["tab_ready"] is True
 
 
+def test_protocol_four_reports_failed_preflight_cleanup_capability_on_pair_and_heartbeat(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    assert queue.status()["input_capabilities"]["failed_preflight_cleanup"] is True
+
+    heartbeat = queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4)
+    assert heartbeat["input_capabilities"]["failed_preflight_cleanup"] is True
+
+
 def test_heartbeat_reconnects_original_client_and_requires_ready_native_mode(tmp_path):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
     queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image")
@@ -106,6 +146,178 @@ def test_heartbeat_rejects_wrong_identity_account_mode_and_ready_type(tmp_path):
             queue.heartbeat(client_id, account, model, tab_ready=ready)
 
 
+def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image")
+
+    assert queue.status()["extension_diagnostics"] == {
+        "worker_version": None,
+        "content_receiver": "unreported",
+        "content_protocol": 0,
+        "receiver_error": "",
+        "upload_dom": None,
+    }
+    legacy = queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True)
+
+    assert legacy["extension_diagnostics"] == {
+        "worker_version": None,
+        "content_receiver": "unreported",
+        "content_protocol": 0,
+        "receiver_error": "",
+        "upload_dom": None,
+    }
+    # Pairing and diagnostic heartbeats are transient, not queue records on disk.
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+def test_heartbeat_diagnostics_round_trip_with_current_protocol(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=2)
+
+    ready = queue.heartbeat(
+        CLIENT_ID,
+        ACCOUNT,
+        "Create image",
+        tab_ready=True,
+        input_protocol=2,
+        worker_version="1.2.3",
+        content_receiver="available",
+        receiver_error="",
+        upload_dom=UPLOAD_DOM,
+    )
+
+    assert ready["extension_diagnostics"] == {
+        "worker_version": "1.2.3",
+        "content_receiver": "available",
+        "content_protocol": 2,
+        "receiver_error": "",
+        "upload_dom": UPLOAD_DOM,
+    }
+    assert queue.client["worker_version"] == "1.2.3"
+    assert queue.client["content_receiver"] == "available"
+    assert queue.client["receiver_error"] == ""
+    assert queue.client["upload_dom"] == UPLOAD_DOM
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+def test_no_receiver_heartbeat_keeps_upload_dom_unknown(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=3)
+
+    status = queue.heartbeat(
+        CLIENT_ID,
+        ACCOUNT,
+        "Create image",
+        tab_ready=False,
+        input_protocol=0,
+        worker_version="1.2.3",
+        content_receiver="unavailable",
+        receiver_error="no_receiver",
+        upload_dom=None,
+    )
+
+    assert status["extension_diagnostics"]["upload_dom"] is None
+    assert queue.client["upload_dom"] is None
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+@pytest.mark.parametrize(
+    "upload_dom",
+    [
+        {},
+        {**UPLOAD_DOM, "extra": "private-text-must-not-pass"},
+        {**UPLOAD_DOM, "editor_form": 1},
+        {**UPLOAD_DOM, "file_inputs": True},
+        {**UPLOAD_DOM, "image_inputs": 1.0},
+        {**UPLOAD_DOM, "form_image_inputs": -1},
+        {**UPLOAD_DOM, "attachment_cards": 10001},
+        [UPLOAD_DOM],
+    ],
+)
+def test_heartbeat_rejects_malformed_upload_dom_without_mutating_client(tmp_path, upload_dom):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=3)
+    queue.heartbeat(
+        CLIENT_ID,
+        ACCOUNT,
+        "Create image",
+        tab_ready=True,
+        input_protocol=3,
+        worker_version="1.2.3",
+        content_receiver="available",
+        upload_dom=UPLOAD_DOM,
+    )
+    client_before = queue.client.copy()
+    status_before = queue.status()
+
+    with pytest.raises(ValueError, match="upload DOM diagnostic"):
+        queue.heartbeat(
+            CLIENT_ID,
+            ACCOUNT,
+            "Create image",
+            tab_ready=True,
+            input_protocol=3,
+            worker_version="1.2.3",
+            content_receiver="available",
+            upload_dom=upload_dom,
+        )
+
+    assert queue.client == client_before
+    assert queue.status() == status_before
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worker_version", None),
+        ("worker_version", 123),
+        ("worker_version", "1"),
+        ("worker_version", "v1.2.3"),
+        ("worker_version", "1.2.3.4.5"),
+        ("worker_version", "x" * 33),
+        ("worker_version", "Bearer synthetic-local-token"),
+        ("worker_version", "sk-test-not-a-real-key"),
+        ("content_receiver", None),
+        ("content_receiver", 1),
+        ("content_receiver", "available "),
+        ("content_receiver", "private-token"),
+        ("receiver_error", None),
+        ("receiver_error", 1),
+        ("receiver_error", "unknown_error"),
+        ("receiver_error", "private-token"),
+    ],
+)
+def test_heartbeat_rejects_invalid_diagnostics_without_mutating_client(tmp_path, field, value):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=2)
+    queue.heartbeat(
+        CLIENT_ID,
+        ACCOUNT,
+        "Create image",
+        tab_ready=True,
+        input_protocol=2,
+        worker_version="1.2.3",
+        content_receiver="available",
+    )
+    client_before = queue.client.copy()
+    status_before = queue.status()
+
+    with pytest.raises(ValueError):
+        queue.heartbeat(
+            CLIENT_ID,
+            ACCOUNT,
+            "Create image",
+            tab_ready=False,
+            input_protocol=0,
+            **{field: value},
+        )
+
+    assert queue.client == client_before
+    assert queue.status() == status_before
+    assert list(queue.root.glob("*/state.json")) == []
+
+
 def test_extension_runtime_rejects_main_account_before_creating_data_dir(tmp_path, monkeypatch):
     data_dir = tmp_path / "must-not-exist"
     monkeypatch.setattr(
@@ -129,6 +341,7 @@ def test_claim_is_at_most_once_and_public_status_hides_private_fields(tmp_path):
         "job_id": job_id,
         "prompt": "Draw a green pear.",
         "expected_model": "Create image",
+        "mode": "create",
     }
     assert queue.claim(CLIENT_ID) == {}
     assert "prompt" not in job
@@ -559,6 +772,248 @@ def test_resolve_marks_queued_work_interrupted_without_claiming_it(tmp_path):
     assert resolved["state"] == "interrupted"
     assert "no automatic resubmission" in resolved["error"]
     assert queue.claim(CLIENT_ID) == {}
+
+
+def test_failed_preflight_cleanup_reuses_job_and_claims_metadata_without_image_bytes(tmp_path, monkeypatch):
+    queue, job_id, original_claim = _failed_upload_preflight(tmp_path)
+    original_error = queue.status(job_id)["error"]
+    original_metadata = [{key: value for key, value in image.items() if key != "data_base64"}
+                         for image in original_claim["images"]]
+
+    queued = queue.resolve(job_id, clear_preflight_uploads=True)
+
+    assert queued["job_id"] == job_id
+    assert queued["state"] == "queued"
+    assert queued["preflight_cleanup_only"] is True
+    assert queued["original_preflight_error"] == original_error
+    assert "error" not in queued
+    assert "data_base64" not in json.dumps(queued)
+
+    monkeypatch.setattr("chatgpt_api.extension_bridge.read_local_image",
+                        lambda *_args: pytest.fail("failed-preflight cleanup must not read or re-upload image bytes"))
+    cleanup_claim = queue.claim(CLIENT_ID)
+    assert cleanup_claim["job_id"] == job_id
+    assert cleanup_claim["preflight_only"] is True
+    assert cleanup_claim["clear_preflight_uploads"] is True
+    assert cleanup_claim["preflight_cleanup_only"] is True
+    assert cleanup_claim["images"] == original_metadata
+    assert all("data_base64" not in image for image in cleanup_claim["images"])
+    assert queue.claim(CLIENT_ID) == {}
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+    complete = queue.result(CLIENT_ID, job_id, preflight_ready=True, preflight_uploads_cleared=True)
+    assert complete["state"] == "complete"
+    assert complete["preflight_ready"] is True
+    assert complete["preflight_uploads_cleared"] is True
+    assert complete["original_preflight_error"] == original_error
+    assert complete["cleanup_status"] == "not_requested"
+    assert complete["submitted"] is False and complete["generated"] is False
+    assert "data_base64" not in json.dumps(complete)
+    assert queue.claim(CLIENT_ID) == {}
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+
+def test_inspected_async_cleanup_failure_can_resume_once_without_reupload(tmp_path, monkeypatch):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    original_error = queue.status(job_id)["error"]
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+    transition_error = "Not submitted. Unexpected attachment controls in this job's composer; inspect the unsent draft"
+    queue.result(CLIENT_ID, job_id, error=transition_error)
+    monkeypatch.setattr("chatgpt_api.extension_bridge.read_local_image",
+                        lambda *_args: pytest.fail("cleanup resume must not read image bytes"))
+
+    resumed = queue.resolve(job_id, clear_preflight_uploads=True)
+    assert resumed["preflight_cleanup_resumed"] is True
+    assert resumed["original_preflight_error"] == original_error
+    assert resumed["previous_preflight_cleanup_error"] == transition_error
+    claimed = queue.claim(CLIENT_ID)
+    assert claimed["job_id"] == job_id
+    assert claimed["preflight_cleanup_resumed"] is True
+    assert all("data_base64" not in image for image in claimed["images"])
+    queue.result(CLIENT_ID, job_id, error=transition_error)
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+
+def test_cleanup_resume_requires_the_original_paired_client(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error=(
+        "Not submitted. Unexpected attachment controls in this job's composer; inspect the unsent draft"
+    ))
+
+    replacement_id = "223e4567-e89b-12d3-a456-426614174000"
+    queue.pair(replacement_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+
+    with pytest.raises(ValueError, match="original paired extension with protocol 4"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id).get("preflight_cleanup_resumed") is not True
+
+
+def test_cleanup_resume_refuses_after_a_newer_job_finishes(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error=(
+        "Not submitted. Unexpected attachment controls in this job's composer; inspect the unsent draft"
+    ))
+
+    newer = queue.submit("Later independent job.", "Create image")
+    assert queue.claim(CLIENT_ID)["job_id"] == newer["job_id"]
+    queue.result(CLIENT_ID, newer["job_id"], error="Explicit later work failed.")
+
+    with pytest.raises(ValueError, match="only the latest inspected preflight"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id).get("preflight_cleanup_resumed") is not True
+
+
+def test_cleanup_resume_limit_survives_restart(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+    transition_error = (
+        "Not submitted. Unexpected attachment controls in this job's composer; inspect the unsent draft"
+    )
+    queue.result(CLIENT_ID, job_id, error=transition_error)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["preflight_cleanup_resumed"] is True
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error=transition_error)
+
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+    restarted.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+
+    assert restarted.claim(CLIENT_ID) == {}
+    assert restarted.status(job_id)["preflight_cleanup_resumed"] is True
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        restarted.resolve(job_id, clear_preflight_uploads=True)
+    assert restarted.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("error", ["Not submitted. Changed draft", "Not submitted. Owned uploads were not fully removed"])
+def test_cleanup_resume_rejects_other_failures(tmp_path, error):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error=error)
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+
+@pytest.mark.parametrize(
+    ("preflight_ready", "preflight_uploads_cleared", "message"),
+    [
+        (False, True, "preflight accepts only a no-Send readiness receipt"),
+        (True, False, "verified preflight upload clearing receipt is required"),
+    ],
+)
+def test_failed_preflight_cleanup_requires_ready_and_cleared_receipts(
+    tmp_path, preflight_ready, preflight_uploads_cleared, message
+):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    queue.claim(CLIENT_ID)
+
+    with pytest.raises(ValueError, match=message):
+        queue.result(CLIENT_ID, job_id, preflight_ready=preflight_ready,
+                     preflight_uploads_cleared=preflight_uploads_cleared)
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "true"])
+def test_failed_preflight_cleanup_rejects_non_boolean_flag(tmp_path, value):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+
+    with pytest.raises(ValueError, match="clear_preflight_uploads must be a boolean"):
+        queue.resolve(job_id, clear_preflight_uploads=value)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("case", ["generation", "plain_preflight", "no_images"])
+def test_failed_preflight_cleanup_requires_original_preflight_and_upload_metadata(tmp_path, case):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    inputs = _local_reference(tmp_path) if case != "no_images" else []
+    if case == "generation":
+        submitted = queue.submit("Generate, not preflight.", "Create image", images=inputs)
+    else:
+        submitted = queue.submit("Verify uploads.", "Create image", images=inputs, preflight_only=True,
+                                 clear_preflight_uploads=case != "plain_preflight")
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error="Not submitted. Native uploads not verified ready; Native image file input missing.")
+
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_failed_preflight_cleanup_requires_exact_error_and_protocol_four_original_client(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(
+        tmp_path, protocol=3, error="Not submitted. Other upload failure; inspect the chat."
+    )
+    with pytest.raises(ValueError, match="only an inspected upload-readiness failure"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+
+    queue, job_id, _ = _failed_upload_preflight(tmp_path / "unsupported-protocol", protocol=3)
+    with pytest.raises(ValueError, match="original paired extension with protocol 4"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+    queue, job_id, _ = _failed_upload_preflight(tmp_path / "wrong-client")
+    replacement_id = "223e4567-e89b-12d3-a456-426614174000"
+    queue.pair(replacement_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+    with pytest.raises(ValueError, match="original paired extension with protocol 4"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+
+
+@pytest.mark.parametrize("blocker", ["queued", "claimed", "pending_cleanup", "confirmation_required"])
+def test_failed_preflight_cleanup_waits_for_other_work_and_pending_cleanup(tmp_path, blocker):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    other = queue.submit("A separate image job.", "Create image")
+    if blocker in {"claimed", "pending_cleanup", "confirmation_required"}:
+        queue.claim(CLIENT_ID)
+    if blocker in {"pending_cleanup", "confirmation_required"}:
+        image_base64, _ = _png_base64()
+        queue.result(CLIENT_ID, other["job_id"], image_base64=image_base64, cleanup_pending=True,
+                     chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    if blocker == "confirmation_required":
+        queue.cleanup(CLIENT_ID, other["job_id"], "confirmation_required")
+
+    with pytest.raises(ValueError, match="finish existing work before preflight cleanup"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_failed_preflight_cleanup_refuses_after_a_newer_terminal_job(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    other = queue.submit("Separate later work.", "Create image")
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, other["job_id"], error="finished separate work")
+    with pytest.raises(ValueError, match="only the latest inspected preflight"):
+        queue.resolve(job_id, clear_preflight_uploads=True)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_failed_preflight_cleanup_recovery_after_restart_is_not_replayed(tmp_path):
+    queue, job_id, _ = _failed_upload_preflight(tmp_path)
+    original_error = queue.status(job_id)["error"]
+    queue.resolve(job_id, clear_preflight_uploads=True)
+    persisted = (queue.root / job_id / "state.json").read_text()
+    assert "data_base64" not in persisted
+
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+    assert restarted.status(job_id)["state"] == "interrupted"
+    assert restarted.status(job_id)["preflight_cleanup_only"] is True
+    assert restarted.status(job_id)["original_preflight_error"] == original_error
+    restarted.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    assert restarted.claim(CLIENT_ID) == {}
 
 
 def test_local_http_handler_rejects_bad_auth_host_and_origin(tmp_path):

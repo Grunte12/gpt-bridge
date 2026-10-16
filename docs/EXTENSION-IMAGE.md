@@ -261,11 +261,396 @@ follow-up results, separate from Luna's file/hash-verified acceptance above.
 An isolated export of the exact staged release also passed all 121 Node tests,
 61 Python tests and both exported skill validators, without unstaged changes.
 
-Requested follow-up (not supported by 0.1.10): accept two actual local reference
-images through MCP for the approved affiliate still pilot. Keep that change
-separate from this cleanup release; it needs local-file/image validation and
-native attachment handling before any production media is generated. Filenames
-inside prompt text are not reference attachments.
+### Create/edit local image inputs (extension 0.1.11 candidate; offline only)
+
+This candidate adds two explicit modes to the existing `extension_image` tool;
+the other three MCP tools and cleanup policy remain unchanged. **Not deployed or
+live-upload verified yet.** Do not treat the 0.1.10 live receipts above as evidence
+that reference uploads or edits work. No new image/credit was used for this change.
+
+```json
+{
+  "prompt": "Create a candid cafe photo using the supplied visual references.",
+  "expected_model": "Create image",
+  "mode": "create",
+  "images": [
+    {"path": "/absolute/goofy-full-body.png", "role": "reference", "description": "Goofy identity and harness"},
+    {"path": "/absolute/cafe.png", "role": "reference", "description": "Shared cafe staging"}
+  ]
+}
+```
+
+- **CREATE:** `mode="create"` (default), prompt only or an ordered, variable-length
+  list of reference images. Omit `images` for prompt-only generation.
+- **EDIT:** `mode="edit"`, editing instructions in `prompt`, at least one image
+  with `role="source"`, plus optional `role="reference"` guidance images. Sources
+  may appear at any declared position; Bridge never silently reorders the list.
+- Each item requires an absolute local `path` and a one-line `description`
+  (1–200 characters). `role` defaults to `reference`; no extra fields are accepted.
+  URLs, inline data/base64, directories, special files and symlink path components
+  are rejected. Static PNG/JPEG/WebP content is decoded and checked, not trusted
+  from its filename. Animated/multi-frame images are unsupported.
+- **Bridge transport limits, not provider limits:** 8 MiB combined input bytes,
+  8192px maximum edge, 40 million pixels per image, and 48 KiB combined metadata.
+  There is no fixed two-image/tool count cap. The actual ChatGPT upload-count
+  maximum is **not live verified**. A runtime input without `multiple` accepts
+  only one image; unsupported native MIME/count/readiness fails before Send.
+
+The worker snapshots validated inputs in the job's private directory (`0700`,
+files `0600`). Original local paths and image bytes are absent from state/status;
+state contains only ordered role/name/format/size/dimensions/hash metadata. The
+original paired extension receives bytes once at claim time and checks hashes.
+Extension storage and popup status never retain those input bytes. Snapshots
+remain local alongside job records; chat deletion does not delete local files.
+Claim/restart behavior remains at-most-once, with no automatic upload replay.
+
+The content script constructs actual ordered `File` objects, uses the existing
+native image file input, and dispatches input/change. Generated upload names are
+numbered and the prompt explicitly maps each actual attachment to its source or
+reference purpose. Filenames in prose are never used instead of uploads. Before
+Send it requires all named preview cards, loaded thumbnails, native Remove
+controls, exact attachment order and no upload progress/error, while rechecking
+the prompt, account-bound tab, native image pill and idle chat. Unknown markup,
+missing/reordered images or ambiguous inputs fail closed and preserve the unsent
+draft; no clearing or retry is attempted.
+
+**Live compatibility gate:** existing repository snapshots do not establish the
+native file input or attachment-ready selectors. Mocked DOM tests prove byte/
+order/readiness gating, not that ChatGPT currently exposes those exact markers.
+The real native maximum and successful source/reference fidelity remain open.
+Report any UI mismatch rather than substituting CUA, plain chat or a filename.
+
+Deployment requires, at an idle point: restart the single owner worker from this
+checkout (preserving its authorized auto-delete flag), reconnect MCP clients to
+refresh the optional input schema, reload the same unpacked extension, and
+refresh its already-paired `second` tab once. Do not create another owner, rotate
+pairing, switch accounts or interrupt busy work. Require
+`extension_status().input_capabilities.ordered_local_images=true` before sending
+image inputs. A versioned heartbeat checks the content script as well as the
+extension; stale receivers reject input jobs instead of silently dropping images.
+The existing running 0.1.10 owner/content scripts were deliberately
+left alone during this offline implementation.
+
+This still uses native `Create image` on `second`. It does not expose or promise
+GPT-6 Pro, GPT-6 Thinking extended/High, a highest-quality selector, identical
+results to `main`, original-download resolution, batches, or saved @Characters.
+
+#### No-Send upload preflight (same candidate; not live verified)
+
+Use the same `extension_image` schema with `preflight_only=true` to prepare the
+native image composer, attach actual ordered files and verify readiness, **without
+inserting the prompt, looking up/clicking Send, generating, fetching an output or
+deleting a chat**. Both CREATE and EDIT role validation still apply. This is a
+new explicitly authorized diagnostic job, not a retry or generation request.
+Require status `input_capabilities.preflight_only=true` (content protocol 2),
+`tab_idle=true`, second/paired/online, and no running work or pending cleanup.
+Older protocol 0/1 content cannot receive preflight jobs. An incomplete update
+fails before delivery rather than allowing an old script to ignore the flag.
+
+Successful preflight receipts have `state=complete`, `preflight_ready=true`,
+`submitted=false`, `generated=false`, `cleanup_status=not_requested`, input
+metadata and **no output image path**. Do not label them generated images or
+production acceptance. The owned upload-only draft remains in the existing tab;
+it is not silently cleared or sent later. Inspect it before further work; normal
+jobs still refuse any preexisting attachments. On failure preserve the unsent
+draft and diagnose the actual native mismatch, not an automatic retry.
+
+Heartbeats now expose `tab_idle` and a short `tab_error` in MCP status, without
+the user's draft text. Idle means no running work, unrelated text or attachments;
+a completed conversation or missing image pill can be idle but not yet fresh.
+Legacy clients that cannot report this diagnostic return `tab_idle=null`, never
+an invented idle proof. No live preparation happens in ordinary status polling.
+
+#### Receiver diagnostics (candidate 0.1.11)
+
+`extension_status().extension_diagnostics` separates the running worker's
+`worker_version` (read from `chrome.runtime.getManifest()`), `content_receiver`,
+`content_protocol`, and `receiver_error`. An online extension alone proves only
+the local heartbeat, not that its paired tab answered.
+
+- `worker_version=null` / `content_receiver=unreported`: the running worker has
+  not reported the new diagnostics; do not infer its version from files on disk.
+- `available` with protocol 0/1: a receiver answered, but not with preflight
+  protocol 2. `available` with protocol 2 and a `tab_error` means the new content
+  script answered but the composer did not pass inspection.
+- `tab_missing`, `wrong_origin`, `unavailable`, or `invalid_reply`: no usable
+  inspection reply. Native exception text is never forwarded; `receiver_error`
+  is restricted to `tab_missing`, `wrong_origin`, `no_receiver`, `port_closed`,
+  `message_failed`, or `invalid_reply` (empty on success).
+
+Diagnostics do not read login state, cookies, tokens, draft text or URLs; do not
+change pairing or cleanup; and do not submit/prepare/upload anything. A configured
+extension path proves configuration, not the loaded worker/content version.
+To deploy these diagnostics: first restart the single **idle** owner from this
+checkout with its existing account and cleanup flags, then use the already
+installed extension popup's **ตัวเลือก → โหลดส่วนขยายรุ่นล่าสุด** once and
+refresh the same paired `second` tab. Existing MCP `extension_status` needs no
+new tool/schema. There is no MCP self-reload command in the pre-diagnostic worker;
+do not fake a job or use browser control as a fallback. Until this deployment is
+confirmed by the heartbeat, report diagnostics as unreported, not live acceptance.
+
+Diagnostics verification (2026-10-16): 118 Python and 170 extension tests passed.
+The first full run exposed a second worker test harness missing the new native
+`getManifest()` fixture; that fixture and the finishing-heartbeat diagnostics
+were corrected before the passing run. Tests cover legacy defaults, transient
+diagnostics, strict version/enums, native-error sanitization, missing/wrong tabs,
+old/new content replies and no job claim when inspection has no usable receiver.
+The idle owner was restarted with the same `second` account and automatic saved
+chat cleanup. Live MCP exposes the diagnostics fields; running extension/content
+acceptance remains pending deployment of the new worker code. No image job,
+preflight upload, Send, generation, account change or browser control was used.
+
+#### Missing receiver repair (candidate 0.1.12)
+
+The live diagnostic subsequently confirmed `worker_version=0.1.11`, paired and
+online, but `content_receiver=unavailable`, `receiver_error=no_receiver`, and
+protocol 0. This is an absent receiver in the existing paired tab, not an image
+upload failure or an account/session authentication diagnosis. No preflight was
+submitted through that failed gate.
+
+0.1.12 adds native `scripting` permission and explicit host access only for
+`https://chatgpt.com/*` (the same origin as the declared content script). When
+the exact paired ChatGPT tab returns native `no_receiver`, and no local job is
+active, the worker injects only the bundled `content.js`, then inspects once.
+It does not reload/navigate the page, open tabs, read credentials, mutate drafts,
+insert text, upload or click Send. A missing/redacted/wrong-origin tab, active
+job, closed port, other message error or denied injection never triggers a
+generation or unsafe fallback. Failed recovery is not repeated for that tab in
+the same worker lifetime. Duplicate injection is guarded with native listener
+registration checks, so an invalidated old marker cannot suppress a new listener.
+
+#### Explicitly return an empty composer after preflight (0.1.12, protocol 3)
+
+`extension_image` keeps the same dynamic create/edit input list and adds optional
+`clear_preflight_uploads: bool = false`. It is valid as `true` only with
+`preflight_only=true` and explicit owner approval. Protocol 3 adds
+`input_capabilities.preflight_clear_uploads`; protocols 0/1/2 cannot receive a
+clearing request, including a downgrade after enqueue. Default protocol-2
+preflight still preserves its unsent uploads exactly as before.
+
+The opted-in preflight first verifies all real ordered uploads, then clicks only
+their verified native Remove controls. Before and between removals it rechecks
+the job, editor, path, empty text, remaining exact attachment names/order, native
+readiness and absence of foreign attachments. It never resets another input,
+deletes source files/chats, navigates or clicks Send. Unknown/mutated UI stops
+with remaining draft preserved; no silent retry or cleanup on failed readiness.
+Success requires a strict `preflight_uploads_cleared=true` receipt in addition to
+`preflight_ready=true`, `submitted=false`, `generated=false`, no output image and
+no chat cleanup. Only that receipt means the composer is empty for a subsequent
+explicit production request. Never infer this from `state=complete` alone.
+
+Deployment: restart only the idle owner with its existing `second` account and
+cleanup policy to activate protocol 3 and the optional schema field; other
+clients use `--connect`. Then reload this same unpacked extension once to load
+0.1.12 and its declared scripting/ChatGPT-site permissions. No pairing/setup,
+account switch, or manual paired-tab refresh is required for receiver recovery.
+Before the one authorized clearing preflight, require live version 0.1.12,
+receiver `available`, protocol 3, `preflight_clear_uploads=true`, `tab_idle=true`
+and no running work/pending cleanup. This documented repair is not evidence that
+native upload selectors or the preflight have passed live.
+
+0.1.12 offline verification (2026-10-16): 129 Python bridge/client/input tests,
+193 content/worker tests and 14 popup tests passed (336 total); scoped diff checks
+passed. Tests include native reinjection scope/permissions, stale listener guards,
+0/1/3/>3 reference counts, protocol-3 downgrade safety, explicit clear receipts,
+and strict preservation of all composer text (even an exact matching old prompt)
+and foreign attachments before/between removals. The idle owner was restarted
+with its original `second` account/pairing key and automatic saved-chat cleanup.
+The remaining live deployment gate is activating extension 0.1.12 in Chrome,
+then observing protocol 3 and executing one owner-authorized upload-only test.
+No upload, Send, generation, quota, browser/CUA or commit/push was used for these
+offline tests or server activation. The configured dedicated CDP endpoint
+127.0.0.1:9222 was checked and was not listening; no Chrome was started/restarted.
+
+Live activation follow-up (2026-10-16): after the owner activated the same
+unpacked extension, MCP reported worker 0.1.12, receiver `available`, protocol 3,
+all three input capabilities enabled, and `tab_idle=true`. Receiver recovery
+therefore passed on the existing paired tab without browser/CUA control. Its
+plain-chat/missing Create image state is not an upload failure: the guarded
+`image-prepare` path selects native Create image before delivering a job. A fresh
+stdio `--connect` client also listed exactly four MCP tools with the optional
+`mode`, dynamic `images`, `preflight_only` and `clear_preflight_uploads` schema.
+Use the literal virtualenv executable path: resolving its symlink to the system
+Python caused a test-harness-only missing-Pillow import failure. These checks
+alone are not live upload or generation acceptance.
+
+The single live preflight subsequently created job
+`8dee0add9b1e4541a5fb16cbc82135b0`. Native Create image preparation succeeded,
+but upload selection failed closed: `Native image file input missing, ambiguous
+or incompatible; nothing uploaded`. No text was inserted and no Send or
+generation occurred. Do not repeat the same job or claim upload acceptance.
+After an interrupted owner process was restored with the same account, pairing
+and cleanup policy, extension 0.1.12 reconnected automatically and reported a
+ready, idle tab without setup or browser control.
+
+Candidate 0.1.13 adds read-only `extension_diagnostics.upload_dom` to distinguish
+this selector failure. It reports only `editor_form` and bounded counts of file
+inputs, form-local inputs, image-compatible/multiple/unrestricted inputs and
+attachment cards. No HTML, text, filenames, input values, URLs, account details
+or credentials are returned. Unknown/old receivers report null; malformed
+diagnostics are rejected or normalized to null, not treated as readiness. This
+does not change upload selection or submit another preflight. Live DOM counts
+are required before choosing a selector fix.
+
+0.1.13 verification: 138 Python bridge/client/input tests and 218 extension
+content/worker/popup tests passed (356 total); scoped diff checks passed. The
+running owner and Chrome extension have not been updated to this candidate.
+An attempt to stop the idle owner for deployment was denied by the execution
+safety reviewer because of the keep-running constraint; it was not retried or
+bypassed. Owner approval for that narrow restart is required before activation.
+The owner then explicitly approved that restart. After confirming all 41 saved
+jobs terminal, no pending cleanup, an idle tab and the exact old owner command,
+the same owner was replaced with unchanged account, pairing and cleanup policy.
+The 0.1.13 server is active; Chrome activation and read-only live upload-DOM
+diagnostics remain pending. No new image/preflight job was submitted.
+
+Live 0.1.13 diagnostics then confirmed an available protocol-3 receiver, a ready
+idle composer, four enabled file inputs in its form, three image-compatible
+inputs, two multi-image inputs, one unrestricted input and no attachment cards.
+This disproves the assumption that the form contains only one upload control;
+the diagnostic alone does not identify every input's exact accept list.
+
+Candidate 0.1.14 keeps the existing compatibility checks but, when multiple
+controls match, accepts only a unique image-only picker instead of a generic
+document picker. Multiple image-only controls still fail closed; no first-match
+selection, unrestricted-input fallback or out-of-form upload was added. A
+failure includes only compatible/image-only candidate counts. This selector
+change still requires a new explicitly scoped preflight, not a generation retry.
+
+The popup now displays the actually loaded manifest version even when MCP is
+offline, separates connection state from the latest job result, shows the last
+checked time and exposes technical job errors under a collapsed disclosure.
+"โหลดโค้ดในเครื่องใหม่" replaces the misleading latest-version reload label:
+the control reloads installed local files and does not download updates. Busy
+preflight copy no longer claims that an image is being generated. Existing
+pairing, account confirmation and active-job reload/deletion guards remain.
+0.1.14 offline verification: 138 Python and 232 extension tests passed (370
+total), including image-picker ambiguity, version visibility without MCP,
+truthful failed/preflight copy and invalid timestamp handling. No live upload,
+Send or image generation was performed for this candidate.
+Popup visual QA used the actual popup files with mocked extension responses in
+an isolated dedicated browser, never the paired ChatGPT tab. All 26 checks
+passed: dark/light themes, visible runtime version, connected-plus-failed state,
+offline state, local reload wording, accessible controls, no horizontal overflow
+at 320px or 200% text, no console errors and no real network/actions. Screenshots
+and the compact receipt are under `.opencode/visual-qa/gpt-bridge-popup/`.
+These fixture images are UI evidence only, not live upload acceptance.
+
+The owner's actual Chrome action-popup capture invalidated the 0.1.14 sizing
+acceptance: the popup opened as a narrow column despite the fixed-size fixture
+looking correct. `body { max-width:100vw }` allowed its width to depend on the
+initial popup viewport rather than establish Chrome's intrinsic document size.
+Candidate 0.1.15 gives the `html` root explicit width/min-width 380px and uses a
+100%-width body with bounded 600px vertical scrolling. Header groups can wrap,
+but the title/account do not break word by word. The earlier 320px mobile-page
+expectation was removed: this is a Chrome action popup, not a responsive page.
+All 233 extension tests pass, including a root-sizing regression assertion.
+Preflight remains paused; no new upload job, Send or generation was performed.
+The sizing regression was reproduced in the same isolated fixture: the prior
+rules produced a 120px document at an initial 120px viewport, while 0.1.15 kept
+the root/body at 380px. All 32 regression checks passed, including vertical
+scrolling/control reachability and intact header groups at 200% text.
+For the named native-popup gap, Chrome control was used only to open the
+already-installed popup, inspect its actual layout and click its guarded local
+reload control. The actual popup displayed version 0.1.15 and no longer formed
+the narrow word-by-word column. No Chrome restart, ChatGPT submission or upload
+was performed through browser control; subsequent upload testing stays in MCP.
+
+The subsequent Luna MCP preflight was blocked by the approval reviewer before
+process/job creation: general preflight authorization did not explicitly cover
+the two private project images and their second-account ChatGPT destination.
+No upload, job, Send or generation occurred, and no alternate route was tried.
+Live upload acceptance remains pending specific owner authorization.
+
+After explicit authorization for both named files and the second-account
+destination, Luna ran exactly one MCP preflight, job
+`b0fe914022014428b20978beaf5d555a`. Its gate passed (0.1.15, protocol 3,
+paired/online/idle/ready, zero detected attachment cards). The job failed with
+`Not submitted. Native uploads not verified ready; inspect the unsent draft.`
+No readiness/clear receipt, Send, generation or output image occurred. No retry
+or unverified cleanup was attempted.
+
+A narrow read-only native UI inspection then showed both `input-001.png` and
+`input-002.png`, each with its image and matching native Remove control, in the
+empty Create image composer. Thus upload delivery did occur; the old
+test-id-only attachment selector missed the current native cards. Its reported
+zero cards and ready/idle status were not proof of an empty composer. Both
+unsent attachments remain preserved. This is not successful live acceptance.
+
+The pending 0.1.16 source repair discovers native cards by a thumbnail filename plus
+the same filename on its Remove control, inside a single card, and shares that
+discovery between readiness and diagnostics. Native Remove/progress controls
+also block a supposedly empty composer when test ids are absent; unexpected
+attachment controls fail closed. It does not adopt an old failed job's draft,
+re-upload images, clear unknown attachments or claim an upload/clear receipt.
+Luna's realistic no-test-id/React-cleared-FileList fixtures passed all 113 content
+tests; the full extension suites passed 240 tests after updating the manifest
+version assertion. The extension was reloaded through its existing guarded
+local reload control only; the paired tab was not refreshed and its unsent
+attachments were not manipulated. This reload is not a successful preflight.
+Luna then verified 0.1.16 through real read-only MCP: receiver available, protocol
+3, two attachment cards, tab_ready=false and tab_idle=false, with the expected
+existing-attachments error. The false-empty status is fixed live.
+
+#### Explicit cleanup of an inspected failed preflight (0.1.17, protocol 4)
+
+The four tool names remain unchanged. After inspecting the original unsent
+draft, and only with owner approval to remove those exact test attachments:
+
+```python
+extension_resolve(job_id="<original failed preflight>",
+                  inspected_chatgpt=True, clear_preflight_uploads=True)
+```
+
+Require `input_capabilities.failed_preflight_cleanup=true`. This is one explicit
+cleanup attempt of the same job, not a new upload or generation retry. It accepts
+only the original paired client's failed upload-readiness preflight, originally
+requested with clearing enabled, with no other work/cleanup pending. The prior
+error is retained as `original_preflight_error`. Delivery contains metadata only,
+never image bytes; it cannot call upload, prepare a new chat, insert text, Send,
+fetch an output image or delete a chat. Restart interrupts rather than replays it.
+
+The content receiver verifies a normal empty home composer, Create image mode,
+no turns or running work, exact ordered unique filenames, loaded thumbnails and
+matching native Remove controls, and rechecks the draft between removals. A
+changed/extra/partial draft fails closed without a retry. Filenames are native
+UI identity checks, not a recomputed server-side image hash: the operator must
+inspect that this is the unchanged failed preflight before using the option.
+Success retains `preflight_cleanup_only=true`, with `preflight_ready=true`,
+`preflight_uploads_cleared=true`, `submitted=false`, `generated=false` and no
+output image. This proves recovery of existing uploads, not a fresh upload run.
+Independent review added two guards: an unpaired visible composer thumbnail
+blocks readiness/removal even without a test id or Remove button, and recovery
+rejects an older job if newer persisted work exists. Pydantic StrictBool prevents
+numeric/string coercion from becoming inspection or cleanup approval.
+Offline verification: 280 JavaScript tests and 161 Python extension tests pass.
+The paired draft remains the source of live acceptance; these tests alone do not
+prove the existing uploads were removed. The extension was reloaded through its
+existing popup control, without refreshing ChatGPT or manipulating attachments.
+
+Parallel workflow: one Luna performs bounded verification with a single actor
+for the paired tab; another collects public primary-source reuse patterns without
+touching accounts/runtime. The lead owns production fixes and safety decisions.
+Research code is not installed/executed merely because a repository exists.
+
+Preflight offline verification (2026-10-16): Luna xhigh passed 100 Python tests
+and 162 extension tests (76 content, 86 worker/popup). Tests assert protocol-2
+gating, actual ordered File uploads, no text insertion/Send lookup/click/output
+fetch/deletion, strict readiness-only receipts, no generated-image receipt or
+cleanup authorization, preserved unsent attachments and accurate popup labeling.
+No live preflight, extension reload, owner restart or generation was performed.
+
+Offline verification (2026-10-16): GPT-6 Luna xhigh ran 151 extension tests
+(content/worker/popup), 90 Python bridge/client/input tests, and both bundled skill
+validators, all passing. Tests cover prompt-only create, one and three inputs,
+source-required edit, File byte/MIME/order identity, readiness failures, corrupt/
+animated/oversized/unsafe inputs, metadata-only persistence, old receiver protocol
+rejection, snapshot integrity and restart no-replay. A targeted regression found
+that removing attachments during Send-control lookup could bypass the earlier
+readiness check; a final synchronous composer/upload recheck now prevents Send.
+These tests used only local fixtures and mocked DOM, no live ChatGPT generation,
+Chrome/CUA, account changes, owner restart or extension reload. The candidate
+is not a production/live-upload acceptance result.
 
 ### Popup and reconnect state
 
@@ -340,6 +725,57 @@ The signed-in account is still owner-confirmed, not independently checked. Reser
 paired tab for Bridge work; do not type, switch accounts or change its model while
 a job is running. Login and any verification remain manual.
 
+### 0.1.18 asynchronous-removal repair (2026-10-16)
+
+The first real cleanup-only call on the inspected failed preflight removed
+`input-001.png`, then failed while React still displayed the old two-card set.
+Live diagnostics subsequently showed one remaining card. This was a partial
+cleanup, not an unchanged draft and not a successful preflight. No Send or
+generation occurred.
+
+The removal loop now keeps its old filename binding while the clicked card is
+still present, waits for disappearance, then verifies the exact remaining set
+before any next click. Explicit inspected recovery accepts only a nonempty
+ordered suffix of the original filenames. Foreign images/text, changed composer,
+and different chats still block cleanup. The server permits one explicit resume
+of this exact historical transition error on the latest original-client job;
+it preserves both errors and never re-uploads image bytes or automatically retries.
+Protocol 4 remains wire-compatible; live acceptance requires runtime 0.1.18.
+
+Live acceptance on `second`: Luna issued one inspected MCP resume on the same
+original job `b0fe914022014428b20978beaf5d555a`. It completed with
+`preflight_ready=true`, `preflight_uploads_cleared=true`, `submitted=false`,
+`generated=false`, and the empty-composer receipt. The next native heartbeat
+independently reported `attachment_cards=0`, `tab_ready=true`, `tab_idle=true`,
+and no tab error (worker 0.1.18 / content protocol 4). Immediately after the
+receipt, global diagnostics still reflected the previous one-card heartbeat;
+wait for the next 30-second check rather than retrying cleanup. No new upload,
+Send, generation, or chat deletion occurred during this recovery. Browser
+control was used only to reload the installed extension; cleanup and acceptance
+used MCP/extension. The two source files remain unchanged on disk.
+
+Regression verification: 291 Node tests and 167 targeted Python tests pass,
+including delayed native removal, foreign draft/file/path guards, exact suffix
+recovery, same-client/latest-job gates and restart/no-replay behavior. This is
+live upload-readiness/cleanup evidence, not a new reference-image generation or
+visual-fidelity test.
+
+An isolated HEAD-plus-release-files export also passed its full offline Python
+suite: **466 passed, 3 skipped**, plus the same 291 Node tests. The first sandboxed
+run denied six loopback-server fixtures; the exact full rerun with loopback
+permission passed. Opt-in live-host tests stayed disabled. No unrelated dirty
+direct-provider, GPT-6, OpenCode or packaging files were needed for this release.
+
+Parallel reuse research inspected (not live-tested)
+[BossDever/chatgpt-chrome-mcp-project](https://github.com/BossDever/chatgpt-chrome-mcp-project),
+an adjacent CDP-based implementation. Its filename-associated DOM adapter and
+post-removal polling support re-reading native state instead of assuming a click
+is synchronous. This is not an extension/MCP transport match; no architecture
+change, dependency or source copy was made (no declared repository license was
+found). Source references:
+[DOM adapter](https://github.com/BossDever/chatgpt-chrome-mcp-project/blob/main/src/chatgpt-dom-adapter.mjs),
+[CDP client](https://github.com/BossDever/chatgpt-chrome-mcp-project/blob/main/src/cdp-client.mjs).
+
 ## One bounded smoke test
 
 Call `extension_status` first. When `account=second`, `paired=true` and `extension_online=true`, call
@@ -365,8 +801,9 @@ generation. The extension checks terminal state before clearing its active slot,
 including after a server restart; disconnect cannot silently drop running work.
 Use the popup's saved-key relink option to change tabs, or explicitly forget the
 pairing to clear its stored key. The extension prepares a fresh empty native
-image chat for the next explicitly requested image. Reference editing and batch
-generation are not implemented.
+image chat for the next explicitly requested image. Ordered reference uploads and
+edit inputs are implemented; the latest live acceptance is preflight-only, not
+proof of reference-edit generation quality. Batch generation is not implemented.
 
 If a UI fix required reloading the extension and the original completed chat,
 keep the MCP server running and use **ตัวเลือก → รับภาพจากงานเดิม ไม่สร้างซ้ำ** in

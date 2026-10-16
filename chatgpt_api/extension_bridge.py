@@ -15,19 +15,99 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 MAX_IMAGE = 25 * 1024 * 1024
+MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT upload limit.
 TERMINAL = {"complete", "failed", "interrupted"}
 PORT = 18767
+
+
+class LocalImageInput(BaseModel):
+    """One real local upload, in attachment order; never a filename-only reference."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    path: str = Field(description="Absolute regular local PNG, JPEG or WebP file; no URLs or symlinks.")
+    role: Literal["source", "reference"] = "reference"
+    description: str = Field(min_length=1, max_length=200,
+                             description="What this image controls, e.g. Goofy identity or cafe staging.")
+
+
+def read_local_image(path: str) -> bytes:
+    """Open every path component without following symlinks; reject special files."""
+    if not isinstance(path, str) or not Path(path).is_absolute() or ".." in Path(path).parts:
+        raise ValueError("image path must be absolute and local")
+    parts = Path(path).parts[1:]
+    if not parts:
+        raise ValueError("image path must be a regular file")
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_INPUT_BYTES:
+                raise ValueError("input must be a regular image within the 8 MiB transport budget")
+            raw = source.read(MAX_INPUT_BYTES + 1)
+            if not raw or len(raw) > MAX_INPUT_BYTES:
+                raise ValueError("input exceeds the 8 MiB transport budget")
+            return raw
+    finally:
+        os.close(directory)
+
+
+def validated_inputs(mode: str, images) -> list[tuple[dict, bytes]]:
+    if mode not in {"create", "edit"}:
+        raise ValueError("mode must be create or edit")
+    if images is None:
+        images = []
+    if not isinstance(images, list):
+        raise ValueError("images must be an ordered list")
+    inputs = [item if isinstance(item, LocalImageInput) else LocalImageInput.model_validate(item) for item in images]
+    if mode == "edit" and not any(item.role == "source" for item in inputs):
+        raise ValueError("edit requires at least one source image")
+    if mode == "create" and any(item.role == "source" for item in inputs):
+        raise ValueError("source images require edit mode; create accepts references")
+    result, total = [], 0
+    formats = {"PNG": ("png", "image/png"), "JPEG": ("jpg", "image/jpeg"), "WEBP": ("webp", "image/webp")}
+    for index, item in enumerate(inputs, 1):
+        if not item.description.strip() or any(ord(char) < 32 for char in item.description):
+            raise ValueError("image description must be a short single line")
+        raw = read_local_image(item.path)
+        total += len(raw)
+        if total > MAX_INPUT_BYTES:
+            raise ValueError("combined inputs exceed the 8 MiB transport budget")
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                if (image.format not in formats or getattr(image, "n_frames", 1) != 1 or
+                        min(image.size) < 1 or max(image.size) > 8192 or image.width * image.height > 40_000_000):
+                    raise ValueError("unsupported input image")
+                suffix, mime = formats[image.format]
+                dimensions = list(image.size)
+                image.verify()
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load()
+        except (OSError, Image.DecompressionBombError) as error:
+            raise ValueError("input is not a valid static PNG, JPEG or WebP") from error
+        result.append(({"order": index, "role": item.role, "description": item.description.strip(),
+                        "name": f"input-{index:03d}.{suffix}", "mime": mime, "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(), "dimensions": dimensions}, raw))
+        if len(json.dumps([metadata for metadata, _raw in result]).encode()) > 48 * 1024:
+            raise ValueError("input metadata exceeds the 48 KiB Bridge state budget")
+    return result
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -62,11 +142,16 @@ class ExtensionClient:
     def status(self, job_id: str = "") -> dict:
         return self.call("status", {"job_id": job_id})
 
-    def submit(self, prompt: str, expected_model: str) -> dict:
-        return self.call("image", {"prompt": prompt, "expected_model": expected_model})
+    def submit(self, prompt: str, expected_model: str, mode: str = "create", images=None,
+               preflight_only: bool = False, clear_preflight_uploads: bool = False) -> dict:
+        return self.call("image", {"prompt": prompt, "expected_model": expected_model, "mode": mode,
+                                   "images": [item.model_dump() if isinstance(item, LocalImageInput) else item
+                                              for item in (images or [])], "preflight_only": preflight_only,
+                                   **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {})})
 
-    def resolve(self, job_id: str) -> dict:
-        return self.call("resolve", {"job_id": job_id, "inspected_chatgpt": True})
+    def resolve(self, job_id: str, clear_preflight_uploads: bool = False) -> dict:
+        return self.call("resolve", {"job_id": job_id, "inspected_chatgpt": True,
+                                    **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {})})
 
     def confirm_delete(self, job_id: str, owner_confirmed: bool = False) -> dict:
         return self.call("confirm-delete", {"job_id": job_id, "owner_confirmed": owner_confirmed})
@@ -87,7 +172,7 @@ class ExtensionQueue:
         self.client = None
         self.jobs: dict[str, dict] = {}
         for path in self.root.glob("*/state.json"):
-            if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 70000:
+            if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 256 * 1024:
                 continue
             try:
                 record = json.loads(path.read_text())
@@ -114,31 +199,58 @@ class ExtensionQueue:
         temporary.chmod(0o600)
         temporary.replace(directory / "state.json")
 
-    def pair(self, client_id: str, account: str, visible_model: str = "") -> dict:
+    def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0) -> dict:
         if account != self.account or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
             raise ValueError("account or client identity mismatch")
         if not isinstance(visible_model, str) or len(visible_model) > 100:
             raise ValueError("invalid visible model label")
+        if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
+            raise ValueError("invalid input protocol")
         with self.lock:
             if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
                 raise ValueError("finish or resolve the current job before pairing again")
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
-                           "tab_ready": True}
+                           "tab_ready": True, "input_protocol": input_protocol}
             return {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
 
     def heartbeat(self, client_id: str, account: str, visible_model: str = "Create image",
-                  tab_ready: bool = False) -> dict:
+                  tab_ready: bool = False, input_protocol: int = 0,
+                  tab_idle: bool | None = None, tab_error: str = "",
+                  worker_version: str = "", content_receiver: str = "unreported",
+                  receiver_error: str = "", upload_dom: dict | None = None) -> dict:
         """Reconnect the already-authorized local extension, never replay old work."""
         if account != self.account or type(tab_ready) is not bool:
             raise ValueError("account or readiness mismatch")
         if not isinstance(visible_model, str) or visible_model != "Create image":
             raise ValueError("native Create image mode is required")
+        if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
+            raise ValueError("invalid input protocol")
+        if (tab_idle is not None and type(tab_idle) is not bool) or not isinstance(tab_error, str) or len(tab_error) > 300:
+            raise ValueError("invalid tab diagnostic")
+        if (not isinstance(worker_version, str) or len(worker_version) > 32 or
+                (worker_version and not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", worker_version))):
+            raise ValueError("invalid worker version")
+        if not isinstance(content_receiver, str) or content_receiver not in {
+                "unreported", "available", "tab_missing", "wrong_origin", "unavailable", "invalid_reply"}:
+            raise ValueError("invalid content receiver diagnostic")
+        if not isinstance(receiver_error, str) or receiver_error not in {
+                "", "tab_missing", "wrong_origin", "no_receiver", "port_closed", "message_failed", "invalid_reply"}:
+            raise ValueError("invalid receiver error diagnostic")
+        upload_counts = {"file_inputs", "form_file_inputs", "image_inputs", "form_image_inputs",
+                         "multiple_image_inputs", "unrestricted_inputs", "attachment_cards"}
+        if upload_dom is not None and (not isinstance(upload_dom, dict) or
+                set(upload_dom) != upload_counts | {"editor_form"} or type(upload_dom["editor_form"]) is not bool or
+                any(type(upload_dom[key]) is not int or not 0 <= upload_dom[key] <= 10000 for key in upload_counts)):
+            raise ValueError("invalid upload DOM diagnostic")
         with self.lock:
             if self.client is None:
-                self.pair(client_id, account, visible_model)
+                self.pair(client_id, account, visible_model, input_protocol)
             else:
                 self._client(client_id)
-            self.client.update(visible_model=visible_model, tab_ready=tab_ready)
+            self.client.update(visible_model=visible_model, tab_ready=tab_ready, input_protocol=input_protocol,
+                               tab_idle=tab_idle, tab_error=tab_error, worker_version=worker_version,
+                               content_receiver=content_receiver, receiver_error=receiver_error,
+                               upload_dom=dict(upload_dom) if upload_dom is not None else None)
             return self.status()
 
     def _client(self, client_id):
@@ -146,7 +258,12 @@ class ExtensionQueue:
             raise ValueError("extension is not paired")
         self.client["seen"] = time.monotonic()
 
-    def submit(self, prompt: str, expected_model: str) -> dict:
+    def submit(self, prompt: str, expected_model: str, mode: str = "create", images=None,
+               preflight_only: bool = False, clear_preflight_uploads: bool = False) -> dict:
+        if type(preflight_only) is not bool:
+            raise ValueError("preflight_only must be a boolean")
+        if type(clear_preflight_uploads) is not bool or (clear_preflight_uploads and not preflight_only):
+            raise ValueError("clear_preflight_uploads requires a boolean and preflight_only=true")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 16000:
             raise ValueError("prompt must contain 1..16000 characters")
         if expected_model != "Create image":
@@ -156,9 +273,28 @@ class ExtensionQueue:
                 raise ValueError("pair a logged-in ChatGPT tab and wait for its heartbeat first")
             if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
                 raise ValueError("one image job at a time; inspect existing job before resubmitting")
+            inputs = validated_inputs(mode, images)
+            if (inputs or mode == "edit") and self.client.get("input_protocol", 0) < 1:
+                raise ValueError("reload the updated extension and paired tab before using local image inputs")
+            if preflight_only and self.client.get("input_protocol", 0) < 2:
+                raise ValueError("reload extension and paired tab for no-Send preflight support")
+            if clear_preflight_uploads and self.client.get("input_protocol", 0) < 3:
+                raise ValueError("protocol 3 is required to clear verified preflight uploads")
             job = {"job_id": uuid.uuid4().hex, "state": "queued", "prompt": prompt, "account": self.account,
-                   "expected_model": expected_model.strip(), "client_id": self.client["client_id"]}
-            if self.auto_delete_saved_chats:
+                   "expected_model": expected_model.strip(), "client_id": self.client["client_id"], "mode": mode}
+            if inputs:
+                directory = self.root / job["job_id"]
+                directory.mkdir(mode=0o700)
+                for metadata, raw in inputs:
+                    descriptor = os.open(directory / metadata["name"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, "wb") as output:
+                        output.write(raw)
+                job["images"] = [metadata for metadata, _raw in inputs]
+            if preflight_only:
+                job["preflight_only"] = True
+            if clear_preflight_uploads:
+                job["clear_preflight_uploads"] = True
+            if self.auto_delete_saved_chats and not preflight_only:
                 job["auto_delete_saved_chat"] = True
             self.jobs[job["job_id"]] = job
             self._save(job)
@@ -169,15 +305,37 @@ class ExtensionQueue:
             self._client(client_id)
             for job in self.jobs.values():
                 if job["state"] == "queued" and job["client_id"] == client_id:
+                    minimum_protocol = 4 if job.get("preflight_cleanup_only") else 3 if job.get("clear_preflight_uploads") else 2 if job.get("preflight_only") else 1 if job.get("images") or job.get("mode") == "edit" else 0
+                    if self.client.get("input_protocol", 0) < minimum_protocol:
+                        job.update(state="failed", error="Input protocol changed before delivery; nothing was delivered. Reload extension and paired tab.")
+                        self._save(job)
+                        raise ValueError(job["error"])
                     job["state"] = "claimed"
                     self._save(job)  # Persist BEFORE delivery. Never repeat on uncertain response.
-                    return {k: job[k] for k in ("job_id", "prompt", "expected_model")}
+                    claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed") if k in job}
+                    if job.get("preflight_cleanup_only"):
+                        claimed["images"] = [dict(metadata) for metadata in job["images"]]
+                        return claimed  # Existing uploads only: never deliver image bytes again.
+                    if job.get("images"):
+                        claimed["images"] = []
+                        try:
+                            for metadata in job["images"]:
+                                raw = read_local_image(str(self.root / job["job_id"] / metadata["name"]))
+                                if len(raw) != metadata["bytes"] or hashlib.sha256(raw).hexdigest() != metadata["sha256"]:
+                                    raise ValueError("input snapshot changed")
+                                claimed["images"].append({**metadata, "data_base64": base64.b64encode(raw).decode("ascii")})
+                        except (OSError, ValueError) as error:
+                            job.update(state="failed", error="Input snapshot unavailable or changed; nothing was delivered.")
+                            self._save(job)
+                            raise ValueError(job["error"]) from error
+                    return claimed
             return {}
 
     def result(self, client_id: str, job_id: str, *, image_base64: str | None = None,
                error: str | None = None, source: str = "rendered-image", cleanup_pending: bool = False,
-               chat_path: str | None = None) -> dict:
-        if type(cleanup_pending) is not bool:
+               chat_path: str | None = None, preflight_ready: bool = False,
+               preflight_uploads_cleared: bool = False) -> dict:
+        if type(cleanup_pending) is not bool or type(preflight_ready) is not bool or type(preflight_uploads_cleared) is not bool:
             raise ValueError("invalid cleanup flag")
         if chat_path is not None and (not isinstance(chat_path, str) or not re.fullmatch(r"/c/[a-f0-9-]{36}", chat_path)):
             raise ValueError("invalid generated chat path")
@@ -186,9 +344,23 @@ class ExtensionQueue:
             job = self.jobs.get(job_id)
             if not job or job["client_id"] != client_id or job["state"] != "claimed":
                 raise ValueError("job is not claimed by this extension; result was not accepted")
+            if preflight_uploads_cleared and not job.get("clear_preflight_uploads"):
+                raise ValueError("preflight upload clearing was not requested")
             if error is not None:
                 job.update(state="failed", error=str(error)[:500])
+            elif job.get("preflight_only"):
+                if not preflight_ready or image_base64 or cleanup_pending or chat_path:
+                    raise ValueError("preflight accepts only a no-Send readiness receipt, never media or cleanup")
+                if job.get("clear_preflight_uploads") and not preflight_uploads_cleared:
+                    raise ValueError("verified preflight upload clearing receipt is required")
+                job.update(state="complete", preflight_ready=True, submitted=False, generated=False,
+                           cleanup_status="not_requested", draft_note="Owned upload-only draft remains unsent; inspect before further work.")
+                if preflight_uploads_cleared:
+                    job.update(preflight_uploads_cleared=True,
+                               draft_note="Owned preflight uploads removed after readiness verification; composer empty.")
             else:
+                if preflight_ready:
+                    raise ValueError("readiness receipt cannot complete a generation job")
                 if not image_base64 or len(image_base64) > (MAX_IMAGE * 4 // 3 + 8):
                     raise ValueError("missing or oversized image")
                 raw = base64.b64decode(image_base64, validate=True)
@@ -269,10 +441,27 @@ class ExtensionQueue:
                         "cleanup_policy": "automatic_saved_chats" if self.auto_delete_saved_chats else "per_job_confirmation",
                         "account_binding": "owner-confirmed, not independently verified",
                         "transport": "extension-native-ui",
+                        "input_capabilities": {"modes": ["create", "edit"],
+                                               "ordered_local_images": bool(self.client and self.client.get("input_protocol", 0) >= 1),
+                                               "preflight_only": bool(self.client and self.client.get("input_protocol", 0) >= 2),
+                                               "preflight_clear_uploads": bool(self.client and self.client.get("input_protocol", 0) >= 3),
+                                               "failed_preflight_cleanup": bool(self.client and self.client.get("input_protocol", 0) >= 4),
+                                               "formats": ["PNG", "JPEG", "WEBP"], "static_only": True,
+                                               "max_total_bytes": MAX_INPUT_BYTES, "max_edge": 8192,
+                                               "max_pixels": 40_000_000, "max_metadata_bytes": 48 * 1024,
+                                               "native_upload_count_limit": "not live verified"},
                         "visible_model": self.client["visible_model"] if self.client else None,
                         "tab_ready": bool(self.client and self.client["tab_ready"]),
+                        "tab_idle": self.client.get("tab_idle") if self.client else None,
+                        "tab_error": self.client.get("tab_error", "") if self.client else "",
+                        "extension_diagnostics": {
+                            "worker_version": (self.client.get("worker_version") or None) if self.client else None,
+                            "content_receiver": self.client.get("content_receiver", "unreported") if self.client else "unreported",
+                            "content_protocol": self.client.get("input_protocol", 0) if self.client else 0,
+                            "receiver_error": self.client.get("receiver_error", "") if self.client else "",
+                            "upload_dom": self.client.get("upload_dom") if self.client else None},
                         "extension_online": bool(self.client and time.monotonic() - self.client["seen"] <= 90),
-                        "jobs": [{k: j[k] for k in ("job_id", "state", "cleanup_status", "chat_path") if k in j}
+                        "jobs": [{k: j[k] for k in ("job_id", "state", "cleanup_status", "chat_path", "preflight_only", "clear_preflight_uploads") if k in j}
                                  for j in list(self.jobs.values())[-10:]]}
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
@@ -286,11 +475,40 @@ class ExtensionQueue:
                 raise ValueError("job does not belong to this extension")
             return self.status(job_id)
 
-    def resolve(self, job_id: str) -> dict:
+    def resolve(self, job_id: str, clear_preflight_uploads: bool = False) -> dict:
         """Explicit operator action after inspecting the upstream conversation."""
         with self.lock:
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
+            if type(clear_preflight_uploads) is not bool:
+                raise ValueError("clear_preflight_uploads must be a boolean")
+            if clear_preflight_uploads:
+                job = self.jobs[job_id]
+                resume = (job.get("preflight_cleanup_only") is True and
+                          not job.get("preflight_cleanup_resumed") and
+                          job.get("original_preflight_error", "").startswith("Not submitted. Native uploads not verified ready;") and
+                          job.get("error") == "Not submitted. Unexpected attachment controls in this job's composer; inspect the unsent draft")
+                if (job["state"] != "failed" or not job.get("preflight_only") or
+                        not job.get("clear_preflight_uploads") or not job.get("images") or
+                        (not resume and (job.get("preflight_cleanup_only") or
+                         not job.get("error", "").startswith("Not submitted. Native uploads not verified ready;")))):
+                    raise ValueError("only an inspected upload-readiness failure can clear its original preflight uploads once")
+                if (not self.client or time.monotonic() - self.client["seen"] > 90 or
+                        self.client.get("input_protocol", 0) < 4 or self.client["client_id"] != job["client_id"]):
+                    raise ValueError("original paired extension with protocol 4 is required")
+                if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
+                    raise ValueError("finish existing work before preflight cleanup")
+                latest = max(self.jobs, key=lambda key: (self.root / key / "state.json").stat().st_mtime_ns)
+                if latest != job_id:
+                    raise ValueError("only the latest inspected preflight may clear existing uploads")
+                error = job.pop("error")
+                job.update(state="queued", preflight_cleanup_only=True)
+                if resume:
+                    job.update(preflight_cleanup_resumed=True, previous_preflight_cleanup_error=error)
+                else:
+                    job["original_preflight_error"] = error
+                self._save(job)
+                return self.status(job_id)
             if self.jobs[job_id]["state"] not in TERMINAL:
                 self.jobs[job_id].update(state="interrupted", error="Operator resolved uncertain work; no automatic resubmission.")
                 self._save(self.jobs[job_id])
@@ -344,7 +562,7 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 if not isinstance(data, dict):
                     raise ValueError("request must be an object")
                 if self.path == "/pair":
-                    result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""))
+                    result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""), data.get("input_protocol", 0))
                 elif self.path == "/heartbeat":
                     result = queue.heartbeat(**data)
                 elif self.path == "/next":
@@ -366,7 +584,7 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 elif self.path == "/agent/resolve":
                     if data.get("inspected_chatgpt") is not True:
                         raise ValueError("inspect ChatGPT before resolving uncertain work")
-                    result = queue.resolve(data["job_id"])
+                    result = queue.resolve(data["job_id"], data.get("clear_preflight_uploads", False))
                 else:
                     return self.reply(404, {"error": "unknown route"})
                 self.reply(200, result)
@@ -385,9 +603,11 @@ def create_mcp(queue):
         return queue.status(job_id)
 
     @server.tool()
-    def extension_image(prompt: str, expected_model: str) -> dict:
-        """Generate ONE image on second. Use expected_model='Create image'. The paired extension prepares a fresh native image chat for this new job; it never clears drafts, interrupts running work, or retries uncertain submissions. Check status first; pairing and extension_online are required, tab_ready may be false."""
-        return queue.submit(prompt, expected_model)
+    def extension_image(prompt: str, expected_model: str, mode: Literal["create", "edit"] = "create",
+                        images: list[LocalImageInput] | None = None, preflight_only: bool = False,
+                        clear_preflight_uploads: bool = False) -> dict:
+        """Create/edit ONE image on second, or preflight_only=true to verify actual uploads WITHOUT text insertion, Send or generation. Preflight normally preserves the unsent draft. With explicit owner approval, clear_preflight_uploads=true removes ONLY this job's verified uploads after readiness, requiring preflight_clear_uploads capability (protocol 3). create accepts ordered references; edit requires >=1 source. Local static PNG/JPEG/WebP, 8 MiB combined, <=40MP/8192px, no URLs/symlinks. Preserve order/roles. Check status/tab_idle. No retries or model/account parity promises."""
+        return queue.submit(prompt, expected_model, mode, images, preflight_only, clear_preflight_uploads)
 
     @server.tool()
     def extension_confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
@@ -395,11 +615,11 @@ def create_mcp(queue):
         return queue.confirm_delete(job_id, owner_confirmed)
 
     @server.tool()
-    def extension_resolve(job_id: str, inspected_chatgpt: bool = False) -> dict:
-        """Release uncertain work ONLY after the operator has inspected ChatGPT. Does not cancel or resend upstream work."""
-        if not inspected_chatgpt:
+    def extension_resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False) -> dict:
+        """Release uncertain work ONLY after inspection. With owner approval, clear_preflight_uploads=true verifies/removes this failed preflight's existing uploads (protocol 4); one explicit resume is supported for the known asynchronous-removal failure. No re-upload, text insertion, Send, generation or chat deletion. Refuses unknown/changed drafts. Otherwise does not cancel/resend upstream work."""
+        if inspected_chatgpt is not True:
             raise ValueError("inspect ChatGPT before resolving uncertain work")
-        return queue.resolve(job_id)
+        return queue.resolve(job_id, clear_preflight_uploads)
 
     return server
 

@@ -70,9 +70,11 @@ class _LocalWorkerTransport:
 
     def __init__(self, handler_type):
         self.handler_type = handler_type
+        self.payloads = []
 
     def open(self, request, timeout):
         body = request.data
+        self.payloads.append(json.loads(body))
         handler = object.__new__(self.handler_type)
         handler.headers = {
             "Host": "127.0.0.1:18767",
@@ -92,6 +94,66 @@ class _LocalWorkerTransport:
             from urllib.error import HTTPError
             raise HTTPError(request.full_url, handler.status, "synthetic worker error", {}, None)
         return _Response(handler.wfile.getvalue())
+
+
+def test_client_forwards_upload_clear_opt_in_and_omits_false_for_compatibility(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=3)
+    handler = make_handler(queue, TOKEN, 18767)
+    client = ExtensionClient(TOKEN)
+    transport = _LocalWorkerTransport(handler)
+    client.http = transport
+
+    default = client.submit("Check without clearing.", "Create image", preflight_only=True)
+    assert "clear_preflight_uploads" not in transport.payloads[-1]
+    queue.claim(CLIENT_ID)
+    default_receipt = queue.result(CLIENT_ID, default["job_id"], preflight_ready=True)
+    assert "preflight_uploads_cleared" not in default_receipt
+
+    cleared = client.submit(
+        "Check and clear the verified upload.",
+        "Create image",
+        preflight_only=True,
+        clear_preflight_uploads=True,
+    )
+    assert transport.payloads[-1]["clear_preflight_uploads"] is True
+    claimed = queue.claim(CLIENT_ID)
+    assert claimed["clear_preflight_uploads"] is True
+    receipt = queue.result(
+        CLIENT_ID,
+        cleared["job_id"],
+        preflight_ready=True,
+        preflight_uploads_cleared=True,
+    )
+    assert receipt["preflight_uploads_cleared"] is True
+
+    before = len(queue.jobs)
+    with pytest.raises(ValueError, match="No automatic retry"):
+        client.submit(
+            "Invalid flag is passed through for worker validation.",
+            "Create image",
+            preflight_only=True,
+            clear_preflight_uploads=0,
+        )
+    assert transport.payloads[-1]["clear_preflight_uploads"] == 0
+    assert len(queue.jobs) == before
+
+
+def test_client_resolve_propagates_clear_flag_only_when_true():
+    client = ExtensionClient(TOKEN)
+    calls = []
+    client.call = lambda action, payload: calls.append((action, payload)) or {"state": "queued"}
+
+    client.resolve("synthetic-job")
+    client.resolve("synthetic-job", clear_preflight_uploads=False)
+    client.resolve("synthetic-job", clear_preflight_uploads=True)
+
+    assert calls == [
+        ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True}),
+        ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True}),
+        ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True,
+                      "clear_preflight_uploads": True}),
+    ]
 
 
 def test_two_stdio_clients_share_the_worker_queue_and_only_one_claims(tmp_path):
@@ -158,6 +220,10 @@ def test_agent_routes_require_auth_valid_origin_and_operator_confirmation(tmp_pa
 
     submitted = queue.submit("Synthetic unresolved job", "Create image")
     assert _request(handler, "/agent/resolve", {"job_id": submitted["job_id"]}, origin="")[0] == 400
+    assert _request(handler, "/agent/resolve", {
+        "job_id": submitted["job_id"], "inspected_chatgpt": 1,
+    }, origin="")[0] == 400
+    assert queue.status(submitted["job_id"])["state"] == "queued"
     resolved_status, resolved = _request(handler, "/agent/resolve", {
         "job_id": submitted["job_id"], "inspected_chatgpt": True,
     }, origin="")
@@ -211,16 +277,42 @@ def test_client_opener_disables_redirects_and_environment_proxies(monkeypatch):
     assert redirect_handler.redirect_request(None, None, None, None, None, None) is None
 
 
-@pytest.mark.parametrize("arguments", [{"job_id": "synthetic"}, {"job_id": "synthetic", "inspected_chatgpt": False}])
+@pytest.mark.parametrize("arguments", [
+    {"job_id": "synthetic"},
+    {"job_id": "synthetic", "inspected_chatgpt": False},
+])
 def test_mcp_resolve_requires_inspection_before_calling_client(arguments):
     from chatgpt_api.extension_bridge import create_mcp
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda job_id: calls.append(job_id) or {"state": "interrupted"}
+    client.resolve = lambda job_id, clear_preflight_uploads=False: calls.append(
+        (job_id, clear_preflight_uploads)
+    ) or {"state": "interrupted"}
     server = create_mcp(client)
 
     with pytest.raises(Exception, match="inspect ChatGPT"):
+        asyncio.run(server.call_tool("extension_resolve", arguments))
+    assert calls == []
+
+
+@pytest.mark.parametrize("arguments", [
+    {"job_id": "synthetic", "inspected_chatgpt": 1},
+    {"job_id": "synthetic", "inspected_chatgpt": "true"},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": 1},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": "true"},
+])
+def test_mcp_resolve_rejects_non_boolean_inspection_and_cleanup_flags(arguments):
+    from chatgpt_api.extension_bridge import create_mcp
+
+    client = ExtensionClient(TOKEN)
+    calls = []
+    client.resolve = lambda job_id, clear_preflight_uploads=False: calls.append(
+        (job_id, clear_preflight_uploads)
+    ) or {"state": "queued"}
+    server = create_mcp(client)
+
+    with pytest.raises(Exception):
         asyncio.run(server.call_tool("extension_resolve", arguments))
     assert calls == []
 
@@ -230,13 +322,21 @@ def test_mcp_resolve_calls_client_only_after_explicit_inspection():
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda job_id: calls.append(job_id) or {"state": "interrupted"}
+    client.resolve = lambda job_id, clear_preflight_uploads=False: calls.append(
+        (job_id, clear_preflight_uploads)
+    ) or {"state": "interrupted"}
     server = create_mcp(client)
 
     result = asyncio.run(server.call_tool("extension_resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True,
     }))
-    assert calls == ["synthetic"]
+    assert calls == [("synthetic", False)]
+    assert "interrupted" in result[0].text
+
+    result = asyncio.run(server.call_tool("extension_resolve", {
+        "job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": True,
+    }))
+    assert calls == [("synthetic", False), ("synthetic", True)]
     assert "interrupted" in result[0].text
 
 

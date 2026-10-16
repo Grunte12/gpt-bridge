@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const {createHash, webcrypto} = require('node:crypto');
 const vm = require('node:vm');
 const path = require('node:path');
 
@@ -8,9 +9,10 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
+  const contentListeners = [];
   let clicks = 0;
   let finalDeleteClicks = 0;
   let menuOpen = false;
@@ -20,6 +22,23 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   let dialogOpen = false;
   let remainingEditorDelay = editorDelayQueries;
   let sendQueries = 0;
+  let insertTextCalls = 0;
+  let fetchCalls = 0;
+  let fileReaderReads = 0;
+  let uploadReadyChecks = 0;
+  let uploadStarted = nativeAttachmentNames.length > 0;
+  let uploadReadyState = nativeAttachmentNames.length > 0;
+  let uploadRemoved = false;
+  let uploadRemovalPending = false;
+  let removeClickCount = 0;
+  const removedUploadNames = [];
+  let pendingNativeRemoval = null;
+  let nativeRemovalWaitPolls = 0;
+  let sendClicks = 0;
+  let sendClickedWhenReady = false;
+  const uploadedFiles = nativeAttachmentNames.map(name => ({name, type: 'image/png', bytes: Uint8Array.from([1])}));
+  const inputEvents = [];
+  const composerEvents = [];
   const location = {origin: 'https://chatgpt.com', href: `https://chatgpt.com${temporaryChat ? '/?temporary-chat=true' : chatPath}`, pathname: chatPath};
   const hasConversation = () => user || (conversationTurns || []).length > 0;
   const sent = [];
@@ -30,7 +49,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
     get value() { return this._value; }
     focus() {}
-    dispatchEvent() {}
+    dispatchEvent(event) { composerEvents.push(event.type); }
     getClientRects() { return editorAvailable ? [{}] : []; }
     click() { clicks++; }
   }
@@ -40,14 +59,143 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
     get textContent() { return this.innerText; }
     focus() {}
-    dispatchEvent() {}
+    dispatchEvent(event) { composerEvents.push(event.type); }
     getClientRects() { return editorAvailable ? [{}] : []; }
   }
   const editor = newUi ? new ContentEditable() : new Textarea();
+  let form;
+  const uploadCardCache = new WeakMap();
+  const makeUploadCard = (file, index) => {
+    if (uploadCardCache.has(file)) return uploadCardCache.get(file);
+    const thumbnail = {alt: file.name, complete: !uploadMissingThumbnail, naturalWidth: uploadMissingThumbnail ? 0 : 32,
+      getClientRects: () => [{}]};
+    const card = {textContent: file.name, parentElement: form,
+      getAttribute(name) { return name === 'title' ? file.name : null; },
+      contains(element) { return card.removeControls.includes(element) || element === thumbnail; },
+      querySelectorAll(selector) {
+        if (selector === 'img') return nativeNoThumbnail ? [] : [thumbnail];
+        if (selector === 'button' || selector.includes('button[aria-label^="Remove "]')) return card.removeControls;
+        return [];
+      },
+      getClientRects: () => [{}], index};
+    const remove = {disabled: false, parentElement: card,
+      getAttribute(name) { return name === 'aria-label' ? `Remove ${file.name}` : null; },
+      getClientRects: () => uploadMissingRemove || removeClickCount >= removeControlUnavailableAfter ? [] : [{}],
+      click() {
+        removeClickCount++;
+        removedUploadNames.push(file.name);
+        const input = fileInputs.find(item => item.files.includes(file));
+        if (delayedNativeRemovePolls > 0) {
+          pendingNativeRemoval = {file, input};
+          nativeRemovalWaitPolls = 0;
+        } else {
+          if (input) input._files = input.files.filter(item => item !== file);
+          uploadedFiles.splice(0, uploadedFiles.length, ...uploadedFiles.filter(item => item !== file));
+        }
+        if (foreignAttachmentAfterRemoveAt === removeClickCount) {
+          const foreign = {name: 'foreign.png', type: 'image/png', bytes: Uint8Array.from([99])};
+          if (input) input._files = [...input.files, foreign];
+          uploadedFiles.push(foreign);
+        }
+        if (foreignTextAfterRemoveAt === removeClickCount) setEditorText(`${composerText()} unrelated text`);
+        if (matchingDraftAfterRemoveAt)
+          setEditorText(`Create image ${matchingDraftAfterRemoveAt}`);
+        if (removeProgressAfterClick) uploadRemovalPending = true;
+      }};
+    const additionalRemove = {disabled: false, parentElement: card,
+      getAttribute(name) { return name === 'aria-label' ? `Remove extra-${file.name}` : null; },
+      getClientRects: () => [{}], click() { remove.click(); }};
+    card.removeControls = nativeAmbiguousContainer ? [remove, additionalRemove] : [remove];
+    uploadCardCache.set(file, card);
+    return card;
+  };
+  const unpairedThumbnail = {alt: 'foreign-native.png', complete: true, naturalWidth: 32,
+    getClientRects: () => [{}]};
+  const unpairedNativeCard = {parentElement: form, querySelectorAll(selector) { return selector === 'img' ? [unpairedThumbnail] : []; },
+    getClientRects: () => [{}]};
+  unpairedThumbnail.parentElement = unpairedNativeCard;
+  const inspectionCards = Array.from({length: attachmentCardCount}, () => ({getClientRects: () => [{}]}));
+  const uploadCards = () => {
+    if (inspectionCards.length) return inspectionCards;
+    if (!uploadStarted || uploadRemoved || uploadNeverReady ||
+        (!nativeAttachmentNames.length && uploadReadyChecks <= uploadReadyAfterChecks)) return [];
+    let files = uploadedFiles.slice();
+    if (uploadReorder) files.reverse();
+    if (uploadPartial) files = files.slice(0, -1);
+    return files.map(makeUploadCard);
+  };
+  const nativeRemoveControls = () => nativeUploadCards ? uploadCards().flatMap(card => card.removeControls) : [];
+  const fileInput = (spec = {}, hasExistingFiles = attachments) => {
+    const input = {type: 'file', accept: spec.accept ?? uploadAccept, multiple: spec.multiple ?? uploadMultiple,
+      disabled: spec.disabled ?? false, name: spec.name, value: spec.value, _files: hasExistingFiles ? [{}] : [],
+      get files() { return this._files; }, set files(value) { this._files = [...value]; },
+      dispatchEvent(event) {
+        inputEvents.push(event.type);
+        if (event.type === 'change') {
+          uploadStarted = true;
+          uploadedFiles.splice(0, uploadedFiles.length, ...this._files);
+          if (nativeForeignOnUpload) uploadedFiles.push({name: nativeForeignOnUpload, type: 'image/png', bytes: Uint8Array.from([99])});
+          uploadReadyState = false;
+          if (reactClearsInputFiles) this._files = [];
+        }
+      }};
+    if (spec.throwAccept) Object.defineProperty(input, 'accept', {get() { throw new Error('accept unavailable'); }});
+    return input;
+  };
+  const inputSpecs = uploadInputSpecs || Array.from({length: 1 + extraUploadInputs}, () => ({}));
+  const fileInputs = uploadInput ? inputSpecs.map(spec => fileInput(spec)) : [];
+  const outsideFileInput = outsideUploadInput ? fileInput(outsideUploadInput, false) : null;
+  const finishPendingNativeRemoval = () => {
+    if (!pendingNativeRemoval) return;
+    const {file, input} = pendingNativeRemoval;
+    if (input) input._files = input.files.filter(item => item !== file);
+    uploadedFiles.splice(0, uploadedFiles.length, ...uploadedFiles.filter(item => item !== file));
+    pendingNativeRemoval = null;
+  };
+  form = {contains(element) { return !uploadOutside && (fileInputs.includes(element) || uploadCards().includes(element) || nativeRemoveControls().includes(element)); },
+    querySelectorAll(selector) {
+      if (selector === 'input[type="file"]') return fileInputs;
+      if (selector === 'img') return [...uploadCards().flatMap(card => card.querySelectorAll('img')),
+        ...(nativeUnpairedThumbnail ? [unpairedThumbnail] : [])];
+      if (selector.includes('button[aria-label^="Remove "]')) return nativeRemoveControls();
+      if (nativeUploadCards && (selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]'))) return [];
+      if (selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]')) return uploadCards();
+      return [];
+    },
+    querySelector(selector) {
+      if (uploadRemovalPending && selector.includes('[data-testid="file-upload-progress"]')) return {getClientRects: () => [{}]};
+      if (selector.includes('[role="alert"]') || selector.includes('[data-testid="file-upload-error"]')) return uploadError ? {getClientRects: () => [{}]} : null;
+      if (selector.includes('[data-testid="file-upload-progress"]') || selector.includes('[role="progressbar"]') || selector.includes('[aria-busy="true"]')) {
+        uploadReadyChecks++;
+        if (changeDuringUpload === 'text') setEditorText(`${composerText()} changed during upload`);
+        if (changeDuringUpload === 'busy') busyState = true;
+        if (changeDuringUpload === 'chip') imageMode = false;
+        const cards = uploadCards();
+        uploadReadyState = cards.length === uploadedFiles.length && cards.length > 0 && !uploadError && !uploadMissingRemove && !uploadMissingThumbnail;
+        return uploadError ? null : (!uploadReadyState ? {getClientRects: () => [{}]} : null);
+      }
+      return null;
+    }};
+  unpairedNativeCard.parentElement = form;
+  editor.closest = selector => selector === 'form' && formAvailable ? form : null;
+  class FakeFile {
+    constructor(parts, name, options = {}) {
+      this.name = name;
+      this.type = options.type || '';
+      this.bytes = Uint8Array.from(parts.flatMap(part => [...part]));
+    }
+  }
+  class FakeDataTransfer {
+    constructor() {
+      const files = [];
+      this.items = {add(file) { files.push(file); }};
+      Object.defineProperty(this, 'files', {get() { return files; }});
+    }
+  }
   const hiddenOldEditor = {value: 'completed conversation content', innerText: 'completed conversation content',
     querySelector() { return null; }, getClientRects: () => []};
   const setEditorText = value => { if (newUi) editor.innerText = value; else editor._value = value; };
-  const send = {get disabled() { return sendQueries <= sendDelayQueries + sendDisabledQueries; }, getClientRects: () => [{}], click() { clicks++; }};
+  const send = {get disabled() { return sendQueries <= sendDelayQueries + sendDisabledQueries; }, getClientRects: () => [{}], click() { clicks++; sendClicks++; sendClickedWhenReady = (uploadReadyState && !uploadRemoved) || uploadedFiles.length === 0; }};
   const hiddenSend = {disabled: false, getClientRects: () => []};
   const picker = {textContent: label, getClientRects: () => [{}]};
   const button = (textContent, ariaLabel, isVisible, onClick = () => {}) => ({
@@ -100,14 +248,26 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       if (selector === 'button[aria-label="Add files and more"]') return filesButton;
       if (selector === 'button[aria-label="More"]') return moreButton;
       if (selector === '[role="dialog"]') return dialogOpen ? deleteDialog : null;
-      if (selector.includes('input[type="file"]')) return attachments ? {files: [{}]} : null;
-      if (selector.includes('[data-testid="file-upload-progress"]') || selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]')) return attachments ? {} : null;
+      if (selector.includes('input[type="file"]')) return fileInputs[0] || null;
+      if (selector.includes('[data-testid="file-upload-progress"]') || selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]'))
+        return uploadRemovalPending ? {getClientRects: () => [{}]} : nativeUploadCards
+          ? (uploadedFiles.length && !uploadReadyState ? {getClientRects: () => [{}]} : null)
+          : attachments ? {} : (uploadStarted && !uploadReadyState ? {getClientRects: () => [{}]} : uploadCards()[0] || null);
       if (selector === '[data-message-author-role="user"]') return user ? {} : null;
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'input[type="file"]') return [...fileInputs, ...(outsideFileInput ? [outsideFileInput] : [])];
+      if (selector.includes('button[aria-label^="Remove "]')) return nativeRemoveControls();
+      if (nativeUploadCards && (selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]'))) return [];
+      if (selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]')) return uploadCards();
       if (selector.includes('[data-testid="send-button"]') || selector.includes('button[aria-label="Send"]')) {
         sendQueries++;
+        if (uploadRemovedBeforeSend && sendQueries === changeAfterSendQueries) {
+          uploadRemoved = true;
+          uploadReadyState = false;
+          for (const input of fileInputs) input._files = [];
+        }
         if (sendQueries === changeAfterSendQueries) {
           if (changeDuringSend === 'text') setEditorText(`${composerText()} changed`);
           if (changeDuringSend === 'chip') imageMode = false;
@@ -129,6 +289,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       return [];
     },
     execCommand(_cmd, _ui, value) {
+      insertTextCalls++;
       let inserted = corruptInsertion ? value.replace('Create one image', 'Create one cat') : value;
       if (inflateWhitespace) inserted = inserted.replace(/\n\n/g, '\n\n\n\n\n');
       if (newUi) editor.innerText += inserted;
@@ -140,7 +301,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   const NativeDate = Date;
   class SimDate extends NativeDate { static now() { return now; } }
   const chrome = {runtime: {
-    onMessage: {addListener(fn) { listener = fn; }},
+    onMessage: {addListener(fn) { listener = fn; contentListeners.push(fn); }, hasListener(fn) { return contentListeners.includes(fn); }},
     async sendMessage(message) {
       sent.push(message);
       if (message.type === 'image-delete-prompt') return {ok: true};
@@ -153,18 +314,41 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   }};
   const context = {
     chrome, document, location,
-    HTMLTextAreaElement: Textarea, Event: class {}, InputEvent: class {},
+    HTMLTextAreaElement: Textarea, Event: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
+    InputEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
+    File: FakeFile, DataTransfer: FakeDataTransfer, atob, crypto: webcrypto,
     PointerEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } }, Date: SimDate,
     setTimeout(fn, ms) {
+      if (pendingNativeRemoval && ms === 100) {
+        nativeRemovalWaitPolls++;
+        if (foreignTextAfterRemoveWaits === nativeRemovalWaitPolls) setEditorText(`${composerText()} unrelated text`);
+        if (matchingDraftAfterRemoveWaits) setEditorText(`Create image ${matchingDraftAfterRemoveWaits}`);
+        if (foreignAttachmentAfterRemoveWaits === nativeRemovalWaitPolls) {
+          const foreign = {name: 'foreign.png', type: 'image/png', bytes: Uint8Array.from([99])};
+          const input = pendingNativeRemoval.input;
+          if (input) input._files = [...input.files, foreign];
+          uploadedFiles.push(foreign);
+        }
+        if (pathChangeAfterRemoveWaits === nativeRemovalWaitPolls) location.pathname = '/c/another-chat';
+        if (nativeRemovalWaitPolls >= delayedNativeRemovePolls) finishPendingNativeRemoval();
+      }
       if (waitForHumanDelete && ms === 250) { now += ms; setImmediate(fn); }
       else { now += ms; queueMicrotask(fn); }
       return 1;
     }, clearTimeout() {},
-    URL, AbortSignal, async fetch() { return {ok: true, async blob() { return {type: 'image/png', size: 32}; }}; },
-    FileReader: class { readAsDataURL() { this.result = 'data:image/png;base64,cG5n'; this.onload(); } }
+    URL, AbortSignal, async fetch() { fetchCalls++; return {ok: true, async blob() { return {type: 'image/png', size: 32}; }}; },
+    FileReader: class { readAsDataURL() { fileReaderReads++; this.result = 'data:image/png;base64,cG5n'; this.onload(); } }
   };
+  if (staleListenerMarker) context.__gptBridgeImageWorkerListener = () => {};
   vm.runInNewContext(contentSource, context, {filename: 'content.js'});
-  return {receive: listener, sent, get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, editor, location,
+  return {receive: listener, sent, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
+    get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, get sendClicks() { return sendClicks; },
+    get sendQueries() { return sendQueries; }, get insertTextCalls() { return insertTextCalls; }, get composerEvents() { return composerEvents; },
+    get fetchCalls() { return fetchCalls; }, get fileReaderReads() { return fileReaderReads; },
+    get sendClickedWhenReady() { return sendClickedWhenReady; }, get uploadedFiles() { return uploadedFiles; }, get fileInputs() { return fileInputs; }, get inputEvents() { return inputEvents; },
+    get removeClicks() { return removeClickCount; },
+    get removedUploadNames() { return removedUploadNames; },
+    get uploadReadyState() { return uploadReadyState; }, get uploadReadyChecks() { return uploadReadyChecks; }, editor, location,
     clickMore() { moreButton.click(); }, get deleteMenuOpen() { return menuOpen; },
     setBusy(value) { busyState = value; }, setChallenge(value) { challengeState = value; },
     setControls(value) { controlsState = value; }, setConversationBodies(value) { conversationBodies = value; },
@@ -183,6 +367,12 @@ async function startContent(harness, job = {job_id: 'job-1', expected_model: 'Cr
   return accepted;
 }
 
+async function waitForContentResult(harness) {
+  for (let i = 0; i < 50 && !harness.sent.some(message => message.type === 'image-result' &&
+    (message.imageBase64 || message.error || message.preflightReady === true)); i++)
+    await new Promise(resolve => setImmediate(resolve));
+}
+
 async function startCollect(harness, expectedModel = 'Create image', prompt = 'draw a cat') {
   let accepted;
   harness.receive({type: 'image-collect', job: {job_id: 'job-collect', expected_model: expectedModel, prompt}}, {}, value => { accepted = value; });
@@ -197,6 +387,21 @@ async function startPrepare(harness, expectedModel = 'Create image', prompt) {
   harness.receive({type: 'image-prepare', job}, {}, value => { result = value; });
   await new Promise(resolve => setImmediate(resolve));
   return result;
+}
+
+function imageInput(order, role = 'reference', payload = [order, 17, 34, 51]) {
+  const bytes = Buffer.from(payload);
+  return {
+    order,
+    role,
+    description: `${role} ${order}`,
+    name: `input-${String(order).padStart(3, '0')}.png`,
+    mime: 'image/png',
+    bytes: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    dimensions: {width: 1, height: 1},
+    data_base64: bytes.toString('base64')
+  };
 }
 
 async function primeArchiveTarget(overrides = {}) {
@@ -221,7 +426,7 @@ async function requestDelete(harness, overrides = {}) {
 test('image preparation leaves an already-fresh native image chat unchanged', async () => {
   const h = contentHarness();
   const result = await startPrepare(h);
-  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image', input_protocol: 4, idle: true});
   assert.equal(h.clicks, 0);
   assert.equal(h.editor.value, 'Create image');
 });
@@ -230,7 +435,9 @@ test('inspection selects the visible composer when a hidden retained composer co
   const h = contentHarness({newUi: true, hiddenRetainedEditor: true});
   let result;
   h.receive({type: 'image-inspect'}, {}, value => { result = value; });
-  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
+    upload_dom: {editor_form: true, file_inputs: 1, form_file_inputs: 1, image_inputs: 1, form_image_inputs: 1,
+      multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 0}});
   assert.equal(h.clicks, 0);
   assert.equal(h.editor.innerText, 'Create image');
 });
@@ -238,7 +445,7 @@ test('inspection selects the visible composer when a hidden retained composer co
 test('image preparation turns a completed chat into a fresh native image chat through visible controls', async () => {
   const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'], imageMode: false, hiddenRetainedEditor: true});
   const result = await startPrepare(h);
-  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image', input_protocol: 4, idle: true});
   assert.equal(h.clicks, 3);
   assert.equal(h.editor.innerText, 'Create image');
 });
@@ -246,7 +453,7 @@ test('image preparation turns a completed chat into a fresh native image chat th
 test('image preparation waits for a temporarily unmounted composer and does not submit', async () => {
   const h = contentHarness({editorDelayQueries: 3});
   const result = await startPrepare(h);
-  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image', input_protocol: 4, idle: true});
   assert.equal(h.clicks, 0);
   assert.equal(h.editor.value, 'Create image');
   assert.equal(h.sent.length, 0);
@@ -257,7 +464,7 @@ test('image preparation accepts only a matching unsent image draft', async () =>
   const draft = `Create one image. Return a generated image, not just a description.\n\n${prompt}`;
   const h = contentHarness({draft});
   const result = await startPrepare(h, 'Create image', prompt);
-  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image', input_protocol: 4, idle: true});
   assert.equal(h.editor.value, `Create image ${draft}`);
   assert.equal(h.clicks, 0);
 });
@@ -467,26 +674,123 @@ test('pairing inspection reports native Create image mode without touching the c
   h.receive({type: 'image-inspect'}, {}, value => { result = value; });
   assert.equal(result.fresh, true);
   assert.equal(result.model, 'Create image');
+  assert.equal(result.input_protocol, 4);
+  assert.equal(result.idle, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.upload_dom)), {
+    editor_form: true, file_inputs: 1, form_file_inputs: 1, image_inputs: 1, form_image_inputs: 1,
+    multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 0
+  });
   assert.equal(h.clicks, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.deepEqual(h.inputEvents, []);
+  assert.deepEqual(h.composerEvents, []);
   assert.equal(h.editor.value, 'Create image');
 });
 
 test('pairing inspection rejects a draft or blank model without submitting', () => {
   for (const options of [{draft: 'preserve this draft'}, {imageMode: false}]) {
     const h = contentHarness(options);
+    const originalText = h.editor.value;
     let result;
     h.receive({type: 'image-inspect'}, {}, value => { result = value; });
-    assert.match(result.error, /fresh empty chat|model label is empty|Select native Create image/);
+    assert.match(result.error, /Preserve the draft or running work|Select native Create image/);
+    assert.equal(result.input_protocol, 4);
+    assert.equal(result.idle, options.draft ? false : true);
+    assert.deepEqual(Object.keys(result.upload_dom).sort(), ['attachment_cards', 'editor_form', 'file_inputs',
+      'form_file_inputs', 'form_image_inputs', 'image_inputs', 'multiple_image_inputs', 'unrestricted_inputs']);
+    assert.equal(h.editor.value, originalText);
+    assert.equal(JSON.stringify(result).includes('preserve this draft'), false, 'inspection does not return composer text');
     assert.equal(h.clicks, 0);
   }
+});
+
+test('upload DOM inspection counts only enabled inputs and stays scoped to the editor form', () => {
+  const h = contentHarness({uploadInputSpecs: [
+    {accept: 'image/*,.png', multiple: true, name: 'private-name.png', value: 'private-value'},
+    {accept: '.jpg,.jpeg,image/webp', multiple: false},
+    {accept: '', multiple: false},
+    {accept: 'image/png', multiple: true, disabled: true}
+  ], outsideUploadInput: {accept: 'image/webp', multiple: true, name: 'outside-private.png'}});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+
+  assert.equal(result.fresh, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.upload_dom)), {
+    editor_form: true, file_inputs: 4, form_file_inputs: 3, image_inputs: 3, form_image_inputs: 2,
+    multiple_image_inputs: 2, unrestricted_inputs: 1, attachment_cards: 0
+  });
+  assert.doesNotMatch(JSON.stringify(result.upload_dom), /private|outside|png|jpg|jpeg|webp|image\//i);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.deepEqual(h.inputEvents, []);
+});
+
+test('upload DOM inspection returns safe counts without an editor and isolates property failures', () => {
+  const noEditor = contentHarness({editorAvailable: false, uploadInputSpecs: [
+    {accept: '.jpg', multiple: true}, {accept: '', multiple: false}
+  ], outsideUploadInput: {accept: 'image/*', multiple: true}});
+  let result;
+  noEditor.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.match(result.error, /composer unavailable/);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.upload_dom)), {
+    editor_form: false, file_inputs: 3, form_file_inputs: 0, image_inputs: 2, form_image_inputs: 0,
+    multiple_image_inputs: 2, unrestricted_inputs: 1, attachment_cards: 0
+  });
+
+  const badProperty = contentHarness({uploadInputSpecs: [{throwAccept: true}]});
+  badProperty.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.fresh, true, 'diagnostics cannot turn a successful normal inspection into an error');
+  assert.equal(result.upload_dom.file_inputs, 1);
+  assert.equal(result.upload_dom.image_inputs, 0);
+  assert.equal(badProperty.clicks, 0);
+  assert.deepEqual(badProperty.inputEvents, []);
+});
+
+test('upload DOM diagnostics are included on inspection errors without changing error state', () => {
+  const h = contentHarness({attachments: true, attachmentCardCount: 2});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.match(result.error, /Remove existing attachments/);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.upload_dom)), {
+    editor_form: true, file_inputs: 1, form_file_inputs: 1, image_inputs: 1, form_image_inputs: 1,
+    multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 2
+  });
+  assert.equal(result.idle, false);
+  assert.equal(h.editor.value, 'Create image');
+  assert.equal(h.clicks, 0);
+  assert.deepEqual(h.inputEvents, []);
 });
 
 test('pairing inspection without a job refuses even an otherwise matching image draft', () => {
   const h = contentHarness({draft: 'Create one image. Return a generated image, not just a description.\n\ndraw a cat'});
   let result;
   h.receive({type: 'image-inspect'}, {}, value => { result = value; });
-  assert.match(result.error, /fresh empty chat/);
+  assert.match(result.error, /Preserve the draft or running work/);
+  assert.equal(result.input_protocol, 4);
+  assert.equal(result.idle, false);
   assert.equal(h.clicks, 0);
+});
+
+test('read-only inspection reports idle state without changing drafts, busy work, attachments, or completed chats', () => {
+  const cases = [
+    ['completed chat without image mode', {newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'], imageMode: false}, true,
+      /Select native Create image/],
+    ['unrelated draft', {draft: 'private draft'}, false, /Preserve the draft or running work/],
+    ['busy draft', {busy: true, draft: 'private draft'}, false, /Preserve the draft or running work/],
+    ['existing attachment', {attachments: true}, false, /Remove existing attachments/]
+  ];
+  for (const [name, options, idle, reason] of cases) {
+    const h = contentHarness(options);
+    const originalText = h.editor.value;
+    let result;
+    h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+    assert.equal(result.input_protocol, 4, `${name} advertises the current protocol`);
+    assert.equal(result.idle, idle, `${name} reports native composer idleness`);
+    assert.match(result.error, reason, `${name} still fails the freshness check`);
+    assert.equal(h.editor.value, originalText, `${name} state is preserved`);
+    assert.equal(JSON.stringify(result).includes('private draft'), false, `${name} text is not returned`);
+    assert.equal(h.clicks, 0, `${name} inspection is read-only`);
+  }
 });
 
 test('content refuses an incompatible route before touching the composer', async () => {
@@ -527,6 +831,682 @@ test('matching fresh composer inserts once and clicks only native send once', as
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].error, /Submission attempted/);
   assert.match(h.sent[0].error, /Timed out/);
+});
+
+test('zero-image generation keeps the ordinary prompt and sends without touching a file input', async () => {
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-no-images', expected_model: 'Create image', prompt: 'draw a cat', images: []});
+  await waitForContentResult(h);
+  assert.deepEqual(h.inputEvents, []);
+  assert.equal(h.uploadedFiles.length, 0);
+  assert.equal(h.sendClicks, 1);
+  assert.match(h.editor.value, /^Create one image\. Return a generated image, not just a description\./);
+  assert.match(h.sent.at(-1).error, /Submission attempted/);
+});
+
+test('one-image upload preserves the actual File bytes, name, MIME type, and event order', async () => {
+  const image = imageInput(1, 'reference', [137, 80, 78, 71]);
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-one-image', expected_model: 'Create image', prompt: 'use this reference', images: [image]});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, ['input', 'change'], JSON.stringify(h.sent));
+  assert.equal(h.uploadedFiles.length, 1, JSON.stringify(h.sent));
+  assert.equal(h.uploadedFiles[0].name, image.name);
+  assert.equal(h.uploadedFiles[0].type, image.mime);
+  assert.deepEqual([...h.uploadedFiles[0].bytes], [...Buffer.from(image.data_base64, 'base64')]);
+  assert.equal(h.sendClicks, 1);
+  assert.equal(h.sendClickedWhenReady, true);
+  assert.match(h.editor.value, /Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1/);
+});
+
+test('three-image edit uploads source then references in order and waits for all attachments before Send', async () => {
+  const images = [
+    imageInput(1, 'source', [1, 2, 3]),
+    imageInput(2, 'reference', [4, 5, 6, 7]),
+    imageInput(3, 'reference', [8, 9, 10, 11, 12])
+  ];
+  const h = contentHarness({uploadReadyAfterChecks: 6});
+  await startContent(h, {job_id: 'job-edit-three', expected_model: 'Create image', mode: 'edit', prompt: 'edit the source', images});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, ['input', 'change'], JSON.stringify(h.sent));
+  assert.equal(h.uploadedFiles.length, 3);
+  assert.deepEqual(h.uploadedFiles.map(file => [file.name, file.type, [...file.bytes]]), images.map(image => [
+    image.name, image.mime, [...Buffer.from(image.data_base64, 'base64')]
+  ]));
+  assert.ok(h.uploadReadyChecks > 6, 'the delayed native cards must be checked before Send becomes available');
+  assert.equal(h.sendClicks, 1);
+  assert.equal(h.sendClickedWhenReady, true);
+  assert.match(h.editor.value, /Image 1: SOURCE TO EDIT — source 1\nImage 2: REFERENCE GUIDANCE — reference 2\nImage 3: REFERENCE GUIDANCE — reference 3/);
+});
+
+test('zero-image create preflight returns one readiness receipt without editing or submitting', async () => {
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-preflight-empty-create', expected_model: 'Create image', mode: 'create',
+    prompt: 'draw a cat', images: [], preflight_only: true});
+  await waitForContentResult(h);
+
+  const receipts = h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipts.length, 1);
+  assert.deepEqual(Object.keys(receipts[0]).sort(), ['jobId', 'preflightReady', 'type']);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.uploadedFiles.length, 0);
+  assert.equal(h.editor.value, 'Create image');
+  assert.deepEqual(h.composerEvents, []);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('three-image edit preflight waits for source and references, then leaves their native Files attached', async () => {
+  const images = [
+    imageInput(1, 'source', [21, 22, 23]),
+    imageInput(2, 'reference', [31, 32, 33, 34]),
+    imageInput(3, 'reference', [41, 42, 43, 44, 45])
+  ];
+  const h = contentHarness({uploadReadyAfterChecks: 5});
+  await startContent(h, {job_id: 'job-preflight-edit-three', expected_model: 'Create image', mode: 'edit',
+    prompt: 'edit the source', images, preflight_only: true});
+  await waitForContentResult(h);
+
+  const receipts = h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipts.length, 1);
+  assert.deepEqual(Object.keys(receipts[0]).sort(), ['jobId', 'preflightReady', 'type']);
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.deepEqual(h.uploadedFiles.map(file => [file.name, file.type, [...file.bytes]]), images.map(image => [
+    image.name, image.mime, [...Buffer.from(image.data_base64, 'base64')]
+  ]));
+  assert.ok(h.uploadReadyChecks > 5, 'preflight waits for all visible attachment cards');
+  assert.equal(h.uploadReadyState, true, 'the worker leaves its verified attachments in the composer');
+  assert.equal(h.editor.value, 'Create image');
+  assert.deepEqual(h.composerEvents, []);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('opt-in upload preflight clears zero or one owned image without touching the chat', async t => {
+  await t.test('zero-image preflight returns a cleared receipt without clicking Remove', async () => {
+    const h = contentHarness();
+    await startContent(h, {job_id: 'job-clear-empty', expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [], preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    const receipts = h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true);
+    assert.equal(receipts.length, 1);
+    assert.deepEqual(Object.keys(receipts[0]).sort(), ['jobId', 'preflightReady', 'preflightUploadsCleared', 'type']);
+    assert.equal(receipts[0].preflightUploadsCleared, true);
+    assert.equal(h.removeClicks, 0);
+    assert.equal(h.uploadedFiles.length, 0);
+    assert.deepEqual(h.inputEvents, []);
+    assert.equal(h.editor.value, 'Create image');
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.finalDeleteClicks, 0);
+  });
+
+  await t.test('one-image preflight removes only its verified native card', async () => {
+    const image = imageInput(1);
+    const h = contentHarness();
+    await startContent(h, {job_id: 'job-clear-one', expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [image], preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+    assert.equal(receipt?.preflightUploadsCleared, true);
+    assert.deepEqual(h.removedUploadNames, [image.name]);
+    assert.equal(h.uploadedFiles.length, 0);
+    assert.deepEqual(h.inputEvents, ['input', 'change'], 'cleanup uses native Remove, not a file input reset');
+    assert.equal(h.editor.value, 'Create image');
+    assert.deepEqual(h.composerEvents, []);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.finalDeleteClicks, 0);
+  });
+});
+
+test('opt-in three-image edit preflight removes only its verified files in order', async () => {
+  const images = [imageInput(1, 'source'), imageInput(2, 'reference'), imageInput(3, 'reference')];
+  const h = contentHarness({uploadReadyAfterChecks: 4});
+  await startContent(h, {job_id: 'job-clear-three', expected_model: 'Create image', mode: 'edit',
+    prompt: 'edit the source', images, preflight_only: true, clear_preflight_uploads: true});
+  await waitForContentResult(h);
+
+  const receipts = h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, images.map(image => image.name));
+  assert.equal(h.uploadedFiles.length, 0);
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.editor.value, 'Create image');
+  assert.equal(h.composerEvents.length, 0);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('clear preflight waits for delayed native Remove updates before removing the next file', async () => {
+  const images = [imageInput(1), imageInput(2)];
+  const h = contentHarness({nativeUploadCards: true, reactClearsInputFiles: true, delayedNativeRemovePolls: 2});
+  await startContent(h, {job_id: 'job-clear-delayed-native-remove', expected_model: 'Create image', mode: 'create',
+    prompt: 'draw a cat', images, preflight_only: true, clear_preflight_uploads: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipt?.preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, images.map(image => image.name));
+  assert.deepEqual(h.uploadedFiles, []);
+  assert.deepEqual(h.fileInputs[0].files, [], 'React may clear the FileList independently of its delayed card update');
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('clear preflight flags are validated before upload while explicit false stays backward-compatible', async t => {
+  for (const [name, job] of [
+    ['clear outside preflight', {preflight_only: false, clear_preflight_uploads: true}],
+    ['non-boolean clear flag', {preflight_only: true, clear_preflight_uploads: 'yes'}]
+  ]) await t.test(name, async () => {
+    const h = contentHarness();
+    await startContent(h, {job_id: `job-invalid-clear-${name}`, expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [imageInput(1)], ...job});
+    await waitForContentResult(h);
+    assert.equal(h.inputEvents.length, 0);
+    assert.equal(h.removeClicks, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.match(h.sent.at(-1).error, /clear_preflight_uploads is valid only/);
+  });
+
+  await t.test('false on an ordinary generation leaves normal submission intact', async () => {
+    const h = contentHarness();
+    await startContent(h, {job_id: 'job-clear-false-generation', expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [], clear_preflight_uploads: false});
+    await waitForContentResult(h);
+    assert.equal(h.sendClicks, 1);
+    assert.equal(h.removeClicks, 0);
+    assert.match(h.sent.at(-1).error || '', /Submission attempted/);
+  });
+});
+
+test('clear preflight fails closed if the draft, attachments, Remove control, or readiness changes', async t => {
+  const images = [imageInput(1, 'source'), imageInput(2, 'reference'), imageInput(3, 'reference')];
+  const cases = [
+    ['foreign text before cleanup', {changeDuringUpload: 'text'}, 0, 3],
+    ['foreign attachment before cleanup', {uploadOutside: true}, 0, 3],
+    ['foreign text between removals', {foreignTextAfterRemoveAt: 1}, 1, 2],
+    ['foreign attachment between removals', {foreignAttachmentAfterRemoveAt: 1}, 1, 3],
+    ['Remove control disappears between removals', {removeControlUnavailableAfter: 1}, 1, 2],
+    ['native upload progress persists after Remove', {removeProgressAfterClick: true}, 1, 2]
+  ];
+  for (const [name, options, expectedRemovals, expectedFiles] of cases) await t.test(name, async () => {
+    const h = contentHarness(options);
+    await startContent(h, {job_id: `job-clear-guard-${name}`, expected_model: 'Create image', mode: 'edit',
+      prompt: 'edit the source', images, preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.equal(h.sent.filter(message => message.type === 'image-result').length, 1);
+    assert.match(h.sent.at(-1).error, /Not submitted/);
+    assert.equal(h.removeClicks, expectedRemovals);
+    assert.equal(h.uploadedFiles.length, expectedFiles);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.finalDeleteClicks, 0);
+  });
+});
+
+test('clear preflight rechecks draft, foreign attachments, and chat path during delayed Remove waits', async t => {
+  const images = [imageInput(1, 'source'), imageInput(2, 'reference'), imageInput(3, 'reference')];
+  const matchingPrompt = 'Edit the attached source image(s) following the instructions. Return one edited image.\n' +
+    'Actual attachments, in upload order:\nImage 1: SOURCE TO EDIT — source 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\nImage 3: REFERENCE GUIDANCE — reference 3\n\nedit the source';
+  const cases = [
+    ['foreign composer text', {foreignTextAfterRemoveWaits: 1}, /Preserve composer text/],
+    ['matching job draft', {matchingDraftAfterRemoveWaits: matchingPrompt}, /Preserve composer text/],
+    ['foreign attachment', {foreignAttachmentAfterRemoveWaits: 1}, /Unexpected attachment controls/],
+    ['chat path change', {pathChangeAfterRemoveWaits: 1}, /Composer changed while removing/]
+  ];
+  for (const [name, change, expectedError] of cases) await t.test(name, async () => {
+    const h = contentHarness({nativeUploadCards: true, reactClearsInputFiles: true, delayedNativeRemovePolls: 3, ...change});
+    await startContent(h, {job_id: `job-clear-delayed-guard-${name}`, expected_model: 'Create image', mode: 'edit',
+      prompt: 'edit the source', images, preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.equal(h.removeClicks, 1, 'the first Remove is the only action before the pending-state guard');
+    assert.equal(h.uploadedFiles.length, name === 'foreign attachment' ? images.length + 1 : images.length,
+      'the still-visible attachment cards are preserved while React has not applied removal');
+    assert.match(h.sent.at(-1).error, expectedError);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.finalDeleteClicks, 0);
+  });
+});
+
+test('clear preflight refuses even an exact matching job draft before or between removals', async t => {
+  await t.test('zero-image preflight preserves an exact matching prompt and sends no cleared receipt', async () => {
+    const prompt = 'Create one image. Return a generated image, not just a description.\n\ndraw a cat';
+    const h = contentHarness({draft: prompt});
+    await startContent(h, {job_id: 'job-clear-zero-matching-draft', expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [], preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    assert.equal(h.sent.filter(message => message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, /Preserve composer text/);
+    assert.equal(h.editor.value, `Create image ${prompt}`);
+    assert.equal(h.removeClicks, 0);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+  });
+
+  await t.test('matching original job prompt typed between removals stops further cleanup', async () => {
+    const images = [imageInput(1, 'source'), imageInput(2, 'reference'), imageInput(3, 'reference')];
+    const prompt = 'Edit the attached source image(s) following the instructions. Return one edited image.\n' +
+      'Actual attachments, in upload order:\nImage 1: SOURCE TO EDIT — source 1\n' +
+      'Image 2: REFERENCE GUIDANCE — reference 2\nImage 3: REFERENCE GUIDANCE — reference 3\n\nedit the source';
+    const h = contentHarness({matchingDraftAfterRemoveAt: prompt});
+    await startContent(h, {job_id: 'job-clear-between-matching-draft', expected_model: 'Create image', mode: 'edit',
+      prompt: 'edit the source', images, preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    assert.equal(h.sent.filter(message => message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, /Preserve composer text/);
+    assert.equal(h.removeClicks, 1);
+    assert.deepEqual(h.uploadedFiles.map(file => file.name), images.slice(1).map(image => image.name));
+    assert.equal(h.editor.value, `Create image ${prompt}`);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+  });
+});
+
+test('failed preflight uploads never click or look up Send and never return readiness', async t => {
+  const cases = [
+    ['partial upload', {uploadPartial: true}],
+    ['native upload error', {uploadError: true}],
+    ['missing file input', {uploadInput: false}]
+  ];
+  for (const [name, options] of cases) await t.test(name, async () => {
+    const h = contentHarness(options);
+    await startContent(h, {job_id: `job-preflight-failed-${name}`, expected_model: 'Create image', mode: 'create',
+      prompt: 'draw a cat', images: [imageInput(1), imageInput(2), imageInput(3)], preflight_only: true});
+    await waitForContentResult(h);
+
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.equal(h.sent.length, 1);
+    assert.match(h.sent[0].error, /Not submitted/);
+    assert.equal(h.editor.value, 'Create image');
+    assert.deepEqual(h.composerEvents, []);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.clicks, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+  });
+});
+
+test('edit mode requires a source image and rejects references-only input before upload', async () => {
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-edit-no-source', expected_model: 'Create image', mode: 'edit', prompt: 'edit this',
+    images: [imageInput(1, 'reference')]});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, []);
+  assert.equal(h.sendClicks, 0);
+  assert.match(h.sent.at(-1).error, /Not submitted.*Invalid create\/edit image roles/);
+});
+
+test('upload preflight keeps a sole compatible mixed-purpose input', async () => {
+  const images = [imageInput(1), imageInput(2), imageInput(3)];
+  const h = contentHarness({uploadInputSpecs: [{accept: 'image/*,application/pdf', multiple: true}]});
+  await startContent(h, {job_id: 'job-preflight-one-compatible-input', expected_model: 'Create image',
+    prompt: 'draw', images, preflight_only: true});
+  await waitForContentResult(h);
+
+  assert.ok(h.sent.find(message => message.type === 'image-result' && message.preflightReady === true));
+  assert.deepEqual(h.fileInputs.map(input => input.files.length), [images.length]);
+  assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name));
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+});
+
+test('upload preflight prefers one image-only multi-file input over a general file picker', async () => {
+  const images = [imageInput(1), imageInput(2), imageInput(3)];
+  const h = contentHarness({uploadInputSpecs: [
+    {accept: 'image/*,application/pdf', multiple: true},
+    {accept: '.png,.jpg,.webp', multiple: true}
+  ]});
+  await startContent(h, {job_id: 'job-preflight-dedicated-image-input', expected_model: 'Create image',
+    prompt: 'draw', images, preflight_only: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.ok(receipt, 'the unambiguous image-only input should be selected');
+  assert.deepEqual(h.fileInputs.map(input => input.files.length), [0, images.length],
+    'the general image-and-PDF input stays untouched');
+  assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name),
+    'the dedicated input receives all images in their declared order');
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+});
+
+test('upload preflight rejects ambiguous or mixed-token image inputs before any upload', async t => {
+  const images = [imageInput(1), imageInput(2), imageInput(3)];
+  const cases = [
+    ['two image-only inputs', {uploadInputSpecs: [
+      {accept: 'image/*', multiple: true}, {accept: '.png,.jpg,.webp', multiple: true}
+    ]}, 'compatible=2, image_only=2'],
+    ['mixed image and unknown MIME tokens', {uploadInputSpecs: [
+      {accept: 'image/*,application/pdf', multiple: true},
+      {accept: 'image/png,application/x-unknown', multiple: true}
+    ]}, 'compatible=2, image_only=0']
+  ];
+  for (const [name, options, counts] of cases) await t.test(name, async () => {
+    const h = contentHarness(options);
+    await startContent(h, {job_id: `job-preflight-${name}`, expected_model: 'Create image', prompt: 'draw',
+      images, preflight_only: true});
+    await waitForContentResult(h);
+    assert.deepEqual(h.inputEvents, []);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, new RegExp(`Native image file input missing, ambiguous or incompatible; ${counts}`));
+    assert.doesNotMatch(h.sent.at(-1).error, /image\/\*|application\/|unknown|input-\d/,
+      'the error reports counts only, not accept tokens or file details');
+  });
+});
+
+test('upload preflight rejects missing, outside-form, disabled, incompatible, or non-multiple inputs', async t => {
+  const cases = [
+    ['missing input', {uploadInput: false}, [imageInput(1)], /Native image file input missing, ambiguous or incompatible/],
+    ['only input is outside the form', {uploadInput: false, outsideUploadInput: {accept: 'image/png', multiple: true}},
+      [imageInput(1)], /Native image file input missing, ambiguous or incompatible/],
+    ['blank accept is not an upload fallback', {uploadAccept: ''}, [imageInput(1)],
+      /Native image file input missing, ambiguous or incompatible/],
+    ['missing editor form', {formAvailable: false}, [imageInput(1)], /Native upload composer form unavailable/],
+    ['disabled input', {uploadInputSpecs: [{accept: 'image/png', multiple: true, disabled: true}]},
+      [imageInput(1)], /Native image file input missing, ambiguous or incompatible/],
+    ['wrong accepted MIME', {uploadAccept: 'image/jpeg'}, [imageInput(1)], /Native image file input missing, ambiguous or incompatible/],
+    ['multi-image input without multiple', {uploadMultiple: false},
+      [imageInput(1), imageInput(2), imageInput(3)], /Native image file input missing, ambiguous or incompatible/]
+  ];
+  for (const [name, options, images, expectedError] of cases) await t.test(name, async () => {
+    const h = contentHarness(options);
+    await startContent(h, {job_id: `job-preflight-${name}`, expected_model: 'Create image', prompt: 'draw',
+      images, preflight_only: true});
+    await waitForContentResult(h);
+    assert.deepEqual(h.inputEvents, []);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, new RegExp(`Not submitted.*${expectedError.source}`));
+  });
+});
+
+test('native attachment cards without test IDs block ready status and clear through their matching Remove buttons', async () => {
+  const h = contentHarness({nativeUploadCards: true, nativeAttachmentNames: ['input-001.png', 'input-002.png']});
+  let inspection;
+  h.receive({type: 'image-inspect'}, {}, value => { inspection = value; });
+
+  assert.match(inspection.error, /Remove existing attachments/);
+  assert.equal(inspection.idle, false);
+  assert.equal(inspection.upload_dom.attachment_cards, 2);
+  assert.equal(h.removeClicks, 0, 'inspection never removes existing native attachments');
+
+  const images = [imageInput(1), imageInput(2)];
+  const cleared = contentHarness({nativeUploadCards: true, reactClearsInputFiles: true});
+  await startContent(cleared, {job_id: 'job-native-card-preflight-clear', expected_model: 'Create image',
+    mode: 'create', prompt: 'check ordered references', images, preflight_only: true, clear_preflight_uploads: true});
+  await waitForContentResult(cleared);
+
+  const receipt = cleared.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipt?.preflightUploadsCleared, true);
+  assert.deepEqual(cleared.fileInputs[0].files, [], 'the page may clear input.files after React accepts the Files');
+  assert.deepEqual(cleared.removedUploadNames, images.map(image => image.name));
+  assert.deepEqual(cleared.uploadedFiles, []);
+  assert.deepEqual(cleared.inputEvents, ['input', 'change']);
+  assert.equal(cleared.sendQueries, 0);
+  assert.equal(cleared.sendClicks, 0);
+  assert.equal(cleared.insertTextCalls, 0);
+  assert.equal(cleared.fetchCalls, 0);
+  assert.equal(cleared.fileReaderReads, 0);
+
+  let finalInspection;
+  cleared.receive({type: 'image-inspect'}, {}, value => { finalInspection = value; });
+  assert.equal(finalInspection.fresh, true);
+  assert.equal(finalInspection.idle, true);
+  assert.equal(finalInspection.upload_dom.attachment_cards, 0);
+});
+
+test('cleanup-only preflight removes matching inspected native cards without uploading or sending', async () => {
+  const sourceImages = [imageInput(1), imageInput(2)];
+  const images = sourceImages.map(({data_base64, ...metadata}) => metadata);
+  const h = contentHarness({nativeUploadCards: true, nativeAttachmentNames: images.map(image => image.name), chatPath: '/'});
+  await startContent(h, {job_id: 'job-native-cleanup-only', expected_model: 'Create image', mode: 'create',
+    prompt: 'validate already attached references', images, preflight_only: true, clear_preflight_uploads: true,
+    preflight_cleanup_only: true});
+  await waitForContentResult(h);
+
+  const receipts = h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, images.map(image => image.name));
+  assert.deepEqual(h.uploadedFiles, []);
+  assert.deepEqual(h.fileInputs[0].files, []);
+  assert.deepEqual(h.inputEvents, [], 'cleanup-only never dispatches input/change');
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+  assert.equal(h.sent.some(message => message.type === 'image-result' && message.imageBase64), false);
+});
+
+test('cleanup-only preflight refuses changed or mismatched state before clicking Remove', async t => {
+  const sourceImages = [imageInput(1), imageInput(2)];
+  const metadata = sourceImages.map(({data_base64, ...image}) => image);
+  const duplicateImage = {...metadata[0], order: 2};
+  const cases = [
+    ['changed composer text', {draft: 'changed draft'}, {}, /Inspected preflight draft changed/],
+    ['changed chat path', {chatPath: '/c/123e4567-e89b-12d3-a456-426614174000'}, {}, /Inspected preflight draft changed/],
+    ['temporary chat', {temporaryChat: true}, {}, /Inspected preflight draft changed/],
+    ['existing turns', {user: true}, {}, /Inspected preflight draft changed/],
+    ['busy chat', {busy: true}, {}, /Inspected preflight draft changed/],
+    ['wrong image order', {}, {images: [metadata[1], metadata[0]]}, /Inspected preflight draft changed/],
+    ['missing existing image', {nativeAttachmentNames: ['input-001.png']}, {}, /do not exactly match/],
+    ['unmarked suffix recovery', {nativeAttachmentNames: ['input-002.png']}, {}, /do not exactly match/],
+    ['non-suffix remaining subset', {nativeAttachmentNames: ['input-001.png']}, {}, /do not exactly match/],
+    ['foreign existing image', {nativeAttachmentNames: ['input-001.png', 'input-002.png', 'foreign.png']}, {}, /do not exactly match/],
+    ['duplicate existing image card', {nativeAttachmentNames: ['input-001.png', 'input-001.png']}, {}, /do not exactly match/],
+    ['duplicate requested image name', {}, {images: [metadata[0], duplicateImage]}, /Inspected preflight draft changed/],
+    ['byte payload included', {}, {images: sourceImages}, /Inspected preflight draft changed/],
+    ['clear flag false', {}, {clear_preflight_uploads: false}, /Invalid cleanup-only preflight/],
+    ['preflight flag false', {}, {preflight_only: false}, /clear_preflight_uploads is valid only/]
+  ];
+
+  for (const [name, harnessOptions, jobOptions, expectedError] of cases) await t.test(name, async () => {
+    const h = contentHarness({nativeUploadCards: true, chatPath: '/', ...harnessOptions});
+    await startContent(h, {job_id: `job-native-cleanup-refusal-${name}`, expected_model: 'Create image', mode: 'create',
+      prompt: 'validate already attached references', images: metadata, preflight_only: true,
+      clear_preflight_uploads: true, preflight_cleanup_only: true, ...jobOptions});
+    await waitForContentResult(h);
+
+    assert.equal(h.removeClicks, 0, 'refusal preserves all existing attachment cards');
+    assert.deepEqual(h.removedUploadNames, []);
+    assert.deepEqual(h.inputEvents, [], 'refusal never dispatches input/change');
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, expectedError);
+  });
+});
+
+test('cleanup-only preflight recovery binds and clears only the exact remaining ordered suffix', async () => {
+  const sourceImages = [imageInput(1), imageInput(2), imageInput(3)];
+  const images = sourceImages.map(({data_base64, ...metadata}) => metadata);
+  const suffix = images.slice(-1);
+  const h = contentHarness({nativeUploadCards: true, nativeAttachmentNames: suffix.map(image => image.name), chatPath: '/'});
+  await startContent(h, {job_id: 'job-native-cleanup-suffix-recovery', expected_model: 'Create image', mode: 'create',
+    prompt: 'validate already attached references', images, preflight_only: true, clear_preflight_uploads: true,
+    preflight_cleanup_only: true, preflight_cleanup_resumed: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.equal(receipt?.preflightUploadsCleared, true);
+  assert.deepEqual(h.removedUploadNames, suffix.map(image => image.name));
+  assert.deepEqual(h.uploadedFiles, []);
+  assert.deepEqual(h.inputEvents, [], 'cleanup-only recovery never re-uploads files');
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
+});
+
+test('unpaired native thumbnail blocks inspection and cleanup without a Remove control', async () => {
+  const sourceImages = [imageInput(1), imageInput(2)];
+  const images = sourceImages.map(({data_base64, ...image}) => image);
+  const h = contentHarness({nativeUploadCards: true, nativeAttachmentNames: images.map(image => image.name),
+    nativeUnpairedThumbnail: true, chatPath: '/'});
+  let inspection;
+  h.receive({type: 'image-inspect'}, {}, value => { inspection = value; });
+
+  assert.match(inspection.error, /Remove existing attachments/);
+  assert.equal(inspection.idle, false);
+  assert.equal(h.removeClicks, 0);
+
+  await startContent(h, {job_id: 'job-unpaired-native-thumbnail', expected_model: 'Create image', mode: 'create',
+    prompt: 'validate already attached references', images, preflight_only: true, clear_preflight_uploads: true,
+    preflight_cleanup_only: true});
+  await waitForContentResult(h);
+
+  assert.equal(h.removeClicks, 0);
+  assert.deepEqual(h.removedUploadNames, []);
+  assert.deepEqual(h.inputEvents, []);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+  assert.match(h.sent.at(-1).error, /Unrecognized attachment thumbnail/);
+});
+
+test('native no-test-ID preflight refuses foreign, unverified, missing-Remove, or ambiguous attachments', async t => {
+  const images = [imageInput(1), imageInput(2)];
+  const cases = [
+    ['foreign attachment with a duplicate name', {nativeForeignOnUpload: 'input-001.png'}, /Unexpected attachment controls/],
+    ['foreign attachment with a different name', {nativeForeignOnUpload: 'foreign.png'}, /Unexpected attachment controls/],
+    ['missing thumbnail', {nativeNoThumbnail: true}, /Native uploads not verified ready/],
+    ['missing visible Remove', {uploadMissingRemove: true}, /Native uploads not verified ready/],
+    ['ambiguous card with multiple Remove controls', {nativeAmbiguousContainer: true}, /Unrecognized attachment thumbnail/]
+  ];
+  for (const [name, options, expectedError] of cases) await t.test(name, async () => {
+    const h = contentHarness({nativeUploadCards: true, reactClearsInputFiles: true, ...options});
+    await startContent(h, {job_id: `job-native-unsafe-${name}`, expected_model: 'Create image', mode: 'create',
+      prompt: 'check ordered references', images, preflight_only: true, clear_preflight_uploads: true});
+    await waitForContentResult(h);
+
+    assert.deepEqual(h.fileInputs[0].files, [], 'React has cleared the native FileList');
+    assert.deepEqual(h.removedUploadNames, [], 'unverified or foreign cards are never removed');
+    assert.equal(h.sent.filter(message => message.type === 'image-result' && message.preflightReady === true).length, 0);
+    assert.match(h.sent.at(-1).error, new RegExp(expectedError.source));
+    assert.equal(h.sendQueries, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.insertTextCalls, 0);
+    assert.equal(h.fetchCalls, 0);
+    assert.equal(h.fileReaderReads, 0);
+  });
+});
+
+test('partial, reordered, errored, or out-of-scope native uploads never reach Send', async t => {
+  const cases = [
+    ['partial upload', {uploadPartial: true}, /Native uploads not verified ready/],
+    ['reordered upload', {uploadReorder: true}, /Native uploads not verified ready/],
+    ['native upload error', {uploadError: true}, /Native attachment error/],
+    ['attachment outside composer', {uploadOutside: true}, /Unexpected attachments outside this job's composer/],
+    ['missing remove control', {uploadMissingRemove: true}, /Native uploads not verified ready/],
+    ['missing loaded thumbnail', {uploadMissingThumbnail: true}, /Native uploads not verified ready/],
+    ['upload remains pending', {uploadNeverReady: true}, /Native uploads not verified ready/]
+  ];
+  for (const [name, options, expected] of cases) await t.test(name, async () => {
+    const h = contentHarness(options);
+    await startContent(h, {job_id: `job-upload-failure-${name}`, expected_model: 'Create image', prompt: 'draw',
+      images: [imageInput(1), imageInput(2), imageInput(3)]});
+    await waitForContentResult(h);
+    assert.deepEqual(h.inputEvents, ['input', 'change']);
+    assert.equal(h.sendClicks, 0);
+    assert.match(h.sent.at(-1).error, expected);
+  });
+});
+
+test('composer changes while uploads are pending stop before text insertion or Send', async () => {
+  const h = contentHarness({uploadReadyAfterChecks: 4, changeDuringUpload: 'text'});
+  await startContent(h, {job_id: 'job-upload-composer-change', expected_model: 'Create image', prompt: 'draw', images: [imageInput(1)]});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.sendClicks, 0);
+  assert.match(h.sent.at(-1).error, /Not submitted.*fresh empty chat/);
+  assert.match(h.editor.value, /changed during upload/);
+});
+
+test('attachments removed after readiness but before Send fail closed', async () => {
+  const h = contentHarness({uploadRemovedBeforeSend: true});
+  await startContent(h, {job_id: 'job-removed-before-send', expected_model: 'Create image', prompt: 'draw', images: [imageInput(1)]});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.sendClicks, 0, 'Send must not be clicked after the native attachment disappears');
+  assert.match(h.sent.at(-1).error, /Not submitted.*(?:attachment|upload)/i);
+});
+
+test('base64 bytes that do not match the declared SHA-256 are rejected before upload or Send', async () => {
+  const image = imageInput(1);
+  image.data_base64 = Buffer.from([99, 98, 97, 96]).toString('base64');
+  const h = contentHarness();
+  await startContent(h, {job_id: 'job-corrupt-image', expected_model: 'Create image', prompt: 'draw', images: [image]});
+  await waitForContentResult(h);
+
+  assert.deepEqual(h.inputEvents, []);
+  assert.equal(h.sendClicks, 0);
+  assert.match(h.sent.at(-1).error, /Not submitted.*Input byte integrity check failed/);
 });
 
 test('current ChatGPT contenteditable UI inserts exact prompt and clicks native send once', async () => {
@@ -677,6 +1657,18 @@ test('verification after sending stops for owner inspection without retry', asyn
   assert.match(h.sent[0].error, /Submission attempted.*Owner action required/);
 });
 
+test('content listener reinjection is idempotent and ignores an unregistered stale marker', () => {
+  const h = contentHarness();
+  assert.equal(h.contentListenerCount, 1);
+  h.rerunContent();
+  assert.equal(h.contentListenerCount, 1);
+
+  const stale = contentHarness({staleListenerMarker: true});
+  assert.equal(stale.contentListenerCount, 1);
+  stale.rerunContent();
+  assert.equal(stale.contentListenerCount, 1);
+});
+
 function workerHarness({config = {token: 'x'.repeat(40), tabId: 7, clientId: 'client'}, active = {jobId: 'job-1', tabId: 7}} = {}) {
   let listener;
   const calls = [];
@@ -686,7 +1678,7 @@ function workerHarness({config = {token: 'x'.repeat(40), tabId: 7, clientId: 'cl
       async get(keys) { const out = {}; for (const key of (Array.isArray(keys) ? keys : [keys])) out[key] = storage[key]; return out; },
       async remove(key) { delete storage[key]; }, async set(value) { Object.assign(storage, value); }
     }},
-    runtime: {onMessage: {addListener(fn) { listener = fn; }}},
+    runtime: {getManifest: () => ({version: '0.1.12'}), onMessage: {addListener(fn) { listener = fn; }}},
     alarms: {onAlarm: {addListener() {}}, async clear() {}, async create() {}},
     tabs: {async sendMessage() {}}
   };

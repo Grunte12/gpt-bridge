@@ -1,8 +1,51 @@
 // No cookies, webRequest, debugger, CDP, screenshots or ChatGPT backend calls.
 const endpoint = "http://127.0.0.1:18767";
+const workerVersion = chrome.runtime.getManifest().version;
 let polling = false;
 let managing = false;
 let finishing = false;
+let receiverRecoveryTab = null;
+const maxInputBytes = 8 * 1024 * 1024; // Bridge messaging budget, not a provider count limit.
+const imageMetadata = image => Object.fromEntries(
+  ["order", "role", "description", "name", "mime", "bytes", "sha256", "dimensions"].map(key => [key, image[key]]));
+const jobMetadata = job => ({job_id: job.job_id, prompt: job.prompt, expected_model: job.expected_model,
+  mode: job.mode || "create", ...(job.preflight_only === true ? {preflight_only: true} : {}),
+  ...(job.clear_preflight_uploads === true ? {clear_preflight_uploads: true} : {}),
+  ...(job.preflight_cleanup_only === true ? {preflight_cleanup_only: true} : {}),
+  ...(job.preflight_cleanup_resumed === true ? {preflight_cleanup_resumed: true} : {}),
+  ...(job.images?.length ? {images: job.images.map(imageMetadata)} : {})});
+function validateImages(job) {
+  const mode = job.mode || "create", images = job.images || [];
+  if (!["create", "edit"].includes(mode) || !Array.isArray(images)) throw new Error("Invalid image mode or inputs");
+  if (job.preflight_only !== undefined && typeof job.preflight_only !== "boolean") throw new Error("Invalid preflight flag");
+  if (job.clear_preflight_uploads !== undefined && (typeof job.clear_preflight_uploads !== "boolean" ||
+      (job.clear_preflight_uploads && !job.preflight_only))) throw new Error("Invalid preflight upload clearing flag");
+  if (job.preflight_cleanup_only !== undefined && (typeof job.preflight_cleanup_only !== "boolean" ||
+      (job.preflight_cleanup_only && (!job.preflight_only || !job.clear_preflight_uploads || !images.length))))
+    throw new Error("Invalid cleanup-only preflight");
+  if (job.preflight_cleanup_resumed !== undefined && (typeof job.preflight_cleanup_resumed !== "boolean" ||
+      (job.preflight_cleanup_resumed && !job.preflight_cleanup_only)))
+    throw new Error("Invalid inspected cleanup resume");
+  let total = 0;
+  for (const [index, image] of images.entries()) {
+    if (!image || image.order !== index + 1 || !["source", "reference"].includes(image.role) ||
+        typeof image.description !== "string" || !image.description.trim() || image.description.length > 200 ||
+        !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) ||
+        !["image/png", "image/jpeg", "image/webp"].includes(image.mime) ||
+        !Number.isInteger(image.bytes) || image.bytes <= 0 || image.bytes > maxInputBytes ||
+        (job.preflight_cleanup_only ? image.data_base64 !== undefined :
+          typeof image.data_base64 !== "string" || image.data_base64.length !== 4 * Math.ceil(image.bytes / 3) ||
+          !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)) || !/^[a-f0-9]{64}$/.test(image.sha256))
+      throw new Error("Invalid ordered local image payload");
+    total += image.bytes;
+    if (total > maxInputBytes) throw new Error("Inputs exceed the 8 MiB Bridge transport budget");
+  }
+  if (mode === "edit" && !images.some(image => image.role === "source")) throw new Error("Edit requires a source image");
+  if (mode === "create" && images.some(image => image.role === "source")) throw new Error("Create accepts references, not edit sources");
+}
+const publicJob = job => job ? Object.fromEntries(Object.entries(job)
+  .filter(([key]) => !["prompt", "client_id", "data_base64", "path"].includes(key))
+  .map(([key, value]) => [key, key === "images" ? (Array.isArray(value) ? value.map(imageMetadata) : []) : value])) : null;
 async function request(config, path, data) {
   const response = await fetch(endpoint + path, {method: "POST", cache: "no-store",
     headers: {"Authorization": "Bearer " + config.token, "Content-Type": "application/json"},
@@ -17,7 +60,15 @@ async function publicStatus() {
   const {config, connection: status, active, lastJob} = await chrome.storage.local.get(["config", "connection", "active", "lastJob"]);
   return {configured: !!config, account: config?.account, tabId: config?.tabId,
     connection: status || {state: config ? "checking" : "unpaired"},
-    active: active ? {jobId: active.jobId} : null, lastJob: lastJob || null};
+    active: active ? {jobId: active.jobId} : null, lastJob: publicJob(lastJob)};
+}
+function uploadDomDiagnostic(value) {
+  const counts = ["file_inputs", "form_file_inputs", "image_inputs", "form_image_inputs",
+    "multiple_image_inputs", "unrestricted_inputs", "attachment_cards"];
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).length !== counts.length + 1 || typeof value.editor_form !== "boolean" ||
+      counts.some(key => !Number.isInteger(value[key]) || value[key] < 0 || value[key] > 10000)) return null;
+  return {editor_form: value.editor_form, ...Object.fromEntries(counts.map(key => [key, value[key]]))};
 }
 async function poll() {
   if (polling || managing) return;
@@ -32,22 +83,64 @@ async function poll() {
     }
     if (finishing) {
       await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-        visible_model: "Create image", tab_ready: false});
+        visible_model: "Create image", tab_ready: false, worker_version: workerVersion,
+        content_receiver: "unreported", receiver_error: ""});
       return;
     }
-    let ready = {fresh: false}, available = false;
+    let ready = {fresh: false}, available = false, tab;
+    let contentReceiver = "tab_missing", receiverError = "tab_missing";
     try {
-      const tab = await chrome.tabs.get(config.tabId);
+      tab = await chrome.tabs.get(config.tabId);
+    } catch (_) { /* Never forward native exception text, which may include private URLs. */ }
+    if (tab) {
+      contentReceiver = "wrong_origin";
+      receiverError = "wrong_origin";
       // activeTab grants may expire after extension reload. A successful message
       // to our ChatGPT-only content script still verifies the paired receiver;
       // do not mistake a redacted tab URL for a closed tab or ask for tabs access.
-      if (!tab.url || new URL(tab.url).origin === "https://chatgpt.com") {
-        ready = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect"}) || ready;
-        available = true;
+      let chatgptTab = !tab.url;
+      try { if (tab.url) chatgptTab = new URL(tab.url).origin === "https://chatgpt.com"; } catch (_) {}
+      if (chatgptTab) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const inspected = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect"});
+            if (inspected && typeof inspected === "object" &&
+                (typeof inspected.fresh === "boolean" || typeof inspected.error === "string")) {
+              ready = inspected;
+              available = true;
+              contentReceiver = "available";
+              receiverError = "";
+              receiverRecoveryTab = null;
+            } else {
+              contentReceiver = "invalid_reply";
+              receiverError = "invalid_reply";
+            }
+          } catch (error) {
+            contentReceiver = "unavailable";
+            const message = String(error?.message || "");
+            receiverError = /receiving end does not exist|could not establish connection/i.test(message) ? "no_receiver"
+              : /message port closed|message channel closed/i.test(message) ? "port_closed" : "message_failed";
+            // Reattach only our bundled listener; never navigate or change a draft.
+            if (attempt === 0 && receiverError === "no_receiver" && !active && tab.url &&
+                receiverRecoveryTab !== config.tabId && chrome.scripting?.executeScript) {
+              receiverRecoveryTab = config.tabId;
+              try {
+                await chrome.scripting.executeScript({target: {tabId: config.tabId}, files: ["content.js"]});
+                continue;
+              } catch (_) { /* Preserve the tab and expose no_receiver; no repeated recovery. */ }
+            }
+          }
+          break;
+        }
       }
-    } catch (_) { /* A missing tab never changes the account or creates another tab. */ }
+    }
     await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-      visible_model: "Create image", tab_ready: ready.fresh === true && ready.model === "Create image"});
+      visible_model: "Create image", tab_ready: ready.fresh === true && ready.model === "Create image",
+      input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
+      tab_idle: typeof ready.idle === "boolean" ? ready.idle : null,
+      tab_error: receiverError ? "Native tab inspection failed: " + receiverError : String(ready.error || "").slice(0, 300),
+      worker_version: workerVersion, content_receiver: contentReceiver, receiver_error: receiverError,
+      upload_dom: uploadDomDiagnostic(ready.upload_dom)});
     if (active) {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
@@ -63,23 +156,42 @@ async function poll() {
       }
     }
     if (!available) {
-      await connection("needs_tab", "เปิดแท็บ ChatGPT ที่เชื่อมไว้ หรือเชื่อมแท็บ second ใหม่ในตัวเลือก");
+      await connection("needs_tab", receiverError === "no_receiver"
+        ? "ตัวรับในแท็บเดิมยังไม่พร้อม ตรวจสิทธิ์ส่วนขยายบน chatgpt.com ไม่ต้องจับคู่หรือกรอกรหัสใหม่"
+        : "เปิดแท็บ ChatGPT ที่เชื่อมไว้ หรือเชื่อมแท็บ second ใหม่ในตัวเลือก");
       return;
     }
     await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");
     // Claims are durable and at-most-once. An extension restart never replays a job.
     const job = await request(config, "/next", {client_id: config.clientId});
     if (!job.job_id) return;
-    await chrome.storage.local.set({active: {jobId: job.job_id, tabId: config.tabId, job}});
-    await connection("busy", "กำลังสร้างภาพ ไม่ต้องพิมพ์ในแท็บที่เชื่อมไว้");
     try {
-      if (ready.fresh !== true || ready.model !== "Create image") {
-        const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare", job});
+      validateImages(job);
+      // Keep source bytes only in this one delivery, never extension storage/replay.
+      const metadata = jobMetadata(job);
+      await chrome.storage.local.set({active: {jobId: job.job_id, tabId: config.tabId, job: metadata}});
+      await connection("busy", job.preflight_only
+        ? "กำลังตรวจอัปโหลดเท่านั้น ไม่ส่งข้อความหรือสร้างภาพ"
+        : "กำลังสร้างภาพ ไม่ต้องพิมพ์ในแท็บที่เชื่อมไว้");
+      if (!job.preflight_cleanup_only && (ready.fresh !== true || ready.model !== "Create image")) {
+        const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare", job: metadata});
         if (prepared?.fresh !== true || prepared.model !== "Create image")
           throw new Error(prepared?.error || "Native image chat could not be prepared");
+        ready = prepared;
         await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-          visible_model: "Create image", tab_ready: true});
+          visible_model: "Create image", tab_ready: true,
+          input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
+          tab_idle: typeof ready.idle === "boolean" ? ready.idle : null, tab_error: "",
+          worker_version: workerVersion, content_receiver: "available", receiver_error: ""});
       }
+      if ((job.images?.length || job.mode === "edit") && ![1, 2, 3, 4].includes(ready.input_protocol))
+        throw new Error("Refresh the paired ChatGPT tab to load local image input support; not submitted");
+      if (job.preflight_only && ![2, 3, 4].includes(ready.input_protocol))
+        throw new Error("Refresh the paired ChatGPT tab for no-Send preflight support; not submitted");
+      if (job.clear_preflight_uploads && ![3, 4].includes(ready.input_protocol))
+        throw new Error("Protocol 3 is required to clear verified preflight uploads; not submitted");
+      if (job.preflight_cleanup_only && ready.input_protocol !== 4)
+        throw new Error("Protocol 4 is required to clear an inspected failed preflight");
       const accepted = await chrome.tabs.sendMessage(config.tabId, {type: "image-job", job});
       if (!accepted?.accepted) throw new Error("Content worker did not accept this job");
     } catch (error) {
@@ -133,7 +245,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         throw new Error(ready?.error || "ยังตรวจแชตว่างและโมเดลไม่ได้ รีเฟรชแท็บ ChatGPT แล้วเชื่อมใหม่");
       const config = {token, tabId: message.tabId,
         clientId: saved?.account === "second" && typeof saved.clientId === "string" ? saved.clientId : crypto.randomUUID(), account: "second"};
-      await request(config, "/pair", {client_id: config.clientId, account: config.account, visible_model: ready.model});
+      await request(config, "/pair", {client_id: config.clientId, account: config.account, visible_model: ready.model,
+        input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0});
       await chrome.storage.local.set({config});
       resumePolling = true;
       await connection("ready", "รอคำสั่งสร้างภาพจากเอเจนต์ได้เลย");
@@ -156,6 +269,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);
       if (!config || !active || message.tabId !== config.tabId || active.tabId !== config.tabId)
         throw new Error("เปิดแท็บเดิมที่กำลังรับงานก่อน รับภาพได้เท่านั้น ไม่ส่งงานใหม่");
+      if (active.job?.preflight_only) throw new Error("Preflight never generates an image to collect");
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (state.state !== "claimed") throw new Error("งานนี้ไม่ได้อยู่ในสถานะรอรับภาพ");
       if (active.job?.job_id !== active.jobId || typeof active.job.prompt !== "string" ||
@@ -186,6 +300,15 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       if (!config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
           new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId)
         throw new Error("Result is not from the paired job/tab");
+      if (!message.error && active.job?.preflight_only && (message.preflightReady !== true || message.imageBase64 || message.chatPath))
+        throw new Error("Preflight cannot accept generated media or cleanup");
+      if (message.preflightUploadsCleared !== undefined && typeof message.preflightUploadsCleared !== "boolean")
+        throw new Error("Invalid preflight clearing receipt");
+      if (message.preflightUploadsCleared === true && !active.job?.clear_preflight_uploads)
+        throw new Error("Preflight upload clearing was not requested");
+      if (!message.error && active.job?.clear_preflight_uploads && message.preflightUploadsCleared !== true)
+        throw new Error("Verified preflight upload clearing receipt is required");
+      if (message.preflightReady && !active.job?.preflight_only) throw new Error("Generation requires a saved image, not a readiness receipt");
       // ChatGPT changes chats through SPA navigation; sender.url can retain the
       // previous document path. The paired content receiver verifies the live
       // path and original prompt again before it opens Delete confirmation.
@@ -194,7 +317,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       let result;
       try {
         result = await request(config, "/result", {client_id: config.clientId, job_id: active.jobId,
-          ...(message.error ? {error: message.error} : {image_base64: message.imageBase64, cleanup_pending: cleanup,
+          ...(message.error ? {error: message.error} : active.job?.preflight_only ? {preflight_ready: true,
+            ...(message.preflightUploadsCleared === true ? {preflight_uploads_cleared: true} : {})} : {image_base64: message.imageBase64, cleanup_pending: cleanup,
             ...(cleanup ? {chat_path: message.chatPath} : {})})});
         if (cleanup && result.state === "complete") {
           let removed;
@@ -212,8 +336,11 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         }
         await chrome.storage.local.set({lastJob: result});
         await chrome.storage.local.remove("active");
-        await connection(message.error ? "failed" : "complete", message.error
+        await connection(message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", message.error
           ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
+          : active.job?.preflight_only ? result.preflight_uploads_cleared
+            ? "ตรวจอัปโหลดผ่านและนำไฟล์แนบทดสอบออกแล้ว แท็บว่าง ไม่มีการส่งหรือเจนภาพ"
+            : "ตรวจอัปโหลดพร้อมแล้ว ยังไม่ส่งและไม่เจนภาพ ดราฟต์ทดสอบยังอยู่ในแท็บเดิม"
           : cleanup && result.cleanup_status !== "deleted"
             ? "รับไฟล์ภาพแล้ว แต่ยังยืนยันการลบไม่ได้ ตรวจแชตเดิม ไม่ต้องเจนซ้ำ"
             : cleanup ? "รับไฟล์ภาพและลบแชตแล้ว พร้อมรับภาพถัดไป"

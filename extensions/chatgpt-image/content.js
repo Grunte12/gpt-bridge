@@ -1,8 +1,11 @@
 // Operates only the ordinary visible composer and its newly generated image.
 // UI changes fail closed; never call private ChatGPT APIs or solve verification.
 (() => {
+  const installed = globalThis.__gptBridgeImageWorkerListener;
+  if (installed && chrome.runtime.onMessage.hasListener(installed)) return;
   let running = false;
   let cleanupTarget = null;
+  let uploadBinding = null;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const visible = el => !!el && el.getClientRects().length > 0;
   const normalizedText = text => text.replace(/\s+/g, " ").trim();
@@ -13,7 +16,13 @@
     const chip = imageChip(element);
     return normalizedText(chip ? text.replace(chip.innerText, " ") : text);
   };
-  const jobPrompt = job => "Create one image. Return a generated image, not just a description.\n\n" + job.prompt;
+  const jobPrompt = job => {
+    const images = job.images || [];
+    const roles = images.map((image, index) => `Image ${index + 1}: ${image.role === "source" ? "SOURCE TO EDIT" : "REFERENCE GUIDANCE"} — ${image.description}`).join("\n");
+    const intent = job.mode === "edit" ? "Edit the attached source image(s) following the instructions. Return one edited image." :
+      "Create one image. Return a generated image, not just a description.";
+    return intent + (roles ? "\nActual attachments, in upload order:\n" + roles : "") + "\n\n" + job.prompt;
+  };
   const matchingDraft = (job, editor) => typeof job?.prompt === "string" &&
     visible(imageChip(editor)) && promptText(editor) === normalizedText(jobPrompt(job));
   const busy = () => visible(document.querySelector('[data-testid="stop-button"], button[aria-label="Stop"]'));
@@ -26,6 +35,221 @@
   const editorElement = () => [...document.querySelectorAll('#prompt-textarea[contenteditable="true"], textarea#prompt-textarea, [role="textbox"][contenteditable="true"][aria-label="Ask ChatGPT"]')].find(visible);
   const hasTurns = () => assistants().length || document.querySelector('[data-message-author-role="user"]') ||
     turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length;
+  const attachmentSelector = '[data-testid="attachment-preview"], [data-testid="file-thumbnail"]';
+  const removeAttachmentSelector = 'button[aria-label^="Remove "]';
+  function attachmentCards(root = document) {
+    const cards = [...root.querySelectorAll(attachmentSelector)];
+    for (const remove of root.querySelectorAll(removeAttachmentSelector)) {
+      if (cards.some(card => card.contains(remove))) continue;
+      const name = remove.getAttribute("aria-label").slice("Remove ".length);
+      // Current native image cards have no test id; bind thumbnail and Remove by the same filename.
+      for (let card = remove.parentElement; card && card !== root; card = card.parentElement) {
+        const images = [...card.querySelectorAll("img")];
+        const buttons = [...card.querySelectorAll(removeAttachmentSelector)];
+        if (buttons.length > 1) break;
+        if (buttons.length === 1 && images.some(image => image.alt === name)) {
+          cards.push(card);
+          break;
+        }
+      }
+    }
+    return [...new Set(cards)].sort((a, b) => {
+      if (a === b || typeof a.compareDocumentPosition !== "function") return 0;
+      return a.compareDocumentPosition(b) & 2 ? 1 : -1;
+    });
+  }
+  function uploadDomDiagnostics() {
+    const counts = {editor_form: false, file_inputs: 0, form_file_inputs: 0, image_inputs: 0,
+      form_image_inputs: 0, multiple_image_inputs: 0, unrestricted_inputs: 0, attachment_cards: 0};
+    const queryAll = (root, selector) => {
+      try { return [...root.querySelectorAll(selector)]; } catch { return []; }
+    };
+    let form = null;
+    try {
+      const editor = editorElement();
+      form = editor?.closest("form") || null;
+    } catch {}
+    counts.editor_form = !!form;
+    const imageAccepts = new Set(["image/*", "image/png", "image/jpeg", "image/webp", ".png", ".jpg", ".jpeg", ".webp"]);
+    const countInputs = (inputs, inForm = false) => {
+      for (const input of inputs) {
+        try { if (input.disabled) continue; } catch { continue; }
+        const fileKey = inForm ? "form_file_inputs" : "file_inputs";
+        counts[fileKey] = Math.min(10000, counts[fileKey] + 1);
+        let accept = null;
+        try { if (typeof input.accept === "string") accept = input.accept; } catch {}
+        const accepts = accept?.toLowerCase().split(",").map(value => value.trim()) || [];
+        const image = accepts.some(value => imageAccepts.has(value));
+        if (image) {
+          const imageKey = inForm ? "form_image_inputs" : "image_inputs";
+          counts[imageKey] = Math.min(10000, counts[imageKey] + 1);
+          if (!inForm) try {
+            if (input.multiple) counts.multiple_image_inputs = Math.min(10000, counts.multiple_image_inputs + 1);
+          } catch {}
+        }
+        if (!inForm && accept !== null && accept.trim() === "")
+          counts.unrestricted_inputs = Math.min(10000, counts.unrestricted_inputs + 1);
+      }
+    };
+    countInputs(queryAll(document, 'input[type="file"]'));
+    if (form) countInputs(queryAll(form, 'input[type="file"]'), true);
+    counts.attachment_cards = Math.min(10000, attachmentCards(form || document).length);
+    return counts;
+  }
+  const attachmentsPresent = () => [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length) ||
+    document.querySelector('[data-testid="file-upload-progress"], ' + attachmentSelector) ||
+    [...(editorElement()?.closest("form")?.querySelectorAll(removeAttachmentSelector + ', img, [role="progressbar"], [aria-busy="true"]') || [])].some(visible);
+  function ownedUploads(job) {
+    return uploadBinding && uploadBinding.jobId === job?.job_id && uploadBinding.path === location.pathname &&
+      uploadBinding.editor === editorElement() && uploadBinding.names.join("\n") === (job.images || []).map(image => image.name).join("\n");
+  }
+  function verifiedUploadCards(job) {
+    if (!ownedUploads(job)) return false;
+    const scope = uploadBinding.scope;
+    if (attachmentCards().some(card => !scope.contains(card)) ||
+        [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length && !scope.contains(input)))
+      throw new Error("Unexpected attachments outside this job's composer");
+    if (scope.querySelector('[data-testid="file-upload-progress"], [role="progressbar"], [aria-busy="true"]')) return null;
+    if (scope.querySelector('[role="alert"], [data-testid="file-upload-error"]'))
+      throw new Error("Native attachment error; inspect the unsent draft");
+    // These markers are checked conservatively. Unknown native UI is NOT proof
+    // of readiness; live compatibility must be verified separately from mocks.
+    const cards = attachmentCards(scope).filter(visible);
+    if ([...scope.querySelectorAll("img")].some(image => visible(image) && !cards.some(card => card.contains(image))))
+      throw new Error("Unrecognized attachment thumbnail; inspect the unsent draft");
+    const removes = [...scope.querySelectorAll(removeAttachmentSelector)].filter(visible);
+    if (removes.length > uploadBinding.names.length)
+      throw new Error("Unexpected attachment controls in this job's composer; inspect the unsent draft");
+    if (cards.length !== uploadBinding.names.length) return null;
+    const valid = cards.every((card, index) => {
+      const name = uploadBinding.names[index];
+      const labels = [card.textContent, card.getAttribute("aria-label"), card.getAttribute("title"),
+        ...[...card.querySelectorAll("img")].map(img => img.alt)].filter(Boolean).join(" ");
+      const exactName = labels.split(/\s+/).includes(name);
+      const remove = [...card.querySelectorAll("button")].some(button => visible(button) && !button.disabled &&
+        button.getAttribute("aria-label") === `Remove ${name}`);
+      const thumbnail = [...card.querySelectorAll("img")].some(img => visible(img) && img.complete && img.naturalWidth > 0);
+      return exactName && remove && thumbnail;
+    });
+    return valid ? cards : null;
+  }
+  function uploadsReady(job) {
+    return !!verifiedUploadCards(job);
+  }
+  async function clearPreflightUploads(job, editor) {
+    const path = location.pathname;
+    const remaining = {...job, images: [...(job.images || [])]};
+    const inspectEmptyDraft = currentJob => {
+      if (location.pathname !== path || editorElement() !== editor)
+        throw new Error("Composer changed while removing this job's attachments; inspect the unsent draft");
+      if (promptText(editor) !== "") throw new Error("Preserve composer text while clearing test uploads; nothing was submitted");
+      const current = inspect(currentJob, true);
+      if (promptText(current) !== "") throw new Error("Preserve composer text while clearing test uploads; nothing was submitted");
+      return current;
+    };
+    inspectEmptyDraft(remaining);
+    while (remaining.images.length) {
+      if (!ownedUploads(remaining))
+        throw new Error("Composer changed while removing this job's attachments; inspect the unsent draft");
+      inspectEmptyDraft(remaining);
+      const cards = verifiedUploadCards(remaining);
+      if (!cards) throw new Error("This job's attachments are no longer verified; inspect the unsent draft");
+      const remove = [...cards[0].querySelectorAll("button")].find(button => visible(button) && !button.disabled &&
+        button.getAttribute("aria-label") === `Remove ${remaining.images[0].name}`);
+      if (!remove) throw new Error("Native Remove control unavailable; inspect the unsent draft");
+      const next = {...remaining, images: remaining.images.slice(1)};
+      const previousNames = uploadBinding.names;
+      remove.click();
+      await waitFor(() => {
+        if (!ownedUploads(remaining))
+          throw new Error("Composer changed while removing this job's attachments; inspect the unsent draft");
+        inspectEmptyDraft(remaining);
+        // React removes cards asynchronously. Keep the old binding until that card disappears.
+        const stillPresent = attachmentCards(uploadBinding.scope).filter(visible).some(card =>
+          [...card.querySelectorAll("button")].some(button =>
+            button.getAttribute("aria-label") === `Remove ${remaining.images[0].name}`));
+        if (stillPresent) { verifiedUploadCards(remaining); return false; }
+        uploadBinding.names = next.images.map(image => image.name);
+        inspectEmptyDraft(next);
+        const ready = next.images.length ? uploadsReady(next) : !attachmentsPresent();
+        if (!ready) uploadBinding.names = previousNames;
+        return ready;
+      }, "Owned uploads were not fully removed; inspect the unsent draft");
+      remaining.images = next.images;
+    }
+    if (location.pathname !== path || editorElement() !== editor)
+      throw new Error("Composer changed after upload cleanup; inspect the unsent draft");
+    uploadBinding = null;
+    inspectEmptyDraft({...job, images: []});
+  }
+  async function uploadImages(job) {
+    const images = job.images || [];
+    if (!Array.isArray(images) || !["create", "edit"].includes(job.mode || "create") ||
+        (job.mode === "edit" && !images.some(image => image.role === "source")) ||
+        ((job.mode || "create") === "create" && images.some(image => image.role === "source")))
+      throw new Error("Invalid create/edit image roles");
+    if (!images.length) return;
+    const editor = inspect(job);
+    const scope = editor.closest("form");
+    if (!scope) throw new Error("Native upload composer form unavailable; nothing uploaded");
+    const accepts = (input, image) => (input.accept || "").split(",").map(value => value.trim().toLowerCase()).some(value =>
+      value === "image/*" || value === image.mime || value === "." + image.name.split(".").at(-1) ||
+      (value === ".jpeg" && image.mime === "image/jpeg"));
+    const compatible = [...scope.querySelectorAll('input[type="file"]')].filter(input => !input.disabled &&
+      (images.length === 1 || input.multiple === true) && images.every(image => accepts(input, image)));
+    // ChatGPT can mount both a generic document uploader and an image-only uploader.
+    const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg", ".ico"]);
+    const imageOnly = compatible.filter(input => (input.accept || "").split(",").map(value => value.trim().toLowerCase())
+      .every(value => /^image\/[a-z0-9.+*-]+$/.test(value) || imageExtensions.has(value)));
+    const inputs = compatible.length === 1 ? compatible : imageOnly;
+    if (inputs.length !== 1) throw new Error(`Native image file input missing, ambiguous or incompatible; compatible=${compatible.length}, image_only=${imageOnly.length}; nothing uploaded`);
+    const input = inputs[0], transfer = new DataTransfer();
+    let total = 0;
+    for (const [index, image] of images.entries()) {
+      if (image.order !== index + 1 || !["source", "reference"].includes(image.role) ||
+          typeof image.description !== "string" || !image.description.trim() || image.description.length > 200 ||
+          !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) ||
+          !["image/png", "image/jpeg", "image/webp"].includes(image.mime) ||
+          !Number.isInteger(image.bytes) || image.bytes < 1 || image.bytes > 8 * 1024 * 1024 ||
+          typeof image.data_base64 !== "string" || image.data_base64.length !== 4 * Math.ceil(image.bytes / 3))
+        throw new Error("Invalid ordered image input; nothing uploaded");
+      total += image.bytes;
+      if (total > 8 * 1024 * 1024) throw new Error("Inputs exceed the 8 MiB Bridge transport budget");
+      const bytes = Uint8Array.from(atob(image.data_base64), char => char.charCodeAt(0));
+      const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map(byte => byte.toString(16).padStart(2, "0")).join("");
+      if (bytes.length !== image.bytes || digest !== image.sha256) throw new Error("Input byte integrity check failed");
+      transfer.items.add(new File([bytes], image.name, {type: image.mime}));
+    }
+    inspect(job); // Preserve any draft/attachments introduced while decoding.
+    uploadBinding = {jobId: job.job_id, path: location.pathname, editor, scope, names: images.map(image => image.name)};
+    input.files = transfer.files;
+    if (input.files.length !== images.length || [...input.files].some((file, index) => file.name !== images[index].name))
+      throw new Error("Native file input did not accept the ordered images");
+    input.dispatchEvent(new Event("input", {bubbles: true}));
+    input.dispatchEvent(new Event("change", {bubbles: true}));
+    await waitFor(() => { inspect(job, true); return uploadsReady(job); }, "Native uploads not verified ready; inspect the unsent draft");
+  }
+  function bindInspectedPreflight(job) {
+    const images = job.images || [], editor = editorElement(), scope = editor?.closest("form");
+    if (job.preflight_only !== true || job.clear_preflight_uploads !== true || !images.length ||
+        location.origin !== "https://chatgpt.com" || location.pathname !== "/" ||
+        new URL(location.href).searchParams.get("temporary-chat") === "true" ||
+        hasTurns() || busy() || !visible(editor) || !scope || promptText(editor) !== "" ||
+        images.some((image, index) => image.order !== index + 1 || image.data_base64 !== undefined ||
+          !/^input-\d{3,}\.(png|jpg|webp)$/.test(image.name) || !/^[a-f0-9]{64}$/.test(image.sha256)) ||
+        new Set(images.map(image => image.name)).size !== images.length)
+      throw new Error("Inspected preflight draft changed; nothing was uploaded or removed");
+    const count = attachmentCards(scope).filter(visible).length;
+    // An explicitly inspected cleanup may resume only a remaining ordered suffix, never arbitrary files.
+    if (!count || count > images.length || (count !== images.length && job.preflight_cleanup_resumed !== true))
+      throw new Error("Existing preflight attachments do not exactly match; nothing was removed");
+    const remaining = {...job, images: images.slice(-count)};
+    uploadBinding = {jobId: job.job_id, path: location.pathname, editor, scope, names: remaining.images.map(image => image.name)};
+    inspect(remaining, true);
+    if (!uploadsReady(remaining)) throw new Error("Existing preflight attachments do not exactly match; nothing was removed");
+    return remaining;
+  }
   function idleEditor(job) {
     if (location.origin !== "https://chatgpt.com") throw new Error("Wrong site");
     if (verificationRequired()) throw new Error("Owner action required: complete verification in ChatGPT. Nothing was submitted.");
@@ -35,8 +259,7 @@
     if (!visible(editor)) throw new Error("ChatGPT composer unavailable. Nothing was submitted.");
     if (busy() || (promptText(editor) && !matchingDraft(job, editor)))
       throw new Error("Preserve the draft or running work. Nothing was submitted.");
-    if (document.querySelector('input[type="file"]')?.files?.length ||
-        document.querySelector('[data-testid="file-upload-progress"], [data-testid="attachment-preview"], [data-testid="file-thumbnail"]'))
+    if (attachmentsPresent())
       throw new Error("Remove existing attachments before using the image worker");
     return editor;
   }
@@ -75,9 +298,9 @@
       await waitFor(() => visible(imageChip(editorElement())), "Native Create image selection did not appear");
     }
     inspect(job);
-    return {fresh: true, model: "Create image"};
+    return {fresh: true, model: "Create image", input_protocol: 4, idle: true};
   }
-  function inspect(job) {
+  function inspect(job, uploading = false) {
     if (location.origin !== "https://chatgpt.com") throw new Error("Wrong site");
     if (verificationRequired()) throw new Error("Owner action required: complete verification in ChatGPT. Nothing was submitted.");
     const editor = editorElement();
@@ -89,9 +312,10 @@
         turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length ||
         (promptText(editor) && !matchingDraft(job, editor)))
       throw new Error("Use a fresh empty chat with no draft or running work. Nothing was submitted.");
-    if (document.querySelector('input[type="file"]')?.files?.length ||
-        document.querySelector('[data-testid="file-upload-progress"], [data-testid="attachment-preview"], [data-testid="file-thumbnail"]'))
+    if (attachmentsPresent() && !(ownedUploads(job) && (uploading || uploadsReady(job))))
       throw new Error("Remove existing attachments before using the image worker");
+    if (!uploading && ownedUploads(job) && !uploadsReady(job))
+      throw new Error("This job's native attachments are no longer verified ready");
     return editor;
   }
   async function deleteSavedChat(message) {
@@ -154,6 +378,17 @@
   async function run(job, collectOnly = false) {
     let submitted = collectOnly;
     try {
+      if ((job.preflight_only !== undefined && typeof job.preflight_only !== "boolean") ||
+          (job.clear_preflight_uploads !== undefined &&
+            (typeof job.clear_preflight_uploads !== "boolean" ||
+              (job.clear_preflight_uploads === true && job.preflight_only !== true))))
+        throw new Error("clear_preflight_uploads is valid only as a boolean on an upload preflight");
+      if (job.preflight_cleanup_only !== undefined && (typeof job.preflight_cleanup_only !== "boolean" ||
+          (job.preflight_cleanup_only && (collectOnly || job.preflight_only !== true || job.clear_preflight_uploads !== true))))
+        throw new Error("Invalid cleanup-only preflight");
+      if (job.preflight_cleanup_resumed !== undefined && (typeof job.preflight_cleanup_resumed !== "boolean" ||
+          (job.preflight_cleanup_resumed && job.preflight_cleanup_only !== true)))
+        throw new Error("Invalid inspected cleanup resume");
       const prompt = jobPrompt(job);
       if (collectOnly) {
         if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
@@ -164,7 +399,18 @@
         if (!userBody || typeof job.prompt !== "string" || promptText(userBody) !== normalizedText(prompt))
           throw new Error("Existing conversation does not match this job's prompt; image was not collected");
       } else {
-        const editor = inspect(job);
+        const inputJob = job.preflight_cleanup_only === true ? bindInspectedPreflight(job) : job;
+        if (job.preflight_cleanup_only !== true)
+          await uploadImages(job);
+        const editor = inspect(inputJob);
+        if (job.preflight_only === true) {
+          const preflightUploadsCleared = job.clear_preflight_uploads === true;
+          if (preflightUploadsCleared) await clearPreflightUploads(inputJob, editor);
+          const receipt = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
+            preflightReady: true, ...(preflightUploadsCleared ? {preflightUploadsCleared: true} : {})});
+          if (receipt?.error) throw new Error("Preflight receipt unavailable; inspect this unsent draft, do not repeat automatically");
+          return; // No text insertion, Send lookup/click, generation, fetch or deletion.
+        }
         editor.focus();
         // A new explicit request may reuse only its exact unsent image draft.
         if (!matchingDraft(job, editor)) {
@@ -186,6 +432,10 @@
           return [...document.querySelectorAll('[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]')]
             .find(button => visible(button) && !button.disabled);
         }, "Native send button unavailable; not submitted");
+        // Awaiting the control yields to native UI updates. Recheck the draft
+        // and every upload once more before the synchronous final click.
+        inspect(job);
+        if (!visible(send) || send.disabled) throw new Error("Native send control changed; not submitted");
         submitted = true;  // From here an uncertain result MUST NOT be retried.
         send.click();
       }
@@ -226,9 +476,9 @@
     } catch (error) {
       await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
         error: (submitted ? "Submission attempted. " : "Not submitted. ") + error.message}).catch(() => {});
-    } finally { running = false; }
+    } finally { running = false; uploadBinding = null; }
   }
-  chrome.runtime.onMessage.addListener((message, _sender, reply) => {
+  const listener = (message, _sender, reply) => {
     if (message.type === "image-delete") {
       void deleteSavedChat(message).then(reply, error => reply({error: error.message}));
       return true;
@@ -240,12 +490,15 @@
       return true;
     }
     if (message.type === "image-inspect") {
+      let idle = false;
       try {
         if (running) throw new Error("Content worker already running");
+        idleEditor();
+        idle = true;
         const model = "Create image";
         inspect({expected_model: model});
-        reply({fresh: true, model});
-      } catch (error) { reply({error: error.message}); }
+        reply({fresh: true, model, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics()});
+      } catch (error) { reply({error: error.message, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics()}); }
       return;
     }
     if (!["image-job", "image-collect"].includes(message.type)) return;
@@ -253,5 +506,7 @@
     running = true;
     reply({accepted: true});
     void run(message.job, message.type === "image-collect");
-  });
+  };
+  chrome.runtime.onMessage.addListener(listener);
+  globalThis.__gptBridgeImageWorkerListener = listener;
 })();

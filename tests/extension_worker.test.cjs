@@ -3,10 +3,20 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
+const {createHash} = require('node:crypto');
 
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
+const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image'}, preparation = {fresh: true, model: 'Create image'}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false} = {}) {
+test('0.1.18 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.18');
+  assert.ok(manifest.permissions.includes('scripting'));
+  assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
+  for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
+    assert.equal(manifest.permissions.includes(permission), false);
+});
+
+function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = ''} = {}) {
   let listener;
   let alarmListener;
   const storage = sharedStorage || {};
@@ -15,27 +25,37 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
   const alarms = [];
   const tabLookups = [];
   const tabMessages = [];
+  const scriptInjections = [];
   let releaseNetwork;
   const networkGate = new Promise(resolve => { releaseNetwork = resolve; });
   let releaseTabLookup;
   const tabGate = new Promise(resolve => { releaseTabLookup = resolve; });
   let releaseDeleteConfirmation;
   const deleteGate = new Promise(resolve => { releaseDeleteConfirmation = resolve; });
+  let activeInspection = inspection;
+  let activeInspectError = inspectError;
+  let reloadCalls = 0;
+  const scripting = scriptingAvailable ? {async executeScript(details) {
+    scriptInjections.push(details);
+    if (scriptingError) throw new Error(scriptingError);
+    activeInspection = inspectionAfterInjection || activeInspection;
+    activeInspectError = inspectErrorAfterInjection;
+  }} : undefined;
   const chrome = {
     storage: {local: {
       async get(keys) { const out = {}; for (const key of Array.isArray(keys) ? keys : [keys]) out[key] = storage[key]; return out; },
       async set(values) { Object.assign(storage, values); },
       async remove(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key]; }
     }},
-    runtime: {onMessage: {addListener(fn) { listener = fn; }}},
+    runtime: {onMessage: {addListener(fn) { listener = fn; }}, getManifest() { return {version: manifest.version}; }, reload() { reloadCalls++; }},
     alarms: {onAlarm: {addListener(fn) { alarmListener = fn; }}, async create(...args) { alarms.push(args); }, async clear(...args) { alarms.push(['clear', ...args]); }},
     tabs: {
       async get(id) { tabLookups.push(id); if (holdTabLookup) await tabGate; return tabExists ? {id, ...(tabUrlRedacted ? {} : {url: tabUrl})} : null; },
       async sendMessage(id, message) {
         tabMessages.push({id, message});
         if (message.type === 'image-inspect') {
-          if (inspectError) throw new Error(inspectError);
-          return inspection;
+          if (activeInspectError) throw new Error(activeInspectError);
+          return activeInspection;
         }
         if (message.type === 'image-prepare') {
           if (prepareError) throw new Error(prepareError);
@@ -56,7 +76,8 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
         }
         return {accepted: true};
       }
-    }
+    },
+    ...(scripting ? {scripting} : {})
   };
   const context = {chrome, URL, crypto: {randomUUID: () => 'client-id'}, AbortSignal,
     async fetch(url, options) {
@@ -74,7 +95,8 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
       return {ok: true, json: async () => response};
     }};
   vm.runInNewContext(source, context, {filename: 'worker.js'});
-  return {storage, requests, alarms, tabLookups, tabMessages, receive: listener,
+  return {storage, requests, alarms, tabLookups, tabMessages, scriptInjections, receive: listener,
+    get reloadCalls() { return reloadCalls; },
     fireAlarm() { alarmListener({name: 'poll'}); },
     releaseNetwork() { releaseNetwork(); },
     releaseTabLookup() { releaseTabLookup(); },
@@ -85,6 +107,25 @@ const pairedImageResult = (overrides = {}) => ({
   message: {type: 'image-result', jobId: 'job-1', imageBase64: 'cG5n', chatPath: '/c/123e4567-e89b-12d3-a456-426614174000', ...overrides},
   sender: {tab: {id: 7}, url: 'https://chatgpt.com/c/123e4567-e89b-12d3-a456-426614174000'}
 });
+
+function referenceImage(order, role, bytes = Buffer.from(`image-${order}`)) {
+  return {order, role, description: `Image ${order}`, name: `input-${String(order).padStart(3, '0')}.png`, mime: 'image/png',
+    bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+    dimensions: {width: 2, height: 2}, data_base64: bytes.toString('base64'), path: `/private/image-${order}.png`};
+}
+
+const uploadDom = () => ({editor_form: true, file_inputs: 3, form_file_inputs: 2, image_inputs: 2,
+  form_image_inputs: 1, multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 1});
+
+const imageJob = images => ({job_id: 'job-1', mode: 'edit', prompt: 'Use the supplied sources',
+  expected_model: 'Create image', images});
+
+const cleanupOnlyPreflight = images => ({...imageJob(images), preflight_only: true,
+  clear_preflight_uploads: true, preflight_cleanup_only: true});
+
+function metadataOnly(job) {
+  return {...job, images: job.images.map(({data_base64, path: localPath, ...image}) => image)};
+}
 
 async function send(h, message, sender = {}) {
   let response;
@@ -116,7 +157,7 @@ test('pair binds only the confirmed second account to the actual ChatGPT tab', a
   const result = await send(h, pairing());
   assert.equal(result.ok, true);
   assert.ok(h.tabLookups.length >= 1 && h.tabLookups.every(id => id === 7));
-  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', account: 'second', visible_model: 'Create image'});
+  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', account: 'second', visible_model: 'Create image', input_protocol: 2});
   assert.equal(h.storage.config.account, 'second');
   assert.equal(h.storage.config.tabId, 7);
   assert.ok(h.alarms.some(args => args[0] === 'poll'));
@@ -233,6 +274,12 @@ test('poll reconnects a saved config after offline state and claims only after f
   assert.equal(offline.requests[0].body.client_id, 'saved-client');
   assert.equal(offline.requests[0].body.account, 'second');
   assert.equal(offline.requests[0].body.tab_ready, true);
+  assert.equal(offline.requests[0].body.input_protocol, 2);
+  assert.equal(offline.requests[0].body.tab_idle, true);
+  assert.equal(offline.requests[0].body.tab_error, '');
+  assert.equal(offline.requests[0].body.worker_version, manifest.version);
+  assert.equal(offline.requests[0].body.content_receiver, 'available');
+  assert.equal(offline.requests[0].body.receiver_error, '');
   assert.equal(offline.requests.some(call => call.url.endsWith('/next')), false);
 
   const online = harness({next: {}});
@@ -313,6 +360,9 @@ test('missing or wrong-domain paired tab heartbeats not-ready and never polls or
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
     assert.equal(h.requests[0].url.endsWith('/heartbeat'), true);
     assert.equal(h.requests[0].body.tab_ready, false);
+    assert.equal(h.requests[0].body.worker_version, manifest.version);
+    assert.equal(h.requests[0].body.content_receiver, name === 'missing tab' ? 'tab_missing' : 'wrong_origin');
+    assert.equal(h.requests[0].body.receiver_error, name === 'missing tab' ? 'tab_missing' : 'wrong_origin');
     assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
     assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
     assert.equal(h.storage.config, config);
@@ -320,9 +370,206 @@ test('missing or wrong-domain paired tab heartbeats not-ready and never polls or
   });
 });
 
+test('old content replies remain available at protocol 0 and app-level content errors stay in tab_error', async t => {
+  await t.test('old content protocol', async () => {
+    const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+    const h = harness({inspection: {fresh: true, model: 'Create image'}, next: {}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.worker_version, manifest.version);
+    assert.equal(heartbeat.content_receiver, 'available');
+    assert.equal(heartbeat.receiver_error, '');
+    assert.equal(heartbeat.input_protocol, 0);
+    assert.equal(heartbeat.tab_idle, null);
+    assert.equal(heartbeat.tab_ready, true);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), true);
+  });
+
+  await t.test('new content app-level error', async () => {
+    const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+    const contentError = 'Preserve the draft or running work. Nothing was submitted.';
+    const h = harness({inspection: {error: contentError, input_protocol: 2, idle: false}, next: {}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.worker_version, manifest.version);
+    assert.equal(heartbeat.content_receiver, 'available');
+    assert.equal(heartbeat.receiver_error, '');
+    assert.equal(heartbeat.input_protocol, 2);
+    assert.equal(heartbeat.tab_idle, false);
+    assert.equal(heartbeat.tab_ready, false);
+    assert.equal(heartbeat.tab_error, contentError);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), true);
+  });
+});
+
+test('receiver failures are classified and never claim a queued job', async t => {
+  const cases = [
+    ['no receiver', {inspectError: 'Could not establish connection. Receiving end does not exist.'}, 'unavailable', 'no_receiver'],
+    ['closed port', {inspectError: 'The message port closed before a response was received.'}, 'unavailable', 'port_closed'],
+    ['unknown native error', {inspectError: 'native-private-error-should-not-leak'}, 'unavailable', 'message_failed'],
+    ['invalid inspection reply', {inspection: {}}, 'invalid_reply', 'invalid_reply']
+  ];
+  for (const [name, options, receiver, errorCode] of cases) await t.test(name, async () => {
+    const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+    const h = harness({...options, next: {job_id: 'job-1'}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.worker_version, manifest.version);
+    assert.equal(heartbeat.content_receiver, receiver);
+    assert.equal(heartbeat.receiver_error, errorCode);
+    assert.equal(heartbeat.tab_ready, false);
+    assert.equal(heartbeat.input_protocol, 0);
+    assert.equal(heartbeat.tab_idle, null);
+    assert.equal(heartbeat.upload_dom, null);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare' || call.message.type === 'image-job'), false);
+    assert.equal(JSON.stringify(heartbeat).includes('native-private-error-should-not-leak'), false);
+  });
+});
+
+test('heartbeat forwards only an exact bounded upload DOM diagnostic and preserves unknown as null', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const settle = async h => {
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+
+  await t.test('valid exact-shape counts are forwarded', async () => {
+    const diagnostic = uploadDom();
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 3, idle: true,
+      upload_dom: diagnostic}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.deepEqual(heartbeat.upload_dom, diagnostic);
+  });
+
+  const invalid = [
+    ['extra untrusted text', {...uploadDom(), page_url: 'https://private.invalid/path'}],
+    ['missing field', Object.fromEntries(Object.entries(uploadDom()).slice(1))],
+    ['boolean count', {...uploadDom(), file_inputs: true}],
+    ['out-of-range count', {...uploadDom(), attachment_cards: 10001}],
+    ['array', [uploadDom()]],
+  ];
+  for (const [name, upload_dom] of invalid) await t.test(name, async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 3, idle: true, upload_dom}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.upload_dom, null);
+    assert.equal(JSON.stringify(heartbeat).includes('private.invalid'), false);
+  });
+
+  await t.test('no receiver leaves upload shape unknown instead of reporting fake zeroes', async () => {
+    const h = harness({inspectError: 'Could not establish connection. Receiving end does not exist.', next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.content_receiver, 'unavailable');
+    assert.equal(heartbeat.receiver_error, 'no_receiver');
+    assert.equal(heartbeat.upload_dom, null);
+  });
+});
+
+test('only a known no-receiver condition gets one exact-target reinjection attempt', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const noReceiver = 'Could not establish connection. Receiving end does not exist.';
+  const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+  await t.test('reinjection restores protocol 2 and sends no content job', async () => {
+    const h = harness({inspectError: noReceiver, scriptingAvailable: true,
+      inspectionAfterInjection: {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, next: {}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(h.scriptInjections)), [{target: {tabId: 7}, files: ['content.js']}]);
+    assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-inspect']);
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.worker_version, manifest.version);
+    assert.equal(heartbeat.content_receiver, 'available');
+    assert.equal(heartbeat.receiver_error, '');
+    assert.equal(heartbeat.input_protocol, 2);
+    assert.equal(heartbeat.tab_idle, true);
+    assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'next']);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job', 'image-delete'].includes(call.message.type)), false);
+    assert.equal(JSON.stringify(h.scriptInjections).includes('synthetic-token'), false);
+    assert.equal(JSON.stringify(h.scriptInjections).includes('saved-client'), false);
+    assert.equal(h.reloadCalls, 0);
+  });
+
+  await t.test('content-level draft guard response survives reinjection', async () => {
+    const reason = 'Preserve the draft or running work. Nothing was submitted.';
+    const h = harness({inspectError: noReceiver, scriptingAvailable: true,
+      inspectionAfterInjection: {error: reason, input_protocol: 2, idle: false}, next: {}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.content_receiver, 'available');
+    assert.equal(heartbeat.receiver_error, '');
+    assert.equal(heartbeat.input_protocol, 2);
+    assert.equal(heartbeat.tab_idle, false);
+    assert.equal(heartbeat.tab_ready, false);
+    assert.equal(heartbeat.tab_error, reason);
+    assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-inspect']);
+    assert.equal(h.scriptInjections.length, 1);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  });
+
+  const cases = [
+    ['missing scripting API', {inspectError: noReceiver}, 0],
+    ['denied scripting API', {inspectError: noReceiver, scriptingAvailable: true, scriptingError: 'private native failure'}, 1],
+    ['active job', {inspectError: noReceiver, scriptingAvailable: true, active: {jobId: 'old-job', tabId: 7}}, 0],
+    ['wrong origin', {tabUrl: 'https://example.com/', inspectError: noReceiver, scriptingAvailable: true}, 0],
+    ['redacted URL', {tabUrlRedacted: true, inspectError: noReceiver, scriptingAvailable: true}, 0],
+    ['closed message port', {inspectError: 'The message port closed before a response was received.', scriptingAvailable: true}, 0]
+  ];
+  for (const [name, options, expectedInjections] of cases) await t.test(name, async () => {
+    const h = harness({...options, next: {job_id: 'must-not-claim'}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+
+    assert.equal(h.scriptInjections.length, expectedInjections);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job', 'image-delete'].includes(call.message.type)), false);
+    assert.equal(JSON.stringify(h.requests).includes('private native failure'), false);
+    assert.equal(h.reloadCalls, 0);
+  });
+
+  await t.test('a failed injection is not retried in this worker lifecycle', async () => {
+    const h = harness({inspectError: noReceiver, scriptingAvailable: true, scriptingError: 'private native failure'});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+    h.fireAlarm();
+    await settle();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(h.scriptInjections)), [{target: {tabId: 7}, files: ['content.js']}]);
+    assert.equal(h.requests.filter(call => call.url.endsWith('/heartbeat')).length, 2);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(JSON.stringify(h.requests).includes('private native failure'), false);
+    assert.equal(h.reloadCalls, 0);
+  });
+});
+
 test('a URL-redacted paired tab is checked through its content script before claiming', async () => {
   const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
-  const job = {job_id: 'job-1', prompt: 'draw once', expected_model: 'Create image'};
+  const job = {job_id: 'job-1', prompt: 'draw once', expected_model: 'Create image', mode: 'create'};
   const h = harness({tabUrlRedacted: true, inspection: {fresh: false, model: ''}, next: job});
   Object.assign(h.storage, {config});
 
@@ -351,7 +598,7 @@ test('a URL-redacted tab without a responding content script is not claimed', as
 
 test('a claimed job prepares the paired tab before dispatch and heartbeats readiness', async () => {
   const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
-  const job = {job_id: 'job-1', prompt: 'draw once', expected_model: 'Create image'};
+  const job = {job_id: 'job-1', prompt: 'draw once', expected_model: 'Create image', mode: 'create'};
   const h = harness({inspection: {fresh: false, model: ''}, next: job});
   Object.assign(h.storage, {config});
 
@@ -360,12 +607,464 @@ test('a claimed job prepares the paired tab before dispatch and heartbeats readi
 
   assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'next', 'heartbeat']);
   assert.equal(h.requests[0].body.tab_ready, false);
+  assert.equal(h.requests[0].body.input_protocol, 0);
   assert.equal(h.requests[1].body.client_id, 'saved-client');
   assert.equal(h.requests[2].body.tab_ready, true);
+  assert.equal(h.requests[2].body.input_protocol, 2);
   assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-prepare', 'image-job']);
   assert.equal(JSON.stringify(h.tabMessages[1].message), JSON.stringify({type: 'image-prepare', job}));
   assert.equal(JSON.stringify(h.tabMessages[2].message), JSON.stringify({type: 'image-job', job}));
   assert.equal(h.storage.active.jobId, 'job-1');
+});
+
+test('edit job delivers three ordered images once to the paired tab and keeps bytes out of storage and status', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference'), referenceImage(3, 'reference')]);
+  const h = harness({inspection: {fresh: false, model: ''}, next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const prepared = h.tabMessages.find(call => call.message.type === 'image-prepare');
+  const dispatched = h.tabMessages.filter(call => call.message.type === 'image-job');
+  assert.equal(prepared.id, config.tabId);
+  assert.deepEqual(JSON.parse(JSON.stringify(prepared.message.job)), metadataOnly(job));
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].id, config.tabId);
+  assert.deepEqual(JSON.parse(JSON.stringify(dispatched[0].message.job)), job);
+  assert.deepEqual(dispatched[0].message.job.images.map(image => image.order), [1, 2, 3]);
+  assert.deepEqual(dispatched[0].message.job.images.map(image => image.role), ['source', 'reference', 'reference']);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.storage.active.job)), metadataOnly(job));
+  assert.equal(JSON.stringify(h.storage.active).includes('data_base64'), false);
+  assert.equal(JSON.stringify(h.storage.active).includes('/private/'), false);
+  assert.equal(JSON.stringify(h.requests.map(call => call.body)).includes(job.images[0].data_base64), false);
+
+  h.storage.lastJob = {...job, images: job.images};
+  const status = await send(h, {type: 'get-status', refresh: false});
+  assert.equal(JSON.stringify(status.active), JSON.stringify({jobId: 'job-1'}));
+  assert.equal(JSON.stringify(status).includes(job.images[0].data_base64), false);
+  assert.equal(JSON.stringify(status).includes('/private/'), false);
+  assert.equal(status.lastJob.images.length, 3);
+  assert.equal(status.lastJob.images[0].data_base64, undefined);
+  assert.equal(status.lastJob.prompt, undefined);
+});
+
+test('protocol-1 content refuses preflight without sending input bytes to content', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = {...imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]), preflight_only: true};
+  const h = harness({
+    inspection: {fresh: false, model: '', input_protocol: 1, idle: false},
+    preparation: {fresh: true, model: 'Create image', input_protocol: 1, idle: true},
+    next: job
+  });
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const heartbeats = h.requests.filter(call => call.url.endsWith('/heartbeat'));
+  const result = h.requests.find(call => call.url.endsWith('/result'));
+  assert.deepEqual(heartbeats.map(call => call.body.input_protocol), [1, 1]);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-prepare']);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.tabMessages[1].message.job)), metadataOnly(job));
+  assert.equal(JSON.stringify(h.tabMessages).includes(job.images[0].data_base64), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
+  assert.ok(result);
+  assert.match(result.body.error, /no-Send preflight support/);
+});
+
+test('preflight preserves its flag and routes only an unsent readiness receipt', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = {...imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]), preflight_only: true};
+  const receipt = {
+    ...metadataOnly(job), state: 'complete', preflight_ready: true, submitted: false,
+    generated: false, cleanup_status: 'not_requested', draft_note: 'Owned uploads remain unsent.'
+  };
+  const h = harness({
+    inspection: {fresh: false, model: '', input_protocol: 2, idle: false},
+    preparation: {fresh: true, model: 'Create image', input_protocol: 2, idle: true},
+    next: job,
+    responses: {result: receipt}
+  });
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const prepared = h.tabMessages.find(call => call.message.type === 'image-prepare');
+  const dispatched = h.tabMessages.find(call => call.message.type === 'image-job');
+  assert.ok(prepared, JSON.stringify({requests: h.requests, tabMessages: h.tabMessages, active: h.storage.active}));
+  assert.equal(prepared.message.job.preflight_only, true);
+  assert.equal(dispatched.message.job.preflight_only, true);
+  assert.equal(h.storage.active.job.preflight_only, true);
+  assert.equal(JSON.stringify(h.storage.active).includes('data_base64'), false);
+
+  const wrongTab = await send(h, {type: 'image-result', jobId: job.job_id, preflightReady: true},
+    {tab: {id: 8}, url: 'https://chatgpt.com/'});
+  assert.ok(wrongTab.error);
+  assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  for (const invalidReceipt of [
+    {preflightReady: true, imageBase64: 'eA=='},
+    {preflightReady: true, chatPath: '/c/123e4567-e89b-12d3-a456-426614174000'},
+  ]) {
+    const rejected = await send(h, {type: 'image-result', jobId: job.job_id, ...invalidReceipt},
+      {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(rejected.error, /Preflight cannot accept generated media or cleanup/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  }
+
+  const accepted = await send(h, {type: 'image-result', jobId: job.job_id, preflightReady: true},
+    {tab: {id: 7}, url: 'https://chatgpt.com/'});
+  assert.equal(accepted.ok, true);
+  const resultRequest = h.requests.find(call => call.url.endsWith('/result'));
+  assert.deepEqual(resultRequest.body, {client_id: 'saved-client', job_id: job.job_id, preflight_ready: true});
+  assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+
+  const status = await send(h, {type: 'get-status', refresh: false});
+  assert.equal(status.connection.state, 'preflight_complete');
+  assert.equal(status.lastJob.preflight_ready, true);
+  assert.equal(status.lastJob.submitted, false);
+  assert.equal(status.lastJob.generated, false);
+  assert.equal(status.lastJob.cleanup_status, 'not_requested');
+  assert.equal(status.lastJob.images[0].data_base64, undefined);
+  assert.equal(JSON.stringify(status).includes('data_base64'), false);
+});
+
+test('cleared preflight requires protocol 3 and a matching native cleanup receipt', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = {...imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]),
+    preflight_only: true, clear_preflight_uploads: true};
+  const settle = async h => {
+    h.fireAlarm();
+    for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+  const activate = async (activeJob, response) => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 3, idle: true},
+      next: activeJob, responses: response ? {result: response} : {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+    return h;
+  };
+
+  await t.test('protocol 2 rejects opt-in cleanup before content dispatch', async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, next: job});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const result = h.requests.find(call => call.url.endsWith('/result'));
+    assert.match(result.body.error, /Protocol 3 is required/);
+    assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect']);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-job' || call.message.type === 'image-prepare'), false);
+    assert.equal(JSON.stringify(h.tabMessages).includes(job.images[0].data_base64), false);
+  });
+
+  await t.test('missing opt-in clearing receipt is rejected without a server result', async () => {
+    const h = await activate(job);
+    assert.equal(h.storage.active.job.clear_preflight_uploads, true);
+    const rejected = await send(h, {type: 'image-result', jobId: job.job_id, preflightReady: true},
+      {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(rejected.error, /Verified preflight upload clearing receipt is required/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.storage.active.job.clear_preflight_uploads, true);
+  });
+
+  await t.test('unsolicited clearing receipt is rejected for a default preflight', async () => {
+    const defaultJob = {...imageJob([referenceImage(1, 'source')]), preflight_only: true};
+    const h = await activate(defaultJob);
+    const rejected = await send(h, {type: 'image-result', jobId: defaultJob.job_id,
+      preflightReady: true, preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(rejected.error, /Preflight upload clearing was not requested/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  });
+
+  await t.test('unsolicited clearing receipt is rejected for image generation', async () => {
+    const generation = imageJob([referenceImage(1, 'source')]);
+    const active = {jobId: generation.job_id, tabId: 7, job: metadataOnly(generation)};
+    const h = harness({active});
+    Object.assign(h.storage, {config, active});
+    const rejected = await send(h, {type: 'image-result', jobId: generation.job_id,
+      imageBase64: 'eA==', preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(rejected.error, /Preflight upload clearing was not requested/);
+    assert.equal(h.requests.length, 0);
+  });
+
+  await t.test('matching cleared receipt is mirrored into the server result and status', async () => {
+    const receipt = {job_id: job.job_id, state: 'complete', preflight_ready: true,
+      preflight_uploads_cleared: true, submitted: false, generated: false, cleanup_status: 'not_requested'};
+    const h = await activate(job, receipt);
+    const dispatched = h.tabMessages.find(call => call.message.type === 'image-job');
+    assert.equal(dispatched.message.job.clear_preflight_uploads, true);
+    assert.equal(JSON.stringify(h.storage.active).includes('data_base64'), false);
+    const accepted = await send(h, {type: 'image-result', jobId: job.job_id,
+      preflightReady: true, preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.equal(accepted.ok, true);
+    const result = h.requests.find(call => call.url.endsWith('/result'));
+    assert.deepEqual(result.body, {client_id: 'saved-client', job_id: job.job_id,
+      preflight_ready: true, preflight_uploads_cleared: true});
+    assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+    const status = await send(h, {type: 'get-status', refresh: false});
+    assert.equal(status.lastJob.preflight_uploads_cleared, true);
+  });
+});
+
+test('protocols 0 through 3 preserve ordinary create-job dispatch', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  for (const protocol of [0, 1, 2, 3]) await t.test(`protocol ${protocol}`, async () => {
+    const job = {job_id: 'job-1', mode: 'create', prompt: 'draw once', expected_model: 'Create image'};
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: protocol, idle: true}, next: job});
+    Object.assign(h.storage, {config});
+
+    h.fireAlarm();
+    for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.requests.find(call => call.url.endsWith('/heartbeat')).body.input_protocol, protocol);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-job']);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.tabMessages[1].message)), {type: 'image-job', job});
+    assert.equal(h.tabMessages.filter(call => call.message.type === 'image-job').length, 1);
+  });
+});
+
+test('protocol 3 still dispatches an ordinary image job with its required bytes', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = imageJob([referenceImage(1, 'source')]);
+  const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 3, idle: true}, next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(h.requests.find(call => call.url.endsWith('/heartbeat')).body.input_protocol, 3);
+  assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-job']);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.tabMessages[1].message.job)), job);
+  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-job').length, 1);
+  assert.equal(JSON.stringify(h.storage.active).includes('data_base64'), false);
+});
+
+test('protocol-4 heartbeat dispatches inspected cleanup resume metadata without a second upload', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = metadataOnly(cleanupOnlyPreflight([referenceImage(1, 'source'), referenceImage(2, 'reference')]));
+  job.preflight_cleanup_resumed = true;
+  const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat'));
+  assert.equal(heartbeat.body.input_protocol, 4);
+  assert.equal(heartbeat.body.tab_ready, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'next']);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-job']);
+  const dispatched = h.tabMessages.filter(call => call.message.type === 'image-job');
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(dispatched[0].message.job)), job);
+  assert.equal(h.storage.active.job.preflight_only, true);
+  assert.equal(h.storage.active.job.clear_preflight_uploads, true);
+  assert.equal(h.storage.active.job.preflight_cleanup_only, true);
+  assert.equal(h.storage.active.job.preflight_cleanup_resumed, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.storage.active.job)), job);
+  for (const value of [h.storage.active, h.tabMessages, h.requests]) {
+    assert.equal(JSON.stringify(value).includes('data_base64'), false);
+    assert.equal(JSON.stringify(value).includes('/private/'), false);
+  }
+});
+
+test('protocol 3 refuses cleanup-only preflight before content dispatch', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = metadataOnly(cleanupOnlyPreflight([referenceImage(1, 'source')]));
+  const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 3, idle: true}, next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(h.requests.find(call => call.url.endsWith('/heartbeat')).body.input_protocol, 3);
+  const result = h.requests.find(call => call.url.endsWith('/result'));
+  assert.match(result.body.error, /Protocol 4 is required/);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare' || call.message.type === 'image-job'), false);
+  assert.equal(h.storage.active, undefined);
+});
+
+test('cleanup-only preflight rejects malformed flags, empty images, and byte reuploads', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const fullJob = cleanupOnlyPreflight([referenceImage(1, 'source')]);
+  const cases = [
+    ['without preflight_only', metadataOnly({...fullJob, preflight_only: false})],
+    ['non-boolean preflight_only', metadataOnly({...fullJob, preflight_only: 'true'})],
+    ['without clear_preflight_uploads', metadataOnly({...fullJob, clear_preflight_uploads: false})],
+    ['non-boolean clear_preflight_uploads', metadataOnly({...fullJob, clear_preflight_uploads: 'true'})],
+    ['non-boolean cleanup flag', {...metadataOnly(fullJob), preflight_cleanup_only: 'true'}],
+    ['non-boolean resume flag', {...metadataOnly(fullJob), preflight_cleanup_resumed: 'true'}],
+    ['resume without cleanup-only', {...metadataOnly(fullJob), preflight_cleanup_only: false, preflight_cleanup_resumed: true}],
+    ['empty images', metadataOnly(cleanupOnlyPreflight([]))],
+    ['image bytes reuploaded for cleanup-only', fullJob],
+    ['ordinary upload without valid bytes', metadataOnly(imageJob([referenceImage(1, 'source')]))]
+  ];
+
+  for (const [name, job] of cases) await t.test(name, async () => {
+    const h = harness({next: job});
+    Object.assign(h.storage, {config});
+
+    h.fireAlarm();
+    for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+    const result = h.requests.find(call => call.url.endsWith('/result'));
+    assert.ok(result?.body.error, JSON.stringify(h.requests));
+    assert.equal(h.storage.active, undefined);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare' || call.message.type === 'image-job'), false);
+  });
+});
+
+test('cleanup-only preflight accepts only a matching, typed upload-clear receipt', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = metadataOnly(cleanupOnlyPreflight([referenceImage(1, 'source')]));
+  const activate = async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: job,
+      responses: {result: {job_id: job.job_id, state: 'complete', preflight_ready: true,
+        preflight_uploads_cleared: true, submitted: false, generated: false, cleanup_status: 'not_requested'}}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.active.job.preflight_cleanup_only, true);
+    return h;
+  };
+
+  await t.test('wrong tab cannot submit the clear receipt', async () => {
+    const h = await activate();
+    const response = await send(h, {type: 'image-result', jobId: job.job_id,
+      preflightReady: true, preflightUploadsCleared: true}, {tab: {id: 8}, url: 'https://chatgpt.com/'});
+    assert.match(response.error, /Result is not from the paired job\/tab/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.storage.active.job.preflight_cleanup_only, true);
+  });
+
+  await t.test('clear receipt without readiness is rejected', async () => {
+    const h = await activate();
+    const response = await send(h, {type: 'image-result', jobId: job.job_id,
+      preflightReady: false, preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(response.error, /Preflight cannot accept generated media or cleanup/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.storage.active.job.preflight_cleanup_only, true);
+  });
+
+  for (const [name, receipt, pattern] of [
+    ['missing', undefined, /Verified preflight upload clearing receipt is required/],
+    ['false', false, /Verified preflight upload clearing receipt is required/],
+    ['non-boolean', 'true', /Invalid preflight clearing receipt/]
+  ]) await t.test(`${name} receipt is rejected without consuming the active job`, async () => {
+    const h = await activate();
+    const message = {type: 'image-result', jobId: job.job_id, preflightReady: true};
+    if (receipt !== undefined) message.preflightUploadsCleared = receipt;
+    const response = await send(h, message, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.match(response.error, pattern);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+    assert.equal(h.storage.active.job.preflight_cleanup_only, true);
+  });
+
+  await t.test('confirmed receipt is sent to the server without generated media', async () => {
+    const h = await activate();
+    const response = await send(h, {type: 'image-result', jobId: job.job_id,
+      preflightReady: true, preflightUploadsCleared: true}, {tab: {id: 7}, url: 'https://chatgpt.com/'});
+    assert.equal(response.ok, true);
+    const result = h.requests.find(call => call.url.endsWith('/result'));
+    assert.deepEqual(result.body, {client_id: config.clientId, job_id: job.job_id,
+      preflight_ready: true, preflight_uploads_cleared: true});
+    assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+    assert.equal(h.storage.active, undefined);
+    assert.equal(h.storage.lastJob.preflight_uploads_cleared, true);
+    assert.equal(JSON.stringify(result.body).includes('image_base64'), false);
+  });
+});
+
+test('interrupted preflight is never replayed after worker restart', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = {...imageJob([referenceImage(1, 'reference')]), preflight_only: true};
+  const active = {jobId: job.job_id, tabId: config.tabId, job: metadataOnly(job)};
+  const h = harness({active, state: {state: 'interrupted', error: 'Server restarted'}});
+  Object.assign(h.storage, {config, active});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'state']);
+  assert.equal(h.storage.active, undefined);
+  assert.equal(h.storage.lastJob.state, 'interrupted');
+  assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('create mode accepts three reference-only images without a source role', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = {...imageJob([referenceImage(1, 'reference'), referenceImage(2, 'reference'), referenceImage(3, 'reference')]), mode: 'create'};
+  const h = harness({next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const dispatched = h.tabMessages.filter(call => call.message.type === 'image-job');
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].id, config.tabId);
+  assert.equal(JSON.stringify(dispatched[0].message.job), JSON.stringify(job));
+});
+
+test('malformed edit image payloads fail before content dispatch', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const cases = [
+    ['nonsequential order', images => { images[1].order = 3; }],
+    ['invalid role', images => { images[1].role = 'background'; }],
+    ['unsafe local filename', images => { images[0].name = '../../source.png'; }],
+    ['edit without source image', images => { images.forEach(image => { image.role = 'reference'; }); }]
+  ];
+  for (const [name, mutate] of cases) await t.test(name, async () => {
+    const images = [referenceImage(1, 'source'), referenceImage(2, 'reference')];
+    mutate(images);
+    const h = harness({next: imageJob(images)});
+    Object.assign(h.storage, {config});
+
+    h.fireAlarm();
+    for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job'].includes(call.message.type)), false);
+    assert.equal(h.storage.active, undefined);
+    assert.equal(h.requests.filter(call => call.url.endsWith('/result')).length, 1);
+  });
+});
+
+test('total image payload above 8 MiB is rejected without dispatch', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const images = [referenceImage(1, 'source', Buffer.alloc(4 * 1024 * 1024)),
+    referenceImage(2, 'reference', Buffer.alloc(4 * 1024 * 1024 + 1))];
+  const h = harness({next: imageJob(images)});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job'].includes(call.message.type)), false);
+  assert.equal(h.storage.active, undefined);
+  assert.equal(h.requests.filter(call => call.url.endsWith('/result')).length, 1);
+});
+
+test('a payload-bearing active edit is never replayed after worker restart and rejects another tab result', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const job = metadataOnly(imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]));
+  const active = {jobId: job.job_id, tabId: config.tabId, job};
+  const h = harness({active, config, state: {state: 'claimed', expected_model: 'Create image'}, next: {}});
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const wrongTab = await send(h, {type: 'image-result', jobId: job.job_id, imageBase64: 'result'},
+    {tab: {id: 8}, url: 'https://chatgpt.com/c/123e4567-e89b-12d3-a456-426614174000'});
+  assert.ok(wrongTab.error);
+  assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job'].includes(call.message.type)), false);
 });
 
 test('a not-ready paired tab is not prepared when there is no queued job', async () => {
@@ -759,6 +1458,9 @@ test('poll heartbeats during owner confirmation without inspecting or claiming a
   for (let i = 0; i < 3; i++) await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'heartbeat']);
   assert.equal(h.requests[2].body.tab_ready, false);
+  assert.equal(h.requests[2].body.worker_version, manifest.version);
+  assert.equal(h.requests[2].body.content_receiver, 'unreported');
+  assert.equal(h.requests[2].body.receiver_error, '');
   assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
   assert.equal(h.tabMessages.filter(call => call.message.type === 'image-inspect').length, 0);
 
@@ -813,6 +1515,20 @@ test('collect-existing requires the paired current tab and a claimed job', async
 
     assert.ok(response.error);
     assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['state']);
+    assert.equal(h.tabMessages.length, 0);
+  });
+
+  await t.test('rejects image collection for a preflight job', async () => {
+    const job = {...imageJob([referenceImage(1, 'reference')]), preflight_only: true, clear_preflight_uploads: true};
+    const active = {jobId: job.job_id, tabId: 7, job: metadataOnly(job)};
+    const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+    const h = harness({active, state: {state: 'claimed', expected_model: 'Create image'}});
+    Object.assign(h.storage, {active, config});
+
+    const response = await send(h, {type: 'collect-existing', tabId: 7});
+
+    assert.match(response.error, /Preflight never generates an image to collect/);
+    assert.equal(h.requests.length, 0);
     assert.equal(h.tabMessages.length, 0);
   });
 
