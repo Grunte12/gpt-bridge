@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.19 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.19');
+test('0.1.23 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.23');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -116,6 +116,15 @@ function referenceImage(order, role, bytes = Buffer.from(`image-${order}`)) {
 
 const uploadDom = () => ({editor_form: true, file_inputs: 3, form_file_inputs: 2, image_inputs: 2,
   form_image_inputs: 1, multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 1});
+
+const resultDom = (overrides = {}) => ({assistant_role_nodes: 2, user_headings: 1, assistant_headings: 1,
+  assistant_images: 2, conversation_images: 2, assistant_body_found: true, busy: false,
+  chat_path: '/c/123e4567-e89b-12d3-a456-426614174000', ...overrides});
+
+const promptDom = (overrides = {}) => ({body_chars: 2712, stripped_chars: 2700, matched_chip_chars: 12,
+  label_count: 1, starts_with_label: true, ends_with_label: false,
+  labels: [{tag: 'SPAN', parent_tag: 'DIV', inline_pill: true, system_hint: true,
+    prompt_link: false, in_button: false, matched_chip: true}], ...overrides});
 
 const imageJob = images => ({job_id: 'job-1', mode: 'edit', prompt: 'Use the supplied sources',
   expected_model: 'Create image', images});
@@ -481,6 +490,107 @@ test('heartbeat forwards only an exact bounded upload DOM diagnostic and preserv
   });
 });
 
+test('heartbeat forwards only bounded result DOM counts and a validated chat path', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const settle = async h => {
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+
+  await t.test('valid exact-shape counts and path are forwarded without page text', async () => {
+    const diagnostic = resultDom();
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
+      result_dom: diagnostic}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.deepEqual(heartbeat.result_dom, diagnostic);
+    assert.deepEqual(Object.keys(heartbeat.result_dom).sort(), Object.keys(diagnostic).sort());
+    assert.equal(JSON.stringify(heartbeat.result_dom).includes('assistant reply'), false);
+    assert.equal(JSON.stringify(heartbeat).includes('image_src'), false);
+  });
+
+  for (const [name, result_dom] of [
+    ['extra page text', {...resultDom(), assistant_text: 'private conversation'}],
+    ['invalid chat path', resultDom({chat_path: 'https://chatgpt.com/c/private'})],
+    ['missing field', Object.fromEntries(Object.entries(resultDom()).slice(1))],
+    ['boolean count', resultDom({assistant_images: true})],
+    ['out-of-range count', resultDom({conversation_images: 10001})],
+    ['array', [resultDom()]]
+  ]) await t.test(name, async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
+      result_dom}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.result_dom, null);
+    assert.equal(JSON.stringify(heartbeat).includes('private conversation'), false);
+  });
+});
+
+test('heartbeat forwards only the bounded prompt DOM diagnostic and preserves unknown as null', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const settle = async h => {
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+
+  await t.test('valid exact-shape prompt and label metadata is forwarded', async () => {
+    const diagnostic = promptDom();
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
+      prompt_dom: diagnostic}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.deepEqual(heartbeat.prompt_dom, diagnostic);
+    assert.deepEqual(Object.keys(heartbeat.prompt_dom).sort(), Object.keys(diagnostic).sort());
+    assert.equal(JSON.stringify(heartbeat).includes('private prompt text'), false);
+  });
+
+  const invalid = [
+    ['extra raw prompt text field', {...promptDom(), prompt: 'private prompt text'}],
+    ['out-of-range body length', promptDom({body_chars: 100001})],
+    ['out-of-range label count', promptDom({label_count: 10001})],
+    ['mismatched label count', promptDom({label_count: 0})],
+    ['unrecognized tag', promptDom({labels: [{...promptDom().labels[0], tag: 'CUSTOM-ELEMENT'}]})],
+    ['extra raw text in a label', promptDom({labels: [{...promptDom().labels[0], text: 'private prompt text'}]})],
+    ['nonboolean label flag', promptDom({labels: [{...promptDom().labels[0], matched_chip: 'true'}]})],
+    ['array', [promptDom()]]
+  ];
+  for (const [name, prompt_dom] of invalid) await t.test(name, async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
+      prompt_dom}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.prompt_dom, null);
+    assert.equal(JSON.stringify(heartbeat).includes('private prompt text'), false);
+  });
+
+  await t.test('old inspection reply without prompt DOM remains unknown', async () => {
+    const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.prompt_dom, null);
+  });
+
+  await t.test('unavailable old receiver leaves prompt DOM unknown', async () => {
+    const h = harness({inspectError: 'Could not establish connection. Receiving end does not exist.', next: {}});
+    Object.assign(h.storage, {config});
+    await settle(h);
+
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.content_receiver, 'unavailable');
+    assert.equal(heartbeat.prompt_dom, null);
+  });
+});
+
 test('only a known no-receiver condition gets one exact-target reinjection attempt', async t => {
   const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
   const noReceiver = 'Could not establish connection. Receiving end does not exist.';
@@ -648,6 +758,55 @@ test('edit job delivers three ordered images once to the paired tab and keeps by
   assert.equal(status.lastJob.images.length, 3);
   assert.equal(status.lastJob.images[0].data_base64, undefined);
   assert.equal(status.lastJob.prompt, undefined);
+});
+
+test('collect-only recovery dispatches metadata to the paired tab without preparing or submitting', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const recoveryChatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const job = metadataOnly({...imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]),
+    collect_only: true, preserve_chat: true, recovery_chat_path: recoveryChatPath, output_binding_revision: 2});
+  const h = harness({inspection: {fresh: false, model: '', input_protocol: 4, idle: false}, next: job});
+  Object.assign(h.storage, {config});
+
+  h.fireAlarm();
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'next']);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect', 'image-collect']);
+  const dispatched = h.tabMessages[1];
+  assert.equal(dispatched.id, config.tabId);
+  assert.deepEqual(JSON.parse(JSON.stringify(dispatched.message.job)), job);
+  assert.equal(dispatched.message.job.collect_only, true);
+  assert.equal(dispatched.message.job.preserve_chat, true);
+  assert.equal(dispatched.message.job.recovery_chat_path, recoveryChatPath);
+  assert.equal(dispatched.message.job.output_binding_revision, 2);
+  assert.equal(JSON.stringify(h.storage.active.job).includes('data_base64'), false);
+  assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job'].includes(call.message.type)), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('unsupported output-binding revisions are rejected before content submission or deletion', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const recoveryChatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const recoveryJob = metadataOnly({...imageJob([referenceImage(1, 'source'), referenceImage(2, 'reference')]),
+    collect_only: true, preserve_chat: true, recovery_chat_path: recoveryChatPath, output_binding_revision: 1});
+  const normalJob = {job_id: 'job-1', mode: 'create', prompt: 'draw once', expected_model: 'Create image',
+    output_binding_revision: 2};
+
+  for (const [name, job] of [['wrong recovery revision', recoveryJob], ['revision flag on normal job', normalJob]])
+    await t.test(name, async () => {
+      const h = harness({inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: job});
+      Object.assign(h.storage, {config});
+      h.fireAlarm();
+      for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+      assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['heartbeat', 'next', 'result']);
+      assert.match(h.requests.at(-1).body.error, /Unsupported output prompt binding revision/);
+      assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job', 'image-collect', 'image-delete']
+        .includes(call.message.type)), false);
+      assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+      assert.equal(h.storage.active, undefined);
+    });
 });
 
 test('protocol-1 content refuses preflight without sending input bytes to content', async () => {
@@ -1360,6 +1519,104 @@ test('image-result only opens Delete confirmation after a successful save with a
     assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
     assert.equal(h.requests[0].body.cleanup_pending, expectedCleanupPending);
   });
+});
+
+test('multiple generated outputs use images_base64 and never trigger chat cleanup', async () => {
+  const active = {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1'}};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, responses: {result: {state: 'complete'}}});
+  Object.assign(h.storage, {active, config});
+  const imagesBase64 = ['cG5nMQ==', 'cG5nMg=='];
+  const {message, sender} = pairedImageResult({imagesBase64});
+
+  const response = await send(h, message, sender);
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+  assert.deepEqual(h.requests[0].body.images_base64, imagesBase64);
+  assert.equal(h.requests[0].body.image_base64, undefined);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
+  assert.equal(h.requests[0].body.chat_path, message.chatPath);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('single-output recovery saves the image and preserves the existing chat', async () => {
+  const recoveryChatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const active = {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1', collect_only: true,
+    preserve_chat: true, recovery_chat_path: recoveryChatPath}};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, responses: {result: {state: 'complete'}}});
+  Object.assign(h.storage, {active, config});
+  const {message, sender} = pairedImageResult({chatPath: recoveryChatPath});
+
+  const response = await send(h, message, sender);
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+  assert.equal(h.requests[0].body.image_base64, message.imageBase64);
+  assert.equal(h.requests[0].body.images_base64, undefined);
+  assert.equal(h.requests[0].body.chat_path, recoveryChatPath);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('successful recovery forwards prompt binding metadata and never deletes the chat', async () => {
+  const recoveryChatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const active = {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1', collect_only: true,
+    preserve_chat: true, recovery_chat_path: recoveryChatPath}};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, responses: {result: {state: 'complete'}}});
+  Object.assign(h.storage, {active, config});
+  const promptBinding = {root_match: false, exact_matching_descendant_count: 1,
+    expected_chars: 487, observed_chars: 502};
+  const {message, sender} = pairedImageResult({chatPath: recoveryChatPath, promptBinding});
+
+  const response = await send(h, message, sender);
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+  assert.deepEqual(h.requests[0].body.prompt_binding, promptBinding);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
+  assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('failed recovery forwards prompt binding metadata and never deletes the chat', async () => {
+  const recoveryChatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const active = {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1', collect_only: true,
+    preserve_chat: true, recovery_chat_path: recoveryChatPath}};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, responses: {result: {state: 'failed'}}});
+  Object.assign(h.storage, {active, config});
+  const promptBinding = {root_match: false, exact_matching_descendant_count: 0,
+    expected_chars: 487, observed_chars: 1284};
+  const {message, sender} = pairedImageResult({chatPath: undefined, imageBase64: undefined,
+    promptBinding, error: 'Existing submitted-job recovery failed. Prompt mismatch.'});
+
+  const response = await send(h, message, sender);
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+  assert.deepEqual(h.requests[0].body, {client_id: config.clientId, job_id: active.jobId,
+    error: message.error, prompt_binding: promptBinding});
+  assert.equal(h.requests.some(call => call.url.endsWith('/cleanup')), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+});
+
+test('preflight rejects multiple generated outputs without sending a result or cleanup request', async () => {
+  const active = {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1', preflight_only: true}};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active});
+  Object.assign(h.storage, {active, config});
+  const {message, sender} = pairedImageResult({preflightReady: true, imageBase64: undefined,
+    imagesBase64: ['cG5nMQ==', 'cG5nMg=='], chatPath: undefined});
+
+  const response = await send(h, message, sender);
+
+  assert.match(response.error, /Preflight cannot accept generated media or cleanup/);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+  assert.equal(h.storage.active, active);
 });
 
 test('valid result chat path opens Delete confirmation when sender URL still names the previous SPA chat', async () => {

@@ -835,6 +835,154 @@ zero attachment cards, ready/idle true, and no tab error on `second`.
 
 ## One bounded smoke test
 
+### 0.1.20 assistant-output recovery
+
+The first normal reference generation after 0.1.19 exposed a different result
+collector bug: when the native UI omitted an assistant author-role attribute,
+the old fallback counted large images in the entire Conversation region. That
+region can include the uploaded references. It must not be treated as proof that
+the provider returned multiple generated images.
+
+The collector now scopes images to the assistant author-role element or the
+body immediately following its native `ChatGPT said:` heading. It never counts
+the full conversation as assistant output. Read-only heartbeat `result_dom`
+reports only bounded counts, readiness booleans and the current `/c/...` path;
+it does not expose image URLs, message text, cookies or tokens.
+
+For an existing failed `Submission attempted. Multiple images returned;` job,
+explicit recovery through the existing fourth MCP tool is:
+
+```text
+extension_resolve(job_id=..., inspected_chatgpt=true,
+  recover_outputs=true, recovery_chat_path="/c/<exact-inspected-chat-uuid>")
+```
+
+It requires the latest failed job, original online 0.1.20 extension, no active
+work, and the exact paired-tab path from diagnostics, with one completed user /
+assistant turn and one to four scoped assistant images. It requeues the same job
+once as metadata-only `collect_only`, never uploads, prepares another chat,
+inserts text, clicks Send or deletes a chat. The content receiver also verifies
+the exact single-turn original prompt and chat path. A restart or uncertainty
+does not replay recovery.
+
+All distinct displayed assistant sources are collected in DOM order, after the
+whole ordered set is stable and generation has stopped. The limit is four
+outputs and 25 MiB combined. Every image is validated before saving any image.
+Receipts contain `outputs` with order, local path, dimensions, bytes and SHA-256,
+plus `output_count`. Single-output receipts retain the legacy singular fields.
+Multiple outputs are never silently reduced to one. Recovered results and all
+multi-output results use `cleanup_status=preserved`, even under automatic chat
+cleanup. An incomplete save preserves existing files and upstream chat; never
+regenerate or overwrite mismatched local output files.
+
+Source/unit tests alone do not establish the number of outputs in the failed
+production chat. Live diagnostics and recovered-file receipts are required.
+The isolated 0.1.20 release export passed 520 Python tests (3 skipped) and
+318 Node extension tests. After owner reload, live `second` diagnostics on
+2026-10-16 confirmed zero assistant author-role nodes, exactly one user heading
+and one assistant heading, a found assistant body with **one assistant image**,
+and **three conversation images**. Generation was no longer busy. This confirms
+the old conversation fallback counted two uploaded references as outputs; the
+provider did not return three generated images. No new generation is part of
+recovery.
+
+### 0.1.21 full rendered-prompt binding
+
+The 0.1.20 live recovery stopped before fetching assets because the entire
+native user-message wrapper did not equal the original full prompt. It did not
+save an image or send another request. The collector now checks either the
+whole body or a visible descendant's **complete rendered `innerText`** against
+the complete normalized original prompt. It never uses a substring, regex,
+hidden node, `textContent`, filename stripping, or a whole-conversation search.
+The same exact chat path and single-turn guards still apply.
+
+`prompt_binding` reports only `root_match`, `exact_matching_descendant_count`,
+`expected_chars`, and `observed_chars`, including on a failed inspected
+collection. No prompt text or DOM content is returned in diagnostics. This
+allows native evidence to distinguish wrapper text from the authored prompt.
+
+The same explicit `recover_outputs` action allows one compatibility resume
+only for the exact old 0.1.20 prompt-mismatch failure without a binding receipt.
+It requires 0.1.21, the original same-client/chat/latest-job gates, and a fresh
+completed-output diagnostic. In that release, `output_recovery_resumed` prevented
+another resume; the revision-gated 0.1.23 repair below supersedes that gate.
+The receipt must include a successful
+bounded prompt-binding diagnostic. No upload, Send, generation or deletion is
+part of this resume.
+
+The isolated 0.1.21 release export passed 535 Python tests (3 skipped) and
+322 Node extension tests. After the owner's reload, the one live compatibility
+resume failed safely before asset fetch: `root_match=false`, zero exact matching
+descendants, 2688 expected and 2700 observed normalized characters. No output was
+saved, no new upload/Send/generation/deletion occurred, and the original chat was
+preserved. This does not establish which native UI label caused the difference.
+
+### 0.1.22 read-only rendered-prompt diagnostics
+
+`extension_status().extension_diagnostics.prompt_dom` adds bounded structural
+evidence from the current user-message body. It reports character counts, whether
+the body starts/ends with the literal native `Create image` label, and at most
+eight visible elements whose entire rendered text equals that label. Each element
+has only a fixed tag category and boolean semantic-attribute markers. No message
+text, raw attributes, CSS classes, asset URLs, cookies or tokens are returned.
+Legacy receivers report null. This heartbeat does not change the prompt matcher,
+re-arm failed recovery, read image bytes, upload, Send, generate or delete.
+
+Focused 0.1.22 checks passed: 197 Python bridge/client tests and 335 Node
+content/worker/popup tests. The owner worker was restarted only after verifying
+all 45 jobs terminal and no pending cleanup; second reconnected on 0.1.21 with
+the same preserved chat. After reload, native evidence showed body length 2713,
+stripped length 2700, a recognized 12-character image pill, and two nested label
+spans. The recognized prompt-link span's parent is a paragraph. This supports
+testing pill-aware paragraph matching; it does not identify the outer wrapper's
+remaining text. No release commit/push had been made at that diagnostic checkpoint.
+
+### 0.1.23 local regression before reload
+
+The local fixture now reproduces a native pill inside the prompt paragraph and
+extra text outside it. It must fail on the old matcher before the fix is applied.
+Matching reads only rendered `innerText`, never form-control `.value`, hidden
+`textContent`, or a substring. A candidate must equal the entire normalized
+original prompt, or have exactly one recognized visible native pill with text
+`Create image` at its leading edge, followed by that entire prompt. Arbitrary
+wrapper text is not removed. Duplicate pills and changed prompts fail closed.
+
+Explicit collect-only recovery may resume an exact prompt-mismatch failure only
+with a strictly newer supported matcher revision. Diagnostic-only 0.1.22 shares
+0.1.21's revision and does not unlock a retry. Revision 2 is bound to the claim
+and must be echoed by the content-script receipt; a stale receiver cannot save
+an output under the new matcher. Previous binding evidence is retained. The
+same chat/client/latest-job/idle guards and no-Send/preserve-chat policy apply.
+
+Reload policy: reproduce the live failure in a realistic local fixture, prove
+old-code failure and fixed-code success, run the isolated offline release suite,
+then request one candidate reload for native acceptance. Do not ask the owner to
+reload for each speculative selector change, count test totals as proof of live
+success, or push a recovery fix before native output saving is verified.
+
+The isolated 0.1.23 release export passed 559 Python tests (3 skipped) and
+341 Node tests. All 11 exported release paths matched the worktree after the
+final regression tests. The owner was restarted only with all 45 jobs terminal
+and no pending cleanup.
+
+After the owner's 0.1.23 reload, one explicit revision-2 collection completed
+through standard MCP and the paired second-account extension. Native binding
+reported `root_match=false`, four exact matching rendered descendants, 2688
+expected/2700 outer observed characters, and `matcher_revision=2`. This verifies
+that excluding the recognized native pill inside the exact rendered prompt
+scope resolves this production failure without discarding arbitrary wrapper text.
+
+The existing job `b87ce0a366584347ad8c8fc78ffd6ace` saved one real PNG,
+941×1672, 1,969,985 bytes, SHA-256
+`fba15d15dcc8f5d0406afc8c38c5c62f53ff5dbf5d7b174ae00d47bf549a9e65`.
+The lead independently checked file type, dimensions, hash and visible contents;
+it is a new café kitten output, not either uploaded reference. The receipt is
+`complete`, `collect_only=true`, `preserve_chat=true`, `cleanup_status=preserved`.
+The original chat and both input files remain unchanged. No new upload, Send,
+generation, retry, deletion, CUA or direct provider API was used in this acceptance.
+This verifies recovery of the inspected existing image, not every future native
+UI layout or original-download resolution.
+
 Call `extension_status` first. When `account=second`, `paired=true` and `extension_online=true`, call
 `extension_image` once with `prompt` and `expected_model`. `expected_model` must
 be **`Create image`**, matching the verified native image route. This is not a

@@ -18,6 +18,10 @@ ACCOUNT = "second"
 CLIENT_ID = "123e4567-e89b-12d3-a456-426614174000"
 TOKEN = "synthetic-local-token-with-enough-length"
 EXTENSION_ORIGIN = "chrome-extension://" + "a" * 32
+RESULT_CHAT_PATH = "/c/123e4567-e89b-12d3-a456-426614174000"
+OTHER_RESULT_CHAT_PATH = "/c/223e4567-e89b-12d3-a456-426614174000"
+MULTIPLE_OUTPUT_ERROR = "Submission attempted. Multiple images returned; inspect ChatGPT instead of choosing silently"
+PROMPT_MISMATCH_ERROR = "Existing submitted-job recovery failed. Existing conversation does not match this job's prompt; image was not collected"
 UPLOAD_DOM = {
     "editor_form": True,
     "file_inputs": 3,
@@ -27,6 +31,23 @@ UPLOAD_DOM = {
     "multiple_image_inputs": 1,
     "unrestricted_inputs": 0,
     "attachment_cards": 1,
+}
+PROMPT_DOM = {
+    "body_chars": 2700,
+    "stripped_chars": 2700,
+    "matched_chip_chars": 0,
+    "label_count": 1,
+    "starts_with_label": True,
+    "ends_with_label": False,
+    "labels": [{
+        "tag": "SPAN",
+        "parent_tag": "DIV",
+        "inline_pill": False,
+        "system_hint": False,
+        "prompt_link": False,
+        "in_button": False,
+        "matched_chip": False,
+    }],
 }
 
 
@@ -81,6 +102,78 @@ def _failed_generation_upload(tmp_path, *, protocol=4,
 def _native_duplicate_name(name, number):
     stem, extension = name.rsplit(".", 1)
     return f"{stem}({number}).{extension}"
+
+
+def _result_dom(chat_path=RESULT_CHAT_PATH, *, assistant_images=2, assistant_body_found=True,
+                busy=False, user_headings=1, assistant_headings=1):
+    return {
+        "assistant_role_nodes": 1,
+        "user_headings": user_headings,
+        "assistant_headings": assistant_headings,
+        "assistant_images": assistant_images,
+        "conversation_images": assistant_images,
+        "assistant_body_found": assistant_body_found,
+        "busy": busy,
+        "chat_path": chat_path,
+    }
+
+
+def _failed_multiple_output_job(tmp_path, *, client_id=CLIENT_ID, error=MULTIPLE_OUTPUT_ERROR,
+                                worker_version="0.1.20", result_dom=None):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(client_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+    submitted = queue.submit("Generate from the supplied reference.", "Create image",
+                             images=_local_reference(tmp_path))
+    original_claim = queue.claim(client_id)
+    queue.result(client_id, submitted["job_id"], error=error)
+    queue.heartbeat(
+        client_id, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+        worker_version=worker_version, content_receiver="available",
+        result_dom=_result_dom() if result_dom is None else result_dom,
+    )
+    return queue, submitted["job_id"], submitted["images"], original_claim, error
+
+
+def _failed_prompt_mismatch_recovery(tmp_path, *, recovery_error=PROMPT_MISMATCH_ERROR):
+    queue, job_id, images, original_claim, original_error = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    legacy_claim = queue.claim(CLIENT_ID)
+    assert legacy_claim["collect_only"] is True
+    assert "data_base64" not in json.dumps(legacy_claim)
+    queue.result(CLIENT_ID, job_id, error=recovery_error)
+    return queue, job_id, images, original_claim, original_error
+
+
+def _failed_revision_one_prompt_binding(tmp_path):
+    queue, job_id, images, original_claim, original_error = _failed_multiple_output_job(
+        tmp_path, worker_version="0.1.21"
+    )
+    first_recovery = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert first_recovery["output_binding_revision"] == 1
+    claim = queue.claim(CLIENT_ID)
+    assert claim["collect_only"] is True
+    assert "data_base64" not in json.dumps(claim)
+    old_binding = {"root_match": False, "exact_matching_descendant_count": 0,
+                   "expected_chars": 2688, "observed_chars": 2700}
+    queue.result(CLIENT_ID, job_id, error=PROMPT_MISMATCH_ERROR, prompt_binding=old_binding)
+    return queue, job_id, images, original_claim, original_error, old_binding
+
+
+def _resumed_revision_two_claim(tmp_path):
+    queue, job_id, images, original_claim, original_error, old_binding = _failed_revision_one_prompt_binding(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    claim = queue.claim(CLIENT_ID)
+    return queue, job_id, images, original_claim, original_error, old_binding, queued, claim
+
+
+def _generated_png_base64(color, size=(512, 512)):
+    image = Image.new("RGB", size, color)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    raw = buffer.getvalue()
+    return base64.b64encode(raw).decode("ascii"), raw
 
 
 def _call_post(handler_type, path, payload, *, token=TOKEN, origin=EXTENSION_ORIGIN,
@@ -177,6 +270,8 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_protocol": 0,
         "receiver_error": "",
         "upload_dom": None,
+        "result_dom": None,
+        "prompt_dom": None,
     }
     legacy = queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True)
 
@@ -186,6 +281,8 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_protocol": 0,
         "receiver_error": "",
         "upload_dom": None,
+        "result_dom": None,
+        "prompt_dom": None,
     }
     # Pairing and diagnostic heartbeats are transient, not queue records on disk.
     assert list(queue.root.glob("*/state.json")) == []
@@ -213,11 +310,78 @@ def test_heartbeat_diagnostics_round_trip_with_current_protocol(tmp_path):
         "content_protocol": 2,
         "receiver_error": "",
         "upload_dom": UPLOAD_DOM,
+        "result_dom": None,
+        "prompt_dom": None,
     }
     assert queue.client["worker_version"] == "1.2.3"
     assert queue.client["content_receiver"] == "available"
     assert queue.client["receiver_error"] == ""
     assert queue.client["upload_dom"] == UPLOAD_DOM
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+def test_heartbeat_prompt_dom_round_trips_as_bounded_transient_copy(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    submitted_diagnostic = json.loads(json.dumps(PROMPT_DOM))
+
+    ready = queue.heartbeat(
+        CLIENT_ID,
+        ACCOUNT,
+        "Create image",
+        tab_ready=True,
+        input_protocol=4,
+        worker_version="0.1.21",
+        content_receiver="available",
+        prompt_dom=submitted_diagnostic,
+    )
+
+    assert ready["extension_diagnostics"]["prompt_dom"] == PROMPT_DOM
+    assert queue.client["prompt_dom"] == PROMPT_DOM
+    submitted_diagnostic["labels"][0]["tag"] = "BUTTON"
+    submitted_diagnostic["body_chars"] = 1
+    assert queue.status()["extension_diagnostics"]["prompt_dom"]["body_chars"] == 2700
+    assert queue.status()["extension_diagnostics"]["prompt_dom"]["labels"][0]["tag"] == "SPAN"
+
+    next_heartbeat = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+        worker_version="0.1.21", content_receiver="available",
+    )
+    assert next_heartbeat["extension_diagnostics"]["prompt_dom"] is None
+    assert queue.client["prompt_dom"] is None
+    assert list(queue.root.glob("*/state.json")) == []
+
+
+@pytest.mark.parametrize("prompt_dom", [
+    {},
+    {**PROMPT_DOM, "raw_prompt": "private text"},
+    {**PROMPT_DOM, "body_chars": 100001},
+    {**PROMPT_DOM, "label_count": 10001},
+    {**PROMPT_DOM, "starts_with_label": 1},
+    {**PROMPT_DOM, "labels": []},
+    {**PROMPT_DOM, "labels": [{**PROMPT_DOM["labels"][0], "tag": ["SPAN"]}]},
+    {**PROMPT_DOM, "labels": [{**PROMPT_DOM["labels"][0], "parent_tag": {"tag": "DIV"}}]},
+    {**PROMPT_DOM, "labels": [{**PROMPT_DOM["labels"][0], "tag": "SPAN arbitrary-value"}]},
+    {**PROMPT_DOM, "labels": [{**PROMPT_DOM["labels"][0], "text": "private text"}]},
+])
+def test_heartbeat_rejects_malformed_prompt_dom_without_mutating_client(tmp_path, prompt_dom):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+        worker_version="0.1.21", content_receiver="available", prompt_dom=PROMPT_DOM,
+    )
+    client_before = json.loads(json.dumps(queue.client))
+    status_before = queue.status()
+
+    with pytest.raises(ValueError, match="bounded prompt DOM diagnostic"):
+        queue.heartbeat(
+            CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, input_protocol=0,
+            worker_version="0.1.21", content_receiver="available", prompt_dom=prompt_dom,
+        )
+
+    assert queue.client == client_before
+    assert queue.status() == status_before
     assert list(queue.root.glob("*/state.json")) == []
 
 
@@ -470,6 +634,627 @@ def test_complete_result_saves_private_image_and_public_metadata(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE((queue.root / job_id / "state.json").stat().st_mode) == 0o600
     assert stat.S_IMODE(queue.root.stat().st_mode) == 0o700
+    assert complete["output_count"] == 1
+    assert complete["outputs"] == [{
+        "order": 1, "image_path": str(path), "dimensions": [512, 512],
+        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+    }]
+
+
+def test_explicit_output_recovery_claim_is_metadata_only_and_persists_all_outputs(tmp_path):
+    queue, job_id, submitted_images, original_claim, original_error = _failed_multiple_output_job(tmp_path)
+    assert "data_base64" in original_claim["images"][0]
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    assert queued["state"] == "queued"
+    assert queued["collect_only"] is True
+    assert queued["preserve_chat"] is True
+    assert queued["recovery_chat_path"] == RESULT_CHAT_PATH
+    assert queued["recovered_from_error"] == original_error
+    assert "error" not in queued
+
+    claim = queue.claim(CLIENT_ID)
+    expected_metadata = [{key: value for key, value in image.items() if key != "data_base64"}
+                         for image in original_claim["images"]]
+    assert claim["job_id"] == job_id
+    assert claim["collect_only"] is True
+    assert claim["preserve_chat"] is True
+    assert claim["recovery_chat_path"] == RESULT_CHAT_PATH
+    assert claim["images"] == expected_metadata == submitted_images
+    assert "data_base64" not in json.dumps(claim)
+
+    first, first_raw = _generated_png_base64((210, 30, 60))
+    second, second_raw = _generated_png_base64((10, 170, 80))
+    complete = queue.result(CLIENT_ID, job_id, images_base64=[first, second],
+                            chat_path=RESULT_CHAT_PATH, cleanup_pending=False)
+
+    assert complete["state"] == "complete"
+    assert complete["submitted"] is True and complete["generated"] is True
+    assert complete["cleanup_status"] == "preserved"
+    assert complete["recovery_chat_path"] == RESULT_CHAT_PATH
+    assert complete["chat_path"] == RESULT_CHAT_PATH
+    assert complete["output_count"] == 2
+    assert "image_path" not in complete  # No misleading single-output alias.
+    assert [item["order"] for item in complete["outputs"]] == [1, 2]
+    assert [item["image_path"].rsplit("/", 1)[-1] for item in complete["outputs"]] == [
+        "image-001.png", "image-002.png",
+    ]
+    assert [item["sha256"] for item in complete["outputs"]] == [
+        hashlib.sha256(first_raw).hexdigest(), hashlib.sha256(second_raw).hexdigest(),
+    ]
+    assert [item["dimensions"] for item in complete["outputs"]] == [[512, 512], [512, 512]]
+    assert [item["bytes"] for item in complete["outputs"]] == [len(first_raw), len(second_raw)]
+    assert [(queue.root / job_id / f"image-{index:03d}.png").read_bytes()
+            for index in (1, 2)] == [first_raw, second_raw]
+    assert all(stat.S_IMODE((queue.root / job_id / f"image-{index:03d}.png").stat().st_mode) == 0o600
+               for index in (1, 2))
+    persisted = (queue.root / job_id / "state.json").read_text()
+    assert first not in persisted and second not in persisted
+    assert "data_base64" not in persisted
+    assert complete["cleanup_status"] != "pending"  # Preserve the original conversation; no delete is authorized.
+
+
+@pytest.mark.parametrize("output_count", [0, 5])
+def test_output_array_rejects_counts_outside_one_to_four_before_writing(tmp_path, output_count):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    image_base64, _raw = _generated_png_base64((90, 80, 70))
+
+    with pytest.raises(ValueError, match="one to four ordered assistant outputs required"):
+        queue.result(CLIENT_ID, job_id, images_base64=[image_base64] * output_count,
+                     chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image-*"))
+
+
+@pytest.mark.parametrize("output_count", [1, 4])
+def test_output_array_accepts_one_and_four_and_keeps_ordered_manifest(tmp_path, output_count):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    encoded = [_generated_png_base64((index * 30, 140, 200))[0] for index in range(output_count)]
+
+    result = queue.result(CLIENT_ID, job_id, images_base64=encoded, chat_path=RESULT_CHAT_PATH)
+
+    assert result["output_count"] == output_count
+    assert [item["order"] for item in result["outputs"]] == list(range(1, output_count + 1))
+    if output_count == 1:
+        assert result["image_path"].endswith("/image.png")
+    else:
+        assert [item["image_path"].rsplit("/", 1)[-1] for item in result["outputs"]] == [
+            f"image-{index:03d}.png" for index in range(1, 5)
+        ]
+
+
+def test_output_result_rejects_mixed_single_and_array_representations(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    image_base64, _raw = _generated_png_base64((100, 120, 140))
+
+    with pytest.raises(ValueError, match="choose one image result representation"):
+        queue.result(CLIENT_ID, job_id, image_base64=image_base64, images_base64=[image_base64],
+                     chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image-*"))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"chat_path": "/c/123e4567-e89b-12d3-a456-426614174001"},
+    {"chat_path": RESULT_CHAT_PATH, "cleanup_pending": True},
+])
+def test_recovery_result_requires_exact_chat_and_no_cleanup_request(tmp_path, kwargs):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    first, _ = _generated_png_base64((30, 70, 110))
+    second, _ = _generated_png_base64((90, 130, 170))
+
+    with pytest.raises(ValueError, match="recovery must preserve the exact inspected result chat"):
+        queue.result(CLIENT_ID, job_id, images_base64=[first, second], **kwargs)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image-*"))
+
+
+def test_result_rejects_error_mixed_with_image_array(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    image_base64, _ = _generated_png_base64((110, 90, 70))
+
+    with pytest.raises(ValueError, match="an error cannot also contain generated images"):
+        queue.result(CLIENT_ID, job_id, error="collection failed", images_base64=[image_base64])
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+def test_output_batch_validates_every_image_before_writing_any_file(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    first, _raw = _generated_png_base64((20, 40, 60))
+    too_small, _ = _png_base64((2, 2))
+
+    with pytest.raises(ValueError, match="not a supported generated image of at least 512px"):
+        queue.result(CLIENT_ID, job_id, images_base64=[first, too_small], chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image-*"))
+
+
+def test_output_batch_enforces_twenty_five_mib_combined_without_partial_write(tmp_path, monkeypatch):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    outputs = [_generated_png_base64((index * 30, 50, 90)) for index in (1, 2)]
+    raw_sizes = [len(raw) for _encoded, raw in outputs]
+    combined_limit = max(raw_sizes) + 1  # Each output is individually valid; only the combined size fails.
+    assert sum(raw_sizes) > combined_limit
+    monkeypatch.setattr("chatgpt_api.extension_bridge.MAX_IMAGE", combined_limit)
+
+    with pytest.raises(ValueError, match="outputs exceed 25 MiB combined"):
+        queue.result(CLIENT_ID, job_id, images_base64=[encoded for encoded, _raw in outputs],
+                     chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image-*"))
+
+
+@pytest.mark.parametrize("kind", ["recovered_single", "normal_multiple"])
+def test_recovered_or_multiple_outputs_cannot_request_chat_cleanup(tmp_path, kind):
+    if kind == "recovered_single":
+        queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+        queue.claim(CLIENT_ID)
+        outputs = [_generated_png_base64((120, 100, 80))[0]]
+    else:
+        queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+        queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+        submitted = queue.submit("Normal multi-output job.", "Create image")
+        job_id = submitted["job_id"]
+        queue.claim(CLIENT_ID)
+        outputs = [_generated_png_base64((index * 30, 100, 80))[0] for index in (1, 2)]
+
+    expected_error = ("recovery must preserve the exact inspected result chat" if kind == "recovered_single"
+                      else "recovered or multiple outputs must preserve their chat")
+    with pytest.raises(ValueError, match=expected_error):
+        queue.result(CLIENT_ID, job_id, images_base64=outputs, cleanup_pending=True,
+                     **({"chat_path": RESULT_CHAT_PATH} if kind == "recovered_single" else {}))
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+def test_output_recovery_is_one_shot_and_interrupted_recovery_is_not_replayed(tmp_path):
+    queue, job_id, _images, _original_claim, original_error = _failed_multiple_output_job(tmp_path)
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["state"] == "queued"
+    assert queued["recovered_from_error"] == original_error
+    with pytest.raises(ValueError, match="only the inspected submitted multiple-image failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+    assert restarted.status(job_id)["state"] == "interrupted"
+    assert restarted.status(job_id)["collect_only"] is True
+    restarted.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    assert restarted.claim(CLIENT_ID) == {}
+
+
+def test_output_recovery_claim_rechecks_protocol_and_exact_worker_version(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=3,
+                    worker_version="0.1.20", content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="Input protocol changed before delivery"):
+        queue.claim(CLIENT_ID)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.claim(CLIENT_ID) == {}
+
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path / "old-worker")
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.19", content_receiver="available", result_dom=_result_dom())
+    with pytest.raises(ValueError, match="Input protocol changed before delivery"):
+        queue.claim(CLIENT_ID)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_output_recovery_requires_the_exact_after_send_multiple_image_failure(tmp_path):
+    queue, job_id, _images, _claim, _error = _failed_multiple_output_job(
+        tmp_path, error="Not submitted. Multiple images returned; this cannot be recovered."
+    )
+    with pytest.raises(ValueError, match="only the inspected submitted multiple-image failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("worker_version", ["0.1.19", ""])
+def test_output_recovery_requires_original_online_worker_020(tmp_path, worker_version):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path, worker_version=worker_version)
+    with pytest.raises(ValueError, match="original online extension 0.1.20"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_output_recovery_requires_same_original_client(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    replacement_id = "223e4567-e89b-12d3-a456-426614174000"
+    queue.pair(replacement_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+    queue.heartbeat(replacement_id, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.20", content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="original online extension 0.1.20"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_output_recovery_requires_latest_failure_and_no_other_active_work(tmp_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    other = queue.submit("Later independent work.", "Create image")
+    with pytest.raises(ValueError, match="finish existing work before output recovery"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(other["job_id"])["state"] == "queued"
+
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path / "older-failure")
+    newer = queue.submit("Later independent job.", "Create image")
+    queue.claim(CLIENT_ID)
+    image_base64, _raw = _generated_png_base64((30, 50, 70))
+    queue.result(CLIENT_ID, newer["job_id"], image_base64=image_base64)
+    with pytest.raises(ValueError, match="only the latest inspected output failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("result_dom_path", ["", "/c/123e4567-e89b-12d3-a456-426614174001"])
+def test_output_recovery_requires_heartbeat_result_dom_path_match(tmp_path, result_dom_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path, result_dom=_result_dom(result_dom_path))
+    with pytest.raises(ValueError, match="paired tab is not the inspected result chat"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("result_dom", [
+    _result_dom(assistant_images=0),
+    _result_dom(assistant_images=5),
+    _result_dom(busy=True),
+    _result_dom(assistant_body_found=False),
+])
+def test_output_recovery_requires_bounded_idle_assistant_result_dom(tmp_path, result_dom):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path, result_dom=result_dom)
+    with pytest.raises(ValueError, match="inspect the completed single-turn assistant outputs"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+@pytest.mark.parametrize("recover_outputs,recovery_chat_path", [
+    (1, RESULT_CHAT_PATH),
+    (False, RESULT_CHAT_PATH),
+    (True, None),
+    (True, "/c/not-a-uuid"),
+])
+def test_output_recovery_requires_explicit_flag_and_exact_chat_path(tmp_path, recover_outputs, recovery_chat_path):
+    queue, job_id, *_ = _failed_multiple_output_job(tmp_path)
+    with pytest.raises(ValueError):
+        queue.resolve(job_id, recover_outputs=recover_outputs, recovery_chat_path=recovery_chat_path)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_exact_legacy_prompt_mismatch_can_resume_once_with_021_and_save_bounded_binding(tmp_path):
+    queue, job_id, submitted_images, _original_claim, original_error = _failed_prompt_mismatch_recovery(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.21", content_receiver="available", result_dom=_result_dom())
+
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    assert queued["state"] == "queued"
+    assert queued["collect_only"] is True and queued["preserve_chat"] is True
+    assert queued["output_recovery_resumed"] is True
+    assert queued["recovered_from_error"] == original_error
+    assert queued["previous_recovery_error"] == PROMPT_MISMATCH_ERROR
+    assert "error" not in queued
+    with pytest.raises(ValueError, match="only the inspected submitted multiple-image failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    claim = queue.claim(CLIENT_ID)
+    assert claim["collect_only"] is True and claim["preserve_chat"] is True
+    assert claim["recovery_chat_path"] == RESULT_CHAT_PATH
+    assert [{key: value for key, value in image.items() if key != "data_base64"}
+            for image in claim["images"]] == submitted_images
+    assert "data_base64" not in json.dumps(claim)
+
+    first, _ = _generated_png_base64((40, 90, 140))
+    binding = {"root_match": False, "exact_matching_descendant_count": 1,
+               "expected_chars": 900, "observed_chars": 900}
+    complete = queue.result(CLIENT_ID, job_id, images_base64=[first],
+                            chat_path=RESULT_CHAT_PATH, prompt_binding=binding)
+
+    assert complete["state"] == "complete"
+    assert complete["prompt_binding"] == binding
+    assert complete["previous_recovery_error"] == PROMPT_MISMATCH_ERROR
+    assert complete["recovered_from_error"] == original_error
+    assert complete["cleanup_status"] == "preserved"
+
+
+def test_prompt_mismatch_resume_requires_worker_021_and_original_path(tmp_path):
+    queue, job_id, *_ = _failed_prompt_mismatch_recovery(tmp_path)
+    with pytest.raises(ValueError, match="prompt-binding resume needs 0.1.21"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["error"] == PROMPT_MISMATCH_ERROR
+
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.21", content_receiver="available", result_dom=_result_dom())
+    with pytest.raises(ValueError, match="prompt-binding resume must inspect the original result chat"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=OTHER_RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["error"] == PROMPT_MISMATCH_ERROR
+
+
+@pytest.mark.parametrize("recovery_error", [
+    PROMPT_MISMATCH_ERROR + ". Extra text.",
+    PROMPT_MISMATCH_ERROR.replace("does not match", "is different"),
+])
+def test_prompt_mismatch_resume_requires_the_exact_known_error(tmp_path, recovery_error):
+    queue, job_id, *_ = _failed_prompt_mismatch_recovery(tmp_path, recovery_error=recovery_error)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.21", content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="only the inspected submitted multiple-image failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["error"] == recovery_error
+
+
+def test_resumed_delivery_rechecks_worker_021_before_claim(tmp_path):
+    queue, job_id, *_ = _failed_prompt_mismatch_recovery(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.21", content_receiver="available", result_dom=_result_dom())
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.20", content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="Input protocol changed before delivery"):
+        queue.claim(CLIENT_ID)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["output_recovery_resumed"] is True
+
+
+def _resumed_prompt_mismatch_claim(tmp_path):
+    queue, job_id, *_ = _failed_prompt_mismatch_recovery(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.21", content_receiver="available", result_dom=_result_dom())
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    claim = queue.claim(CLIENT_ID)
+    return queue, job_id, claim
+
+
+def test_resumed_success_requires_matching_prompt_binding_before_writing(tmp_path):
+    queue, job_id, claim = _resumed_prompt_mismatch_claim(tmp_path)
+    assert claim["collect_only"] is True
+    image, _ = _generated_png_base64((100, 80, 60))
+    mismatch = {"root_match": False, "exact_matching_descendant_count": 0,
+                "expected_chars": 500, "observed_chars": 498}
+
+    with pytest.raises(ValueError, match="recovery prompt binding did not match"):
+        queue.result(CLIENT_ID, job_id, images_base64=[image], chat_path=RESULT_CHAT_PATH,
+                     prompt_binding=mismatch)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image*.png"))
+
+
+def test_resumed_success_requires_prompt_binding_receipt(tmp_path):
+    queue, job_id, _claim = _resumed_prompt_mismatch_claim(tmp_path)
+    image, _ = _generated_png_base64((30, 70, 110))
+
+    with pytest.raises(ValueError, match="prompt-binding resume requires its native binding diagnostic"):
+        queue.result(CLIENT_ID, job_id, images_base64=[image], chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image*.png"))
+
+
+@pytest.mark.parametrize("binding", [
+    {"root_match": 1, "exact_matching_descendant_count": 1, "expected_chars": 1, "observed_chars": 1},
+    {"root_match": True, "exact_matching_descendant_count": True, "expected_chars": 1, "observed_chars": 1},
+    {"root_match": True, "exact_matching_descendant_count": 1, "expected_chars": -1, "observed_chars": 1},
+    {"root_match": True, "exact_matching_descendant_count": 100001, "expected_chars": 1, "observed_chars": 1},
+    {"root_match": True, "exact_matching_descendant_count": 1, "expected_chars": 1, "observed_chars": 100001},
+    {"root_match": True, "exact_matching_descendant_count": 1, "expected_chars": 1},
+    {"root_match": True, "exact_matching_descendant_count": 1, "expected_chars": 1,
+     "observed_chars": 1, "observed_text": "raw prompt text"},
+])
+def test_prompt_binding_receipt_rejects_unbounded_or_unexpected_fields(tmp_path, binding):
+    queue, job_id, _claim = _resumed_prompt_mismatch_claim(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid bounded original-prompt binding diagnostic"):
+        queue.result(CLIENT_ID, job_id, error="Collection failed safely.", prompt_binding=binding)
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+def test_failed_resumed_result_persists_only_bounded_prompt_binding_counts(tmp_path):
+    queue, job_id, _claim = _resumed_prompt_mismatch_claim(tmp_path)
+    binding = {"root_match": False, "exact_matching_descendant_count": 0,
+               "expected_chars": 1200, "observed_chars": 1199}
+    long_error = "Collection failed safely. " + "x" * 600
+
+    failed = queue.result(CLIENT_ID, job_id, error=long_error, prompt_binding=binding)
+
+    assert failed["state"] == "failed"
+    assert len(failed["error"]) == 500
+    assert failed["prompt_binding"] == binding
+    assert failed["output_recovery_resumed"] is True
+    assert "observed_text" not in failed and "expected_text" not in failed
+    with pytest.raises(ValueError, match="only the inspected submitted multiple-image failure"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+
+
+def test_revision_one_mismatch_explicitly_resumes_with_revision_two_metadata_only(tmp_path):
+    queue, job_id, submitted_images, _original_claim, original_error, old_binding = _failed_revision_one_prompt_binding(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    assert queued["state"] == "queued"
+    assert queued["output_binding_revision"] == 2
+    assert queued["output_recovery_resumed"] is True
+    assert queued["previous_prompt_binding"] == old_binding
+    assert "prompt_binding" not in queued
+    assert queued["recovered_from_error"] == original_error
+    assert queued["previous_recovery_error"] == PROMPT_MISMATCH_ERROR
+    assert queued["recovery_chat_path"] == RESULT_CHAT_PATH
+
+    claim = queue.claim(CLIENT_ID)
+    assert claim["output_binding_revision"] == 2
+    assert claim["collect_only"] is True and claim["preserve_chat"] is True
+    assert claim["recovery_chat_path"] == RESULT_CHAT_PATH
+    assert [{key: value for key, value in image.items() if key != "data_base64"}
+            for image in claim["images"]] == submitted_images
+    assert "data_base64" not in json.dumps(claim)
+
+
+@pytest.mark.parametrize("worker_version", ["0.1.21", "0.1.22"])
+def test_revision_one_prompt_mismatch_cannot_resume_without_a_newer_matcher(tmp_path, worker_version):
+    queue, job_id, *_ = _failed_revision_one_prompt_binding(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version=worker_version, content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="unchanged retry refused"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    failed = queue.status(job_id)
+    assert failed["state"] == "failed"
+    assert failed["error"] == PROMPT_MISMATCH_ERROR
+    assert failed["prompt_binding"]["expected_chars"] == 2688
+    assert failed["prompt_binding"]["observed_chars"] == 2700
+
+
+def test_same_revision_two_mismatch_cannot_be_explicitly_retried_again(tmp_path):
+    queue, job_id, *_rest, queued, claim = _resumed_revision_two_claim(tmp_path)
+    assert queued["output_binding_revision"] == claim["output_binding_revision"] == 2
+    binding = {"root_match": False, "exact_matching_descendant_count": 0,
+               "expected_chars": 2688, "observed_chars": 2700, "matcher_revision": 2}
+    queue.result(CLIENT_ID, job_id, error=PROMPT_MISMATCH_ERROR, prompt_binding=binding)
+
+    with pytest.raises(ValueError, match="unchanged retry refused"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+    failed = queue.status(job_id)
+    assert failed["state"] == "failed"
+    assert failed["output_binding_revision"] == 2
+    assert failed["prompt_binding"] == binding
+
+
+def test_revision_two_claim_refuses_if_paired_worker_downgrades_before_delivery(tmp_path):
+    queue, job_id, *_ = _failed_revision_one_prompt_binding(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["state"] == "queued"
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.22", content_receiver="available", result_dom=_result_dom())
+
+    with pytest.raises(ValueError, match="Input protocol changed before delivery"):
+        queue.claim(CLIENT_ID)
+
+    failed = queue.status(job_id)
+    assert failed["state"] == "failed"
+    assert failed["output_binding_revision"] == 2
+    assert failed["output_recovery_resumed"] is True
+
+
+def test_legacy_revision_one_record_infers_prior_binding_and_allows_only_revision_two(tmp_path):
+    queue, job_id, *_ = _failed_revision_one_prompt_binding(tmp_path)
+    queue.jobs[job_id].pop("output_binding_revision")
+    queue._save(queue.jobs[job_id])
+
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+    assert "output_binding_revision" not in restarted.status(job_id)
+    restarted.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                        worker_version="0.1.22", content_receiver="available", result_dom=_result_dom())
+    with pytest.raises(ValueError, match="unchanged retry refused"):
+        restarted.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert restarted.status(job_id)["state"] == "failed"
+
+    restarted.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                        worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+    queued = restarted.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["state"] == "queued"
+    assert queued["output_binding_revision"] == 2
+    assert queued["previous_prompt_binding"]["observed_chars"] == 2700
+
+
+@pytest.mark.parametrize("wrong_client,wrong_path", [
+    (False, True),
+    (True, False),
+])
+def test_revision_resume_still_requires_original_client_and_exact_original_path(tmp_path, wrong_client, wrong_path):
+    queue, job_id, *_ = _failed_revision_one_prompt_binding(tmp_path)
+    client_id = CLIENT_ID
+    if wrong_client:
+        client_id = "223e4567-e89b-12d3-a456-426614174000"
+        queue.pair(client_id, ACCOUNT, visible_model="Create image", input_protocol=4)
+    queue.heartbeat(client_id, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+    recovery_path = OTHER_RESULT_CHAT_PATH if wrong_path else RESULT_CHAT_PATH
+
+    expected = ("prompt-binding resume must inspect the original result chat" if wrong_path else
+                "original online extension 0.1.20 or a supported newer matcher")
+    with pytest.raises(ValueError, match=expected):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=recovery_path)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["error"] == PROMPT_MISMATCH_ERROR
+
+
+@pytest.mark.parametrize("binding", [
+    {"root_match": True, "exact_matching_descendant_count": 0,
+     "expected_chars": 2688, "observed_chars": 2700},
+    {"root_match": True, "exact_matching_descendant_count": 0,
+     "expected_chars": 2688, "observed_chars": 2700, "matcher_revision": 1},
+    {"root_match": True, "exact_matching_descendant_count": 0,
+     "expected_chars": 2688, "observed_chars": 2700, "matcher_revision": True},
+])
+def test_revision_two_success_requires_exact_integer_matcher_revision_two(tmp_path, binding):
+    queue, job_id, *_rest, _queued, claim = _resumed_revision_two_claim(tmp_path)
+    assert claim["output_binding_revision"] == 2
+    image, _raw = _generated_png_base64((80, 120, 160))
+
+    with pytest.raises(ValueError, match="invalid bounded original-prompt binding diagnostic"):
+        queue.result(CLIENT_ID, job_id, images_base64=[image], chat_path=RESULT_CHAT_PATH,
+                     prompt_binding=binding)
+    assert queue.status(job_id)["state"] == "claimed"
+    assert not list((queue.root / job_id).glob("image*.png"))
+
+
+def test_revision_two_success_accepts_matching_bounded_binding_and_preserves_chat(tmp_path):
+    queue, job_id, *_rest, _queued, claim = _resumed_revision_two_claim(tmp_path)
+    assert claim["output_binding_revision"] == 2
+    image, _raw = _generated_png_base64((100, 130, 170))
+    binding = {"root_match": False, "exact_matching_descendant_count": 1,
+               "expected_chars": 2688, "observed_chars": 2700, "matcher_revision": 2}
+
+    complete = queue.result(CLIENT_ID, job_id, images_base64=[image], chat_path=RESULT_CHAT_PATH,
+                            prompt_binding=binding)
+
+    assert complete["state"] == "complete"
+    assert complete["prompt_binding"] == binding
+    assert complete["output_binding_revision"] == 2
+    assert complete["cleanup_status"] == "preserved"
+    assert complete["chat_path"] == RESULT_CHAT_PATH
+
+
+def test_revision_two_claim_is_interrupted_after_restart_without_replay(tmp_path):
+    queue, job_id, *_rest, queued, claim = _resumed_revision_two_claim(tmp_path)
+    assert queued["state"] == "queued"
+    assert claim["output_binding_revision"] == 2
+    restarted = ExtensionQueue(queue.root, ACCOUNT)
+
+    interrupted = restarted.status(job_id)
+    assert interrupted["state"] == "interrupted"
+    assert interrupted["output_binding_revision"] == 2
+    assert interrupted["previous_prompt_binding"]["observed_chars"] == 2700
+    restarted.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                        worker_version="0.1.23", content_receiver="available", result_dom=_result_dom())
+    assert restarted.claim(CLIENT_ID) == {}
+    assert restarted.status(job_id)["state"] == "interrupted"
 
 
 def _complete_image_job(queue, *, cleanup_pending=True):

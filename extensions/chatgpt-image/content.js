@@ -29,6 +29,52 @@
   const assistants = () => [...document.querySelectorAll('[data-message-author-role="assistant"]')];
   const conversation = () => document.querySelector('[role="region"][aria-label="Conversation"]');
   const turnHeadings = text => [...(conversation()?.querySelectorAll("h4") || [])].filter(el => el.textContent.trim() === text);
+  // Never fall back to the whole conversation: it also contains uploaded references.
+  const assistantBody = () => assistants().at(-1) || turnHeadings("ChatGPT said:").at(-1)?.nextElementSibling || null;
+  const displayedImages = root => root ? [...root.querySelectorAll("img")].filter(img =>
+    visible(img) && img.complete && img.naturalWidth >= 512 && img.naturalHeight >= 512) : [];
+  const outputImages = () => [...new Map(displayedImages(assistantBody()).map(img => [img.currentSrc || img.src, img])).values()];
+  function resultDomDiagnostics() {
+    return {assistant_role_nodes: assistants().length, user_headings: turnHeadings("You said:").length,
+      assistant_headings: turnHeadings("ChatGPT said:").length, assistant_body_found: !!assistantBody(),
+      assistant_images: outputImages().length, conversation_images: displayedImages(conversation()).length,
+      busy: busy(), chat_path: /^\/c\/[a-f0-9-]{36}$/.test(location.pathname) ? location.pathname : ""};
+  }
+  function originalPromptBinding(job) {
+    const body = turnHeadings("You said:")[0]?.nextElementSibling;
+    const expected = normalizedText(jobPrompt(job));
+    const observed = body ? promptText(body) : "";
+    const matches = element => {
+      if (!element || !visible(element) || typeof element.innerText !== "string") return false;
+      const rendered = normalizedText(element.innerText);
+      if (rendered === expected) return true;
+      const chips = [...element.querySelectorAll(imageChipSelector)].filter(visible);
+      // Only the native leading image pill may be excluded, never wrapper text.
+      return chips.length === 1 && normalizedText(chips[0].innerText) === "Create image" &&
+        rendered.startsWith("Create image ") && rendered.slice("Create image ".length) === expected;
+    };
+    const count = body ? [...body.querySelectorAll("*")].filter(matches).length : 0;
+    return {root_match: matches(body), exact_matching_descendant_count: count,
+      expected_chars: expected.length, observed_chars: observed.length,
+      ...(job.output_binding_revision === 2 ? {matcher_revision: 2} : {})};
+  }
+  function promptDomDiagnostics() {
+    const body = turnHeadings("You said:")[0]?.nextElementSibling;
+    const raw = normalizedText(body?.innerText || "");
+    const chip = body && imageChip(body);
+    const tags = new Set(["DIV", "SPAN", "BUTTON", "A", "P"]);
+    const tag = element => tags.has(element?.tagName) ? element.tagName : "OTHER";
+    const labels = body ? [...body.querySelectorAll("*")].filter(element => visible(element) &&
+      typeof element.innerText === "string" && normalizedText(element.innerText) === "Create image") : [];
+    return {body_chars: Math.min(raw.length, 100000), stripped_chars: Math.min(body ? promptText(body).length : 0, 100000),
+      matched_chip_chars: Math.min(chip?.innerText?.length || 0, 100000), label_count: Math.min(labels.length, 10000),
+      starts_with_label: raw.startsWith("Create image"), ends_with_label: raw.endsWith("Create image"),
+      labels: labels.slice(0, 8).map(element => ({tag: tag(element), parent_tag: tag(element.parentElement),
+        inline_pill: element.hasAttribute("data-inline-selection-pill"),
+        system_hint: element.hasAttribute("data-system-hint-type"),
+        prompt_link: element.hasAttribute("data-prompt-link-href"),
+        in_button: !!element.closest("button"), matched_chip: element === chip}))};
+  }
   const verificationRequired = () => [...document.querySelectorAll(
     'iframe[src*="challenges.cloudflare.com"], #challenge-running, #challenge-stage'
   )].some(visible);
@@ -377,6 +423,7 @@
   }
   async function run(job, collectOnly = false) {
     let submitted = collectOnly;
+    let promptBinding = null;
     try {
       if ((job.preflight_only !== undefined && typeof job.preflight_only !== "boolean") ||
           (job.clear_preflight_uploads !== undefined &&
@@ -391,12 +438,16 @@
         throw new Error("Invalid inspected cleanup resume");
       const prompt = jobPrompt(job);
       if (collectOnly) {
+        if (job.output_binding_revision !== undefined && job.output_binding_revision !== 2)
+          throw new Error("Unsupported output prompt binding revision; image was not collected");
         if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
           throw new Error("Wrong site or model; existing image was not collected");
+        if (job.collect_only && location.pathname !== job.recovery_chat_path)
+          throw new Error("Existing result chat does not match this inspected job; nothing was submitted");
         if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 || turnHeadings("ChatGPT said:").length !== 1)
           throw new Error("Inspect the completed single-turn conversation before collecting; nothing was submitted");
-        const userBody = turnHeadings("You said:")[0].nextElementSibling;
-        if (!userBody || typeof job.prompt !== "string" || promptText(userBody) !== normalizedText(prompt))
+        promptBinding = originalPromptBinding(job);
+        if (typeof job.prompt !== "string" || (!promptBinding.root_match && !promptBinding.exact_matching_descendant_count))
           throw new Error("Existing conversation does not match this job's prompt; image was not collected");
       } else {
         const inputJob = job.preflight_cleanup_only === true ? bindInspectedPreflight(job) : job;
@@ -444,38 +495,47 @@
       while (Date.now() < deadline) {
         await sleep(2500);
         if (verificationRequired()) throw new Error("Owner action required: complete verification and inspect ChatGPT before any new request.");
-        const message = assistants().at(-1) || (turnHeadings("ChatGPT said:").length === 1 ? conversation() : null);
-        const images = message ? [...message.querySelectorAll("img")].filter(img =>
-          visible(img) && img.complete && img.naturalWidth >= 512 && img.naturalHeight >= 512) : [];
-        if (images.length > 1) throw new Error("Multiple images returned; inspect ChatGPT instead of choosing silently");
-        const img = images[0];
-        if (!img || busy()) { stable = 0; continue; }
-        const source = img.currentSrc || img.src;
-        stable = source === previous ? stable + 1 : 0;
-        previous = source;
+        const images = outputImages();
+        if (!images.length || busy()) { stable = 0; continue; }
+        if (images.length > 4) throw new Error("More than four assistant images; preserve chat and inspect outputs");
+        const sources = images.map(img => img.currentSrc || img.src);
+        const signature = JSON.stringify(sources);
+        stable = signature === previous ? stable + 1 : 0;
+        previous = signature;
         if (stable < 2) continue;
-        // Read only the asset already displayed by ChatGPT, never auth or API data.
-        const url = new URL(source, location.href);
-        if (!["https:", "blob:"].includes(url.protocol)) throw new Error("Unsupported displayed image source");
-        const response = await fetch(url.href, {signal: AbortSignal.timeout(30000)});
-        if (!response.ok) throw new Error("Displayed image could not be read; use its native download manually");
-        const blob = await response.blob();
-        if (!/^image\/(png|jpeg|webp)(;|$)/i.test(blob.type) || blob.size > 25 * 1024 * 1024)
-          throw new Error("Generated asset is not a supported image under 25 MiB");
-        const imageBase64 = await new Promise((resolve, reject) => {
-          const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(",")[1]);
-          reader.onerror = reject; reader.readAsDataURL(blob);
-        });
-        cleanupTarget = {jobId: job.job_id, path: location.pathname, prompt};
-        const result = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id, imageBase64,
-          chatPath: location.pathname});
+        const path = location.pathname;
+        const outputs = [];
+        let total = 0;
+        for (const source of sources) {
+          // Read only assets displayed in this assistant response, never auth/API data.
+          const url = new URL(source, location.href);
+          if (!["https:", "blob:"].includes(url.protocol)) throw new Error("Unsupported displayed image source");
+          const response = await fetch(url.href, {signal: AbortSignal.timeout(30000)});
+          if (!response.ok) throw new Error("Displayed image could not be read; preserve the existing chat");
+          const blob = await response.blob();
+          total += blob.size;
+          if (!/^image\/(png|jpeg|webp)(;|$)/i.test(blob.type) || total > 25 * 1024 * 1024)
+            throw new Error("Generated assets must be supported images under 25 MiB combined; preserve chat");
+          const imageBase64 = await new Promise((resolve, reject) => {
+            const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(",")[1]);
+            reader.onerror = reject; reader.readAsDataURL(blob);
+          });
+          outputs.push(imageBase64);
+        }
+        if (path !== location.pathname || busy() || JSON.stringify(outputImages().map(img => img.currentSrc || img.src)) !== signature)
+          throw new Error("Existing result changed during collection; preserve chat and do not regenerate");
+        cleanupTarget = job.preserve_chat || outputs.length > 1 ? null : {jobId: job.job_id, path, prompt};
+        const result = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
+          ...(outputs.length === 1 ? {imageBase64: outputs[0]} : {imagesBase64: outputs}), chatPath: path,
+          ...(job.collect_only && promptBinding ? {promptBinding} : {})});
         if (result?.error) throw new Error("Image result could not be saved. Inspect ChatGPT; do not regenerate.");
         return;
       }
       throw new Error("Timed out; generation may still complete. Inspect ChatGPT before resubmitting.");
     } catch (error) {
       await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
-        error: (submitted ? "Submission attempted. " : "Not submitted. ") + error.message}).catch(() => {});
+        ...(job.collect_only && promptBinding ? {promptBinding} : {}),
+        error: (collectOnly ? "Existing submitted-job recovery failed. " : submitted ? "Submission attempted. " : "Not submitted. ") + error.message}).catch(() => {});
     } finally { running = false; uploadBinding = null; }
   }
   const listener = (message, _sender, reply) => {
@@ -497,8 +557,10 @@
         idle = true;
         const model = "Create image";
         inspect({expected_model: model});
-        reply({fresh: true, model, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics()});
-      } catch (error) { reply({error: error.message, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics()}); }
+        reply({fresh: true, model, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()});
+      } catch (error) { reply({error: !running && hasTurns() && !busy()
+          ? "Existing conversation preserved; inspect its job result instead of submitting again" : error.message,
+        input_protocol: 4, idle, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()}); }
       return;
     }
     if (!["image-job", "image-collect"].includes(message.type)) return;

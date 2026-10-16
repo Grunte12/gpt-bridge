@@ -147,12 +147,17 @@ def test_client_resolve_propagates_clear_flag_only_when_true():
     client.resolve("synthetic-job")
     client.resolve("synthetic-job", clear_preflight_uploads=False)
     client.resolve("synthetic-job", clear_preflight_uploads=True)
+    client.resolve("synthetic-job", recover_outputs=True,
+                   recovery_chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
 
     assert calls == [
         ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True}),
         ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True}),
         ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True,
                       "clear_preflight_uploads": True}),
+        ("resolve", {"job_id": "synthetic-job", "inspected_chatgpt": True,
+                      "recover_outputs": True,
+                      "recovery_chat_path": "/c/123e4567-e89b-12d3-a456-426614174000"}),
     ]
 
 
@@ -303,6 +308,9 @@ def test_mcp_resolve_requires_inspection_before_calling_client(arguments):
     {"job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": "true"},
     {"job_id": "synthetic", "inspected_chatgpt": True, "clear_failed_uploads": 1},
     {"job_id": "synthetic", "inspected_chatgpt": True, "clear_failed_uploads": "true"},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "recover_outputs": 1},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "recover_outputs": "true"},
+    {"job_id": "synthetic", "inspected_chatgpt": True, "recover_outputs": True, "recovery_chat_path": 123},
 ])
 def test_mcp_resolve_rejects_non_boolean_inspection_and_cleanup_flags(arguments):
     from chatgpt_api.extension_bridge import create_mcp
@@ -355,6 +363,26 @@ def test_mcp_failed_upload_cleanup_forwards_only_explicit_inspected_names():
         "clear_failed_uploads": True, "native_upload_names": names,
     }))
     assert calls == [("synthetic", False, True, names)]
+
+
+def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
+    from chatgpt_api.extension_bridge import create_mcp
+
+    client = ExtensionClient(TOKEN)
+    calls = []
+    client.resolve = lambda *args: calls.append(args) or {"state": "queued"}
+    server = create_mcp(client)
+    chat_path = "/c/123e4567-e89b-12d3-a456-426614174000"
+
+    result = asyncio.run(server.call_tool("extension_resolve", {
+        "job_id": "synthetic-job",
+        "inspected_chatgpt": True,
+        "recover_outputs": True,
+        "recovery_chat_path": chat_path,
+    }))
+
+    assert calls == [("synthetic-job", False, False, None, True, chat_path)]
+    assert "queued" in result[0].text
 
 
 def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval(tmp_path):

@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -36,14 +36,80 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   let nativeRemovalWaitPolls = 0;
   let sendClicks = 0;
   let sendClickedWhenReady = false;
+  let assistantImageQueries = 0;
+  const fetchedUrls = [];
+  const defaultImageSource = 'https://chatgpt.com/generated.png';
+  const toDisplayedImage = source => ({src: source, currentSrc: source, complete: true,
+    naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}]});
+  const baseAssistantSources = assistantImageSources === null
+    ? (imageReady ? [defaultImageSource] : []) : assistantImageSources;
+  const userImages = userImageSources.map(toDisplayedImage);
+  let userPromptDescendantNodes = [];
+  userPromptDescendantNodes = userPromptDescendants.map(spec => {
+    const attributes = new Set(Object.entries(spec.attributes || {})
+      .filter(([, value]) => value !== false).map(([name]) => name));
+    if (spec.inlinePill) attributes.add('data-inline-selection-pill');
+    if (spec.systemHint) attributes.add('data-system-hint-type');
+    if (spec.promptLink) attributes.add('data-prompt-link-href');
+    const parentElement = {tagName: spec.parentTag || (spec.inButton ? 'BUTTON' : 'DIV')};
+    return {
+      ...('innerText' in spec ? {innerText: spec.innerText} : {}),
+      ...('textContent' in spec ? {textContent: spec.textContent} : {}),
+      ...('value' in spec ? {value: spec.value} : {}),
+      tagName: spec.tagName || 'SPAN', parentElement,
+      hasAttribute(name) { return attributes.has(name); },
+      closest(selector) { return selector === 'button' && spec.inButton ? parentElement : null; },
+      querySelector(selector) {
+        const indices = spec.chipChildIndices || (Number.isInteger(spec.chipChildIndex) ? [spec.chipChildIndex] : []);
+        return imageMode && /data-inline-selection-pill|data-prompt-link-href/.test(selector)
+          ? indices.map(index => userPromptDescendantNodes[index]).find(node => node &&
+            (node.hasAttribute('data-inline-selection-pill') || node.hasAttribute('data-prompt-link-href'))) || null
+          : null;
+      },
+      querySelectorAll(selector) {
+        const indices = spec.chipChildIndices || (Number.isInteger(spec.chipChildIndex) ? [spec.chipChildIndex] : []);
+        return imageMode && /data-inline-selection-pill|data-prompt-link-href/.test(selector)
+          ? indices.map(index => userPromptDescendantNodes[index]).filter(node => node &&
+            (node.hasAttribute('data-inline-selection-pill') || node.hasAttribute('data-prompt-link-href'))) : [];
+      },
+      getClientRects: () => spec.visible === false ? [] : [{}]
+    };
+  });
+  if (imageMode && !userPromptDescendantNodes.some(node =>
+    node.hasAttribute('data-inline-selection-pill') || node.hasAttribute('data-prompt-link-href'))) {
+    const attribute = promptLinkBadge ? 'data-prompt-link-href' : 'data-inline-selection-pill';
+    userPromptDescendantNodes.push({innerText: 'Create image', tagName: 'SPAN', parentElement: {tagName: 'P'},
+      hasAttribute(name) { return name === attribute; }, closest() { return null; },
+      querySelector() { return null; }, querySelectorAll() { return []; },
+      getClientRects: () => [{}]});
+  }
+  const allConversationImages = (conversationImageSources === null
+    ? [...userImageSources, ...baseAssistantSources] : conversationImageSources).map(toDisplayedImage);
+  const currentAssistantImages = () => {
+    if (assistantImageSequence) {
+      const index = Math.min(assistantImageQueries, assistantImageSequence.length - 1);
+      assistantImageQueries++;
+      return assistantImageSequence[index].map(toDisplayedImage);
+    }
+    return baseAssistantSources.map(toDisplayedImage);
+  };
+  const assistantMessage = {querySelectorAll(selector) { return selector === 'img' ? currentAssistantImages() : []; }};
   const uploadedFiles = nativeAttachmentNames.map(name => ({name, type: 'image/png', bytes: Uint8Array.from([1])}));
   const inputEvents = [];
   const composerEvents = [];
   const location = {origin: 'https://chatgpt.com', href: `https://chatgpt.com${temporaryChat ? '/?temporary-chat=true' : chatPath}`, pathname: chatPath};
-  const hasConversation = () => user || (conversationTurns || []).length > 0;
+  const currentConversationTurns = () => conversationTurns ||
+    (conversationTurnsAfterSend && sendClicks > 0 ? ['You said:', 'ChatGPT said:'] : []);
+  const hasConversation = () => user || currentConversationTurns().length > 0;
   const sent = [];
   const chip = {innerText: 'Create image', getClientRects: () => [{}]};
   const composerText = () => `${imageMode ? 'Create image' : ''}${draft ? (imageMode ? ' ' : '') + draft : ''}`;
+  const bodyImageChip = selector => {
+    if (!imageMode) return null;
+    const attribute = promptLinkBadge ? 'data-prompt-link-href' : 'data-inline-selection-pill';
+    return selector.includes(attribute)
+      ? userPromptDescendantNodes.find(node => node.hasAttribute(attribute)) || chip : null;
+  };
   class Textarea {
     constructor() { this._value = composerText(); this.disabled = false; }
     querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
@@ -222,15 +288,22 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     removeEventListener(type, fn) { if (type === 'click') this.listeners.delete(fn); },
     click(event = {isTrusted: false}) { clicks++; finalDeleteClicks++; for (const fn of this.listeners) fn(event); location.pathname = '/'; dialogOpen = false; }};
   const deleteDialog = {getClientRects: () => dialogOpen ? [{}] : [], querySelectorAll(selector) { return selector === 'button' ? [finalDeleteButton] : []; }};
-  const displayedImage = {src: 'https://chatgpt.com/generated.png', currentSrc: 'https://chatgpt.com/generated.png',
-    complete: true, naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}]};
   const conversation = {getClientRects: () => [{}], querySelectorAll(selector) {
-    if (selector === 'img') return imageReady ? [displayedImage] : [];
-    if (selector === 'h4') return (conversationTurns || []).map((textContent, index) => ({
-      textContent, nextElementSibling: conversationBodies[index] ? {
-        innerText: conversationBodies[index],
-        querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
-      } : null,
+    if (selector === 'img') return allConversationImages;
+    if (selector === 'h4') return currentConversationTurns().map((textContent, index) => ({
+      textContent, nextElementSibling: {
+        innerText: conversationBodies[index] || '',
+        querySelector(selector) { return bodyImageChip(selector); },
+        querySelectorAll(selector) {
+          if (selector === 'img') return textContent === 'You said:' ? userImages :
+            textContent === 'ChatGPT said:' ? currentAssistantImages() : [];
+          if (/data-inline-selection-pill|data-prompt-link-href/.test(selector))
+            return userPromptDescendantNodes.filter(node => node.hasAttribute('data-inline-selection-pill') ||
+              node.hasAttribute('data-prompt-link-href'));
+          return selector === '*' && textContent === 'You said:' ? userPromptDescendantNodes : [];
+        },
+        getClientRects: () => [{}]
+      },
       getClientRects: () => [{}]
     }));
     return [];
@@ -253,10 +326,12 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
         return uploadRemovalPending ? {getClientRects: () => [{}]} : nativeUploadCards
           ? (uploadedFiles.length && !uploadReadyState ? {getClientRects: () => [{}]} : null)
           : attachments ? {} : (uploadStarted && !uploadReadyState ? {getClientRects: () => [{}]} : uploadCards()[0] || null);
-      if (selector === '[data-message-author-role="user"]') return user ? {} : null;
+      if (selector === '[data-message-author-role="user"]') return user || currentConversationTurns().includes('You said:') ? {} : null;
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="assistant"]')
+        return assistantRoleNodes === 'always' || (assistantRoleNodes && sendClicks > 0) ? [assistantMessage] : [];
       if (selector === 'input[type="file"]') return [...fileInputs, ...(outsideFileInput ? [outsideFileInput] : [])];
       if (selector.includes('button[aria-label^="Remove "]')) return nativeRemoveControls();
       if (nativeUploadCards && (selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]'))) return [];
@@ -285,7 +360,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       if (selector.includes('challenges.cloudflare.com') && (challengeState || (challengeAfterSend && clicks)))
         return [{getClientRects: () => [{}]}];
       if (selector.includes('h4') && !selector.startsWith('region'))
-        return (conversationTurns || []).map(textContent => ({textContent, getClientRects: () => [{}]}));
+        return currentConversationTurns().map(textContent => ({textContent, getClientRects: () => [{}]}));
       return [];
     },
     execCommand(_cmd, _ui, value) {
@@ -336,7 +411,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       else { now += ms; queueMicrotask(fn); }
       return 1;
     }, clearTimeout() {},
-    URL, AbortSignal, async fetch() { fetchCalls++; return {ok: true, async blob() { return {type: 'image/png', size: 32}; }}; },
+    URL, AbortSignal, async fetch(url) { fetchedUrls.push(url); fetchCalls++; return {ok: true, async blob() { return {type: 'image/png', size: 32}; }}; },
     FileReader: class { readAsDataURL() { fileReaderReads++; this.result = 'data:image/png;base64,cG5n'; this.onload(); } }
   };
   if (staleListenerMarker) context.__gptBridgeImageWorkerListener = () => {};
@@ -344,7 +419,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   return {receive: listener, sent, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
     get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, get sendClicks() { return sendClicks; },
     get sendQueries() { return sendQueries; }, get insertTextCalls() { return insertTextCalls; }, get composerEvents() { return composerEvents; },
-    get fetchCalls() { return fetchCalls; }, get fileReaderReads() { return fileReaderReads; },
+    get fetchCalls() { return fetchCalls; }, get fetchedUrls() { return fetchedUrls; }, get fileReaderReads() { return fileReaderReads; },
     get sendClickedWhenReady() { return sendClickedWhenReady; }, get uploadedFiles() { return uploadedFiles; }, get fileInputs() { return fileInputs; }, get inputEvents() { return inputEvents; },
     get removeClicks() { return removeClickCount; },
     get removedUploadNames() { return removedUploadNames; },
@@ -373,9 +448,9 @@ async function waitForContentResult(harness) {
     await new Promise(resolve => setImmediate(resolve));
 }
 
-async function startCollect(harness, expectedModel = 'Create image', prompt = 'draw a cat') {
+async function startCollect(harness, expectedModel = 'Create image', prompt = 'draw a cat', jobOptions = {}) {
   let accepted;
-  harness.receive({type: 'image-collect', job: {job_id: 'job-collect', expected_model: expectedModel, prompt}}, {}, value => { accepted = value; });
+  harness.receive({type: 'image-collect', job: {job_id: 'job-collect', expected_model: expectedModel, prompt, ...jobOptions}}, {}, value => { accepted = value; });
   await new Promise(resolve => setImmediate(resolve));
   return accepted;
 }
@@ -437,7 +512,12 @@ test('inspection selects the visible composer when a hidden retained composer co
   h.receive({type: 'image-inspect'}, {}, value => { result = value; });
   assert.deepEqual(JSON.parse(JSON.stringify(result)), {fresh: true, model: 'Create image', input_protocol: 4, idle: true,
     upload_dom: {editor_form: true, file_inputs: 1, form_file_inputs: 1, image_inputs: 1, form_image_inputs: 1,
-      multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 0}});
+      multiple_image_inputs: 1, unrestricted_inputs: 0, attachment_cards: 0},
+    result_dom: {assistant_role_nodes: 0, user_headings: 0, assistant_headings: 0,
+      assistant_body_found: false, assistant_images: 0, conversation_images: 0, busy: false,
+      chat_path: '/c/123e4567-e89b-12d3-a456-426614174000'},
+    prompt_dom: {body_chars: 0, stripped_chars: 0, matched_chip_chars: 0, label_count: 0,
+      starts_with_label: false, ends_with_label: false, labels: []}});
   assert.equal(h.clicks, 0);
   assert.equal(h.editor.innerText, 'Create image');
 });
@@ -761,6 +841,47 @@ test('upload DOM diagnostics are included on inspection errors without changing 
   assert.deepEqual(h.inputEvents, []);
 });
 
+test('prompt DOM inspection counts exact visible edge labels and reports bounded semantic flags without text', () => {
+  const uniquePromptText = 'private prompt marker that must not appear in diagnostics';
+  const body = `Create image\n${uniquePromptText}\nCreate image`;
+  const labels = [
+    {innerText: 'Create image', tagName: 'SPAN', parentTag: 'DIV', inlinePill: true, systemHint: true},
+    {innerText: 'Create image', tagName: 'SPAN', parentTag: 'BUTTON', promptLink: true, inButton: true},
+    ...Array.from({length: 8}, () => ({innerText: 'Create image', tagName: 'SPAN', parentTag: 'P'})),
+    {innerText: 'Create image', visible: false},
+    {innerText: 'before Create image after'},
+    {textContent: 'Create image'}
+  ];
+  const h = contentHarness({
+    user: true, conversationTurns: ['You said:'], conversationBodies: [body], userPromptDescendants: labels
+  });
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+
+  const diagnostics = JSON.parse(JSON.stringify(result.prompt_dom));
+  const normalizedBody = body.replace(/\s+/g, ' ').trim();
+  assert.deepEqual(diagnostics, {
+    body_chars: normalizedBody.length,
+    stripped_chars: normalizedBody.replace('Create image', ' ').replace(/\s+/g, ' ').trim().length,
+    matched_chip_chars: 'Create image'.length,
+    label_count: 10,
+    starts_with_label: true,
+    ends_with_label: true,
+    labels: [
+      {tag: 'SPAN', parent_tag: 'DIV', inline_pill: true, system_hint: true,
+        prompt_link: false, in_button: false, matched_chip: true},
+      {tag: 'SPAN', parent_tag: 'BUTTON', inline_pill: false, system_hint: false,
+        prompt_link: true, in_button: true, matched_chip: false},
+      ...Array.from({length: 6}, () => ({tag: 'SPAN', parent_tag: 'P', inline_pill: false,
+        system_hint: false, prompt_link: false, in_button: false, matched_chip: false}))
+    ]
+  });
+  assert.equal(diagnostics.labels.length, 8, 'individual label details are capped at eight');
+  assert.equal(JSON.stringify(result).includes(uniquePromptText), false, 'inspection never returns message text');
+  assert.equal(h.clicks, 0);
+  assert.equal(h.sendClicks, 0);
+});
+
 test('pairing inspection without a job refuses even an otherwise matching image draft', () => {
   const h = contentHarness({draft: 'Create one image. Return a generated image, not just a description.\n\ndraw a cat'});
   let result;
@@ -774,7 +895,7 @@ test('pairing inspection without a job refuses even an otherwise matching image 
 test('read-only inspection reports idle state without changing drafts, busy work, attachments, or completed chats', () => {
   const cases = [
     ['completed chat without image mode', {newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'], imageMode: false}, true,
-      /Select native Create image/],
+      /Existing conversation preserved; inspect its job result instead of submitting again/],
     ['unrelated draft', {draft: 'private draft'}, false, /Preserve the draft or running work/],
     ['busy draft', {busy: true, draft: 'private draft'}, false, /Preserve the draft or running work/],
     ['existing attachment', {attachments: true}, false, /Remove existing attachments/]
@@ -858,6 +979,98 @@ test('one-image upload preserves the actual File bytes, name, MIME type, and eve
   assert.equal(h.sendClicks, 1);
   assert.equal(h.sendClickedWhenReady, true);
   assert.match(h.editor.value, /Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1/);
+});
+
+test('inspection separates two user-upload references from one adjacent assistant output', () => {
+  const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['submitted prompt', 'assistant reply'], assistantRoleNodes: 'always',
+    userImageSources: ['https://chatgpt.com/reference-1.png', 'https://chatgpt.com/reference-2.png'],
+    assistantImageSources: ['https://chatgpt.com/output.png']});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result_dom)), {
+    assistant_role_nodes: 1, user_headings: 1, assistant_headings: 1, assistant_body_found: true,
+    assistant_images: 1, conversation_images: 3, busy: false,
+    chat_path: '/c/123e4567-e89b-12d3-a456-426614174000'
+  });
+});
+
+test('generation collects the last adjacent assistant body, not the two reference images in the user turn', async () => {
+  const output = 'https://chatgpt.com/generated-output.png';
+  const references = ['https://chatgpt.com/uploaded-reference-1.png', 'https://chatgpt.com/uploaded-reference-2.png'];
+  const h = contentHarness({conversationTurnsAfterSend: true, assistantImageSources: [output],
+    userImageSources: references});
+  const images = [imageInput(1), imageInput(2)];
+  await startContent(h, {job_id: 'job-assistant-scope', expected_model: 'Create image', mode: 'create',
+    prompt: 'use these references', images});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.imageBase64, 'cG5n');
+  assert.equal(receipt.imagesBase64, undefined);
+  assert.deepEqual(h.fetchedUrls, [output]);
+  assert.equal(h.sendClicks, 1);
+  assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name));
+});
+
+test('generation collects every stable assistant output image', async () => {
+  const outputs = ['https://chatgpt.com/generated-output-1.png', 'https://chatgpt.com/generated-output-2.png'];
+  const h = contentHarness({assistantRoleNodes: true, assistantImageSources: outputs});
+  await startContent(h, {job_id: 'job-two-assistant-outputs', expected_model: 'Create image', prompt: 'draw two panels', images: []});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imagesBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.imageBase64, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(receipt.imagesBase64)), ['cG5n', 'cG5n']);
+  assert.deepEqual(h.fetchedUrls, outputs);
+  assert.equal(h.fileReaderReads, 2);
+  assert.equal(h.sendClicks, 1);
+});
+
+test('duplicate assistant image URLs are deduplicated before collection', async () => {
+  const output = 'https://chatgpt.com/generated-output.png';
+  const h = contentHarness({assistantRoleNodes: true, assistantImageSources: [output, output]});
+  await startContent(h, {job_id: 'job-duplicate-output-url', expected_model: 'Create image', prompt: 'draw one image', images: []});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.imagesBase64, undefined);
+  assert.deepEqual(h.fetchedUrls, [output]);
+  assert.equal(h.fileReaderReads, 1);
+  assert.equal(h.sendClicks, 1);
+});
+
+test('more than four assistant outputs fail closed without downloading or resending', async () => {
+  const outputs = Array.from({length: 5}, (_, index) => `https://chatgpt.com/generated-output-${index + 1}.png`);
+  const h = contentHarness({assistantRoleNodes: true, assistantImageSources: outputs});
+  await startContent(h, {job_id: 'job-too-many-outputs', expected_model: 'Create image', prompt: 'draw many images', images: []});
+  await waitForContentResult(h);
+
+  const result = h.sent.at(-1);
+  assert.match(result.error, /Submission attempted.*More than four assistant images/);
+  assert.equal(result.imageBase64, undefined);
+  assert.equal(result.imagesBase64, undefined);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.sendClicks, 1);
+});
+
+test('changed assistant output set is not collected and never triggers another Send', async () => {
+  const first = 'https://chatgpt.com/generated-output-1.png';
+  const replacement = 'https://chatgpt.com/generated-output-2.png';
+  const h = contentHarness({assistantRoleNodes: true,
+    assistantImageSequence: [[first], [first], [first], [replacement]]});
+  await startContent(h, {job_id: 'job-output-changed', expected_model: 'Create image', prompt: 'draw one image', images: []});
+  await waitForContentResult(h);
+
+  const result = h.sent.at(-1);
+  assert.match(result.error, /Submission attempted.*Existing result changed during collection/);
+  assert.equal(result.imageBase64, undefined);
+  assert.equal(result.imagesBase64, undefined);
+  assert.equal(h.sendClicks, 1, 'a changed result is not resubmitted');
 });
 
 test('upload preflight accepts and clears the exact per-job snapshot filename', async () => {
@@ -1655,12 +1868,256 @@ test('whitespace normalization does not accept changed prompt words', async () =
 
 test('collection-only accepts one existing conversation and never inserts or clicks Send', async () => {
   const originalPrompt = 'Create image Create one image. Return a generated image, not just a description.\n\ndraw a cat';
-  const h = contentHarness({newUi: true,
+  const h = contentHarness({newUi: true, imageReady: true,
     conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [originalPrompt]});
   const accepted = await startCollect(h);
   assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.promptBinding, undefined, 'legacy collect jobs do not send new diagnostics');
   assert.equal(h.editor.innerText, 'Create image');
   assert.equal(h.clicks, 0);
+});
+
+test('submitted-job recovery collects only from the exact inspected chat and preserves it', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const originalPrompt = 'Create image Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const h = contentHarness({newUi: true, chatPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [originalPrompt]});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, preserve_chat: true, recovery_chat_path: chatPath, images: originalImages
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.chatPath, chatPath);
+  assert.equal(receipt.imageBase64, 'cG5n');
+  assert.deepEqual(JSON.parse(JSON.stringify(receipt.promptBinding)), {
+    root_match: true, exact_matching_descendant_count: 0,
+    expected_chars: receipt.promptBinding.expected_chars,
+    observed_chars: receipt.promptBinding.expected_chars
+  });
+  assert.equal(h.fetchCalls, 1);
+  assert.deepEqual(h.inputEvents, [], 'recovery must not re-upload original references');
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.sent.some(message => message.type === 'image-delete-prompt'), false);
+});
+
+test('submitted-job recovery accepts an exact visible prompt child inside a labelled user-message wrapper', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const expectedPrompt = 'Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const wrappedBody = `Create image\nSent in image mode\n${expectedPrompt}\nCopy · Edit`;
+  const h = contentHarness({newUi: true, chatPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [wrappedBody],
+    userPromptDescendants: [{innerText: expectedPrompt}]});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, preserve_chat: true, recovery_chat_path: chatPath, images: originalImages
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.chatPath, chatPath);
+  assert.equal(receipt.promptBinding.root_match, false);
+  assert.equal(receipt.promptBinding.exact_matching_descendant_count, 1);
+  assert.equal(receipt.promptBinding.expected_chars, expectedPrompt.replace(/\s+/g, ' ').trim().length);
+  assert.equal(receipt.promptBinding.observed_chars, wrappedBody.replace('Create image', ' ').replace(/\s+/g, ' ').trim().length);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.inputEvents.length, 0);
+});
+
+test('submitted-job recovery strips exactly one native image chip prefix from the rendered prompt paragraph', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const expectedPrompt = 'Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const wrapperDelta = 'abcdefghijk';
+  const paragraphText = `Create image ${expectedPrompt}`;
+  const outerBody = `Create image ${wrapperDelta} ${expectedPrompt}`;
+  const expectedChars = expectedPrompt.replace(/\s+/g, ' ').trim().length;
+  assert.equal(outerBody.replace(/\s+/g, ' ').trim().length, expectedChars + 25);
+  assert.equal(outerBody.replace('Create image', ' ').replace(/\s+/g, ' ').trim().length, expectedChars + 12);
+  const h = contentHarness({newUi: true, promptLinkBadge: true, chatPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: [outerBody, 'assistant reply'],
+    userPromptDescendants: [
+      {innerText: paragraphText, tagName: 'P', parentTag: 'DIV', chipChildIndex: 1},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'P', promptLink: true, chipChildIndex: 2},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'SPAN'}
+    ]});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, output_binding_revision: 2, preserve_chat: true,
+    recovery_chat_path: chatPath, images: originalImages
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.chatPath, chatPath);
+  assert.equal(receipt.promptBinding.root_match, false, 'outer wrapper keeps its 12-character delta');
+  assert.equal(receipt.promptBinding.exact_matching_descendant_count, 1,
+    'the full rendered P matches only after removing its single native chip prefix');
+  assert.equal(receipt.promptBinding.expected_chars, expectedChars);
+  assert.equal(receipt.promptBinding.observed_chars, expectedChars + 12);
+  assert.equal(receipt.promptBinding.matcher_revision, 2);
+  assert.equal(h.fetchCalls, 1);
+  assert.deepEqual(h.inputEvents, [], 'recovery must not re-upload original references');
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.clicks, 0);
+});
+
+test('submitted-job recovery rejects malformed rendered-chip matches before reading images', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const expectedPrompt = 'Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const outerBody = `Create image abcdefghijk ${expectedPrompt}`;
+  const validRenderedPrompt = `Create image ${expectedPrompt}`;
+  const cases = [
+    ['duplicate chips', [
+      {innerText: validRenderedPrompt, tagName: 'P', chipChildIndices: [1, 2]},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'P', promptLink: true, chipChildIndex: 2},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'SPAN', promptLink: true}
+    ]],
+    ['non-prefix chip', [
+      {innerText: `${expectedPrompt} Create image`, tagName: 'P', chipChildIndex: 1},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'P', promptLink: true}
+    ]],
+    ['wrong chip text', [
+      {innerText: `Create image tools ${expectedPrompt}`, tagName: 'P', chipChildIndex: 1},
+      {innerText: 'Create image tools', tagName: 'SPAN', parentTag: 'P', promptLink: true}
+    ]],
+    ['value-only paragraph', [
+      {value: validRenderedPrompt, tagName: 'P', chipChildIndex: 1},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'P', promptLink: true}
+    ]],
+    ['textContent-only paragraph', [
+      {textContent: validRenderedPrompt, tagName: 'P', chipChildIndex: 1},
+      {innerText: 'Create image', tagName: 'SPAN', parentTag: 'P', promptLink: true}
+    ]]
+  ];
+
+  for (const [name, userPromptDescendants] of cases) {
+    const h = contentHarness({newUi: true, promptLinkBadge: true, chatPath, imageReady: true,
+      conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [outerBody, 'assistant reply'],
+      userPromptDescendants});
+    const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+      collect_only: true, output_binding_revision: 2, preserve_chat: true,
+      recovery_chat_path: chatPath, images: originalImages
+    });
+    assert.ok(accepted?.accepted, name);
+    await waitForContentResult(h);
+
+    const result = h.sent.at(-1);
+    assert.match(result.error, /prompt|binding|chip/i, name);
+    assert.equal(result.imageBase64, undefined, `${name}: no image receipt`);
+    assert.equal(result.imagesBase64, undefined, `${name}: no multi-image receipt`);
+    assert.equal(result.promptBinding?.matcher_revision, 2, `${name}: revision diagnostic is bounded`);
+    assert.equal(h.fetchCalls, 0, `${name}: no assistant image read`);
+    assert.equal(h.sendClicks, 0, `${name}: no Send`);
+    assert.equal(h.inputEvents.length, 0, `${name}: no upload`);
+  }
+});
+
+test('submitted-job recovery refuses an unsupported output binding revision before reading images', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const expectedPrompt = 'Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const h = contentHarness({newUi: true, chatPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [expectedPrompt, 'assistant reply']});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, output_binding_revision: 1, preserve_chat: true,
+    recovery_chat_path: chatPath, images: originalImages
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+
+  const result = h.sent.at(-1);
+  assert.match(result.error, /revision|binding|prompt/i);
+  assert.equal(result.imageBase64, undefined);
+  assert.equal(result.imagesBase64, undefined);
+  assert.equal(result.promptBinding?.matcher_revision, undefined);
+  assert.equal(h.fetchCalls, 0, 'unsupported revision refuses before assistant image read');
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.inputEvents.length, 0);
+});
+
+test('failed submitted-job binding reports counts only and rejects substring, hidden, or textContent-only prompt matches', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const expectedPrompt = 'Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  for (const [name, descendant] of [
+    ['substring-only', {innerText: `prefix ${expectedPrompt} suffix`}],
+    ['hidden exact text', {innerText: expectedPrompt, visible: false}],
+    ['textContent-only', {textContent: expectedPrompt}]
+  ]) {
+    const h = contentHarness({newUi: true, chatPath, imageReady: true,
+      conversationTurns: ['You said:', 'ChatGPT said:'],
+      conversationBodies: [`Create image\nMessage controls\n${expectedPrompt}\nCopy`],
+      userPromptDescendants: [descendant]});
+    const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+      collect_only: true, preserve_chat: true, recovery_chat_path: chatPath, images: originalImages
+    });
+    assert.ok(accepted?.accepted, name);
+    await waitForContentResult(h);
+
+    const result = h.sent.at(-1);
+    assert.match(result.error, /^Existing submitted-job recovery failed\. Existing conversation does not match this job's prompt/, name);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.promptBinding)), {
+      root_match: false, exact_matching_descendant_count: 0,
+      expected_chars: expectedPrompt.replace(/\s+/g, ' ').trim().length,
+      observed_chars: result.promptBinding.observed_chars
+    }, name);
+    assert.deepEqual(Object.keys(result.promptBinding).sort(), [
+      'exact_matching_descendant_count', 'expected_chars', 'observed_chars', 'root_match'
+    ], `${name}: diagnostics contain counts, not prompt text`);
+    assert.equal(h.fetchCalls, 0, `${name}: no assistant image read before prompt binding`);
+    assert.equal(h.sendClicks, 0, `${name}: no Send`);
+    assert.equal(h.inputEvents.length, 0, `${name}: no upload`);
+  }
+});
+
+test('submitted-job recovery rejects a chat path mismatch before reading candidate images', async () => {
+  const expectedPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const actualPath = '/c/223e4567-e89b-12d3-a456-426614174000';
+  const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
+  const originalPrompt = 'Create image Create one image. Return a generated image, not just a description.\n' +
+    'Actual attachments, in upload order:\nImage 1: REFERENCE GUIDANCE — reference 1\n' +
+    'Image 2: REFERENCE GUIDANCE — reference 2\n\ndraw a cat';
+  const h = contentHarness({newUi: true, chatPath: actualPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [originalPrompt]});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, preserve_chat: true, recovery_chat_path: expectedPath, images: originalImages
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+
+  const result = h.sent.at(-1);
+  assert.match(result.error, /^Existing submitted-job recovery failed\. Existing result chat does not match this inspected job/);
+  assert.equal(result.imageBase64, undefined);
+  assert.equal(result.imagesBase64, undefined);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.clicks, 0);
+  assert.equal(h.sent.some(message => message.type === 'image-delete-prompt'), false);
 });
 
 test('collection-only refuses an existing user turn whose original prompt differs', async () => {

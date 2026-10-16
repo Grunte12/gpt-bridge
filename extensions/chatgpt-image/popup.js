@@ -54,7 +54,8 @@ function render(status) {
       ? "ตรวจอัปโหลดผ่าน · คืนแท็บว่างแล้ว · ไม่ได้เจนภาพ"
       : "อัปโหลดพร้อมแล้ว · ยังไม่ส่งและไม่เจนภาพ"
     : job.state === "complete"
-    ? "ภาพล่าสุดบันทึกแล้ว" + (job.dimensions ? ` · ${job.dimensions.join(" × ")} พิกเซล` : "")
+    ? "ภาพล่าสุดบันทึกแล้ว" + (job.output_count > 1 ? ` · ${job.output_count} ภาพ` : job.dimensions ? ` · ${job.dimensions.join(" × ")} พิกเซล` : "") +
+      (job.cleanup_status === "preserved" ? " · เก็บแชตเดิมไว้" : "")
     : job.state === "interrupted" ? "งานก่อนหน้าถูกขัดจังหวะ ไม่มีการส่งซ้ำ"
     : /Native image file input/i.test(job.error || "") ? "ยังเลือกช่องแนบภาพไม่ได้"
     : "งานก่อนหน้าไม่สำเร็จ ไม่มีการลองซ้ำอัตโนมัติ";

@@ -53,6 +53,14 @@ async function settle() {
   for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
 }
 
+test('multiple saved outputs show their count and preserved chat', async () => {
+  const h = harness({configured: true, connection: {state: 'complete'}, active: null,
+    lastJob: {state: 'complete', output_count: 2, cleanup_status: 'preserved'}});
+  await settle();
+  assert.match(h.elements['last-job'].textContent, /2 ภาพ/);
+  assert.match(h.elements['last-job'].textContent, /เก็บแชตเดิมไว้/);
+});
+
 test('cleared preflight reports an empty tab without claiming an image was generated', async () => {
   const h = harness({configured: true, account: 'second', connection: {state: 'preflight_complete'},
     active: null, lastJob: {state: 'complete', preflight_ready: true, preflight_uploads_cleared: true}});

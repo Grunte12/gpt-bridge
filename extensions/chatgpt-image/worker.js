@@ -13,10 +13,17 @@ const jobMetadata = job => ({job_id: job.job_id, prompt: job.prompt, expected_mo
   ...(job.clear_preflight_uploads === true ? {clear_preflight_uploads: true} : {}),
   ...(job.preflight_cleanup_only === true ? {preflight_cleanup_only: true} : {}),
   ...(job.preflight_cleanup_resumed === true ? {preflight_cleanup_resumed: true} : {}),
+  ...(job.collect_only === true ? {collect_only: true, preserve_chat: true, recovery_chat_path: job.recovery_chat_path} : {}),
+  ...(job.output_binding_revision !== undefined ? {output_binding_revision: job.output_binding_revision} : {}),
   ...(job.images?.length ? {images: job.images.map(imageMetadata)} : {})});
 function validateImages(job) {
   const mode = job.mode || "create", images = job.images || [];
   if (!["create", "edit"].includes(mode) || !Array.isArray(images)) throw new Error("Invalid image mode or inputs");
+  if (job.collect_only !== undefined && (job.collect_only !== true || job.preserve_chat !== true || job.preflight_only ||
+      !/^\/c\/[a-f0-9-]{36}$/.test(job.recovery_chat_path || "")))
+    throw new Error("Output recovery must preserve the existing chat without preflight or submission");
+  if (job.output_binding_revision !== undefined && (job.collect_only !== true || job.output_binding_revision !== 2))
+    throw new Error("Unsupported output prompt binding revision");
   if (job.preflight_only !== undefined && typeof job.preflight_only !== "boolean") throw new Error("Invalid preflight flag");
   if (job.clear_preflight_uploads !== undefined && (typeof job.clear_preflight_uploads !== "boolean" ||
       (job.clear_preflight_uploads && !job.preflight_only))) throw new Error("Invalid preflight upload clearing flag");
@@ -34,7 +41,7 @@ function validateImages(job) {
           /^input-\d{3,}(?:-[a-f0-9]{32})?\.(png|jpg|webp)$/).test(image.name) ||
         !["image/png", "image/jpeg", "image/webp"].includes(image.mime) ||
         !Number.isInteger(image.bytes) || image.bytes <= 0 || image.bytes > maxInputBytes ||
-        (job.preflight_cleanup_only ? image.data_base64 !== undefined :
+        (job.preflight_cleanup_only || job.collect_only ? image.data_base64 !== undefined :
           typeof image.data_base64 !== "string" || image.data_base64.length !== 4 * Math.ceil(image.bytes / 3) ||
           !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)) || !/^[a-f0-9]{64}$/.test(image.sha256))
       throw new Error("Invalid ordered local image payload");
@@ -70,6 +77,28 @@ function uploadDomDiagnostic(value) {
       Object.keys(value).length !== counts.length + 1 || typeof value.editor_form !== "boolean" ||
       counts.some(key => !Number.isInteger(value[key]) || value[key] < 0 || value[key] > 10000)) return null;
   return {editor_form: value.editor_form, ...Object.fromEntries(counts.map(key => [key, value[key]]))};
+}
+function resultDomDiagnostic(value) {
+  const counts = ["assistant_role_nodes", "user_headings", "assistant_headings", "assistant_images", "conversation_images"];
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 8 ||
+      typeof value.assistant_body_found !== "boolean" || typeof value.busy !== "boolean" ||
+      typeof value.chat_path !== "string" || (value.chat_path !== "" && !/^\/c\/[a-f0-9-]{36}$/.test(value.chat_path)) ||
+      counts.some(key => !Number.isInteger(value[key]) || value[key] < 0 || value[key] > 10000)) return null;
+  return Object.fromEntries([...counts, "assistant_body_found", "busy", "chat_path"].map(key => [key, value[key]]));
+}
+function promptDomDiagnostic(value) {
+  const counts = ["body_chars", "stripped_chars", "matched_chip_chars", "label_count"];
+  const flags = ["starts_with_label", "ends_with_label"];
+  const labelFlags = ["inline_pill", "system_hint", "prompt_link", "in_button", "matched_chip"];
+  const tags = new Set(["DIV", "SPAN", "BUTTON", "A", "P", "OTHER"]);
+  if (!value || Object.keys(value).length !== 7 ||
+      counts.some(key => !Number.isInteger(value[key]) || value[key] < 0 || value[key] > (key === "label_count" ? 10000 : 100000)) ||
+      flags.some(key => typeof value[key] !== "boolean") || !Array.isArray(value.labels) || value.labels.length > 8 ||
+      value.labels.length !== Math.min(value.label_count, 8) || value.labels.some(label => !label ||
+        Object.keys(label).length !== 7 || !tags.has(label.tag) || !tags.has(label.parent_tag) ||
+        labelFlags.some(key => typeof label[key] !== "boolean"))) return null;
+  return {...Object.fromEntries([...counts, ...flags].map(key => [key, value[key]])),
+    labels: value.labels.map(label => Object.fromEntries(["tag", "parent_tag", ...labelFlags].map(key => [key, label[key]])))};
 }
 async function poll() {
   if (polling || managing) return;
@@ -141,7 +170,8 @@ async function poll() {
       tab_idle: typeof ready.idle === "boolean" ? ready.idle : null,
       tab_error: receiverError ? "Native tab inspection failed: " + receiverError : String(ready.error || "").slice(0, 300),
       worker_version: workerVersion, content_receiver: contentReceiver, receiver_error: receiverError,
-      upload_dom: uploadDomDiagnostic(ready.upload_dom)});
+      upload_dom: uploadDomDiagnostic(ready.upload_dom), result_dom: resultDomDiagnostic(ready.result_dom),
+      prompt_dom: promptDomDiagnostic(ready.prompt_dom)});
     if (active) {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
@@ -171,10 +201,10 @@ async function poll() {
       // Keep source bytes only in this one delivery, never extension storage/replay.
       const metadata = jobMetadata(job);
       await chrome.storage.local.set({active: {jobId: job.job_id, tabId: config.tabId, job: metadata}});
-      await connection("busy", job.preflight_only
+      await connection("busy", job.collect_only ? "กำลังรับภาพจากงานเดิมเท่านั้น ไม่ส่งซ้ำและไม่ลบแชต" : job.preflight_only
         ? "กำลังตรวจอัปโหลดเท่านั้น ไม่ส่งข้อความหรือสร้างภาพ"
         : "กำลังสร้างภาพ ไม่ต้องพิมพ์ในแท็บที่เชื่อมไว้");
-      if (!job.preflight_cleanup_only && (ready.fresh !== true || ready.model !== "Create image")) {
+      if (!job.preflight_cleanup_only && !job.collect_only && (ready.fresh !== true || ready.model !== "Create image")) {
         const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare", job: metadata});
         if (prepared?.fresh !== true || prepared.model !== "Create image")
           throw new Error(prepared?.error || "Native image chat could not be prepared");
@@ -193,11 +223,12 @@ async function poll() {
         throw new Error("Protocol 3 is required to clear verified preflight uploads; not submitted");
       if (job.preflight_cleanup_only && ready.input_protocol !== 4)
         throw new Error("Protocol 4 is required to clear an inspected failed preflight");
-      const accepted = await chrome.tabs.sendMessage(config.tabId, {type: "image-job", job});
+      const accepted = await chrome.tabs.sendMessage(config.tabId, {type: job.collect_only ? "image-collect" : "image-job", job});
       if (!accepted?.accepted) throw new Error("Content worker did not accept this job");
     } catch (error) {
       const result = await request(config, "/result", {client_id: config.clientId, job_id: job.job_id,
-        error: "Not submitted or delivery uncertain. " + error.message + ". No automatic resubmission; inspect ChatGPT first."});
+        error: (job.collect_only ? "Existing output recovery delivery failed or uncertain. " : "Not submitted or delivery uncertain. ") +
+          error.message + ". No automatic resubmission; inspect ChatGPT first."});
       await chrome.storage.local.set({lastJob: result});
       await chrome.storage.local.remove("active");
       await connection("failed", "แท็บไม่รับงาน ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการส่งซ้ำ");
@@ -301,7 +332,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       if (!config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
           new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId)
         throw new Error("Result is not from the paired job/tab");
-      if (!message.error && active.job?.preflight_only && (message.preflightReady !== true || message.imageBase64 || message.chatPath))
+      if (!message.error && active.job?.preflight_only && (message.preflightReady !== true || message.imageBase64 || message.imagesBase64 || message.chatPath))
         throw new Error("Preflight cannot accept generated media or cleanup");
       if (message.preflightUploadsCleared !== undefined && typeof message.preflightUploadsCleared !== "boolean")
         throw new Error("Invalid preflight clearing receipt");
@@ -313,14 +344,16 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       // ChatGPT changes chats through SPA navigation; sender.url can retain the
       // previous document path. The paired content receiver verifies the live
       // path and original prompt again before it opens Delete confirmation.
-      const cleanup = !message.error && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
+      const cleanup = !message.error && !active.job?.preserve_chat && !message.imagesBase64 && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
       finishing = true;
       let result;
       try {
         result = await request(config, "/result", {client_id: config.clientId, job_id: active.jobId,
           ...(message.error ? {error: message.error} : active.job?.preflight_only ? {preflight_ready: true,
-            ...(message.preflightUploadsCleared === true ? {preflight_uploads_cleared: true} : {})} : {image_base64: message.imageBase64, cleanup_pending: cleanup,
-            ...(cleanup ? {chat_path: message.chatPath} : {})})});
+            ...(message.preflightUploadsCleared === true ? {preflight_uploads_cleared: true} : {})} : {
+              ...(message.imagesBase64 ? {images_base64: message.imagesBase64} : {image_base64: message.imageBase64}), cleanup_pending: cleanup,
+              ...(/^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "") ? {chat_path: message.chatPath} : {})}),
+          ...(message.promptBinding ? {prompt_binding: message.promptBinding} : {})});
         if (cleanup && result.state === "complete") {
           let removed;
           try {
@@ -339,6 +372,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         await chrome.storage.local.remove("active");
         await connection(message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", message.error
           ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
+          : result.cleanup_status === "preserved" ? "บันทึกภาพที่ได้ครบแล้ว เก็บแชตเดิมไว้ ยังไม่ได้ลบแชต"
           : result.uploads_cleared ? "นำไฟล์แนบของงานที่หยุดก่อนส่งออกแล้ว แท็บว่าง ไม่ได้เจนภาพ"
           : active.job?.preflight_only ? result.preflight_uploads_cleared
             ? "ตรวจอัปโหลดผ่านและนำไฟล์แนบทดสอบออกแล้ว แท็บว่าง ไม่มีการส่งหรือเจนภาพ"
