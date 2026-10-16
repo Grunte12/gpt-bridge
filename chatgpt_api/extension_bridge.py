@@ -73,13 +73,16 @@ class ExtensionClient:
 
 
 class ExtensionQueue:
-    def __init__(self, root: Path, account: str):
+    def __init__(self, root: Path, account: str, *, auto_delete_saved_chats: bool = False):
+        if type(auto_delete_saved_chats) is not bool:
+            raise ValueError("invalid automatic cleanup policy")
         if root.is_symlink():
             raise ValueError("data directory must not be a symlink")
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.account = account
+        self.auto_delete_saved_chats = auto_delete_saved_chats
         self.lock = threading.RLock()
         self.client = None
         self.jobs: dict[str, dict] = {}
@@ -155,6 +158,8 @@ class ExtensionQueue:
                 raise ValueError("one image job at a time; inspect existing job before resubmitting")
             job = {"job_id": uuid.uuid4().hex, "state": "queued", "prompt": prompt, "account": self.account,
                    "expected_model": expected_model.strip(), "client_id": self.client["client_id"]}
+            if self.auto_delete_saved_chats:
+                job["auto_delete_saved_chat"] = True
             self.jobs[job["job_id"]] = job
             self._save(job)
             return self.status(job["job_id"])
@@ -250,6 +255,8 @@ class ExtensionQueue:
             if cleanup_status == "deleted" and job["cleanup_status"] != "confirmation_required":
                 raise ValueError("deletion must follow the native confirmation step")
             job.update(cleanup_status=cleanup_status)
+            if cleanup_status == "confirmation_required" and job.get("auto_delete_saved_chat") is True:
+                job["cleanup_confirmation"] = "requested"
             if cleanup_status == "failed":
                 job["cleanup_error"] = error[:500]
             self._save(job)
@@ -259,6 +266,7 @@ class ExtensionQueue:
         with self.lock:
             if not job_id:
                 return {"account": self.account, "paired": bool(self.client),
+                        "cleanup_policy": "automatic_saved_chats" if self.auto_delete_saved_chats else "per_job_confirmation",
                         "account_binding": "owner-confirmed, not independently verified",
                         "transport": "extension-native-ui",
                         "visible_model": self.client["visible_model"] if self.client else None,
@@ -373,7 +381,7 @@ def create_mcp(queue):
 
     @server.tool()
     def extension_status(job_id: str = "") -> dict:
-        """Check a saved image job. confirmation_required blocks new images; show its chat_path and request owner approval, then call extension_confirm_delete once. deleted confirms cleanup. Cleanup failure never means regenerate the saved image."""
+        """Check account, cleanup_policy and saved image receipt. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
         return queue.status(job_id)
 
     @server.tool()
@@ -383,7 +391,7 @@ def create_mcp(queue):
 
     @server.tool()
     def extension_confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
-        """Permanently delete only this saved-image chat via MCP/extension, without browser-control tools. Require actual owner approval at action time for the exact job and chat_path; never infer it from a cleanup preference. Pass owner_confirmed=true only after that approval. Single-use: poll status, never retry uncertain deletion."""
+        """Legacy per-job confirmation only; not needed when cleanup_policy=automatic_saved_chats. Permanently delete only this saved-image chat after exact-chat owner approval. Pass owner_confirmed=true only after that approval. Single-use: poll status, never retry uncertain deletion."""
         return queue.confirm_delete(job_id, owner_confirmed)
 
     @server.tool()
@@ -413,7 +421,11 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".local/share/gpt-bridge/extension/second")
     parser.add_argument("--connect", action="store_true",
                         help="Share an already running local extension worker; do not create another queue or listener")
+    parser.add_argument("--auto-delete-saved-chats", action="store_true",
+                        help="Owner opt-in: permanently delete only new Bridge-created image chats after validated local save, without per-image prompts")
     args = parser.parse_args()
+    if args.connect and args.auto_delete_saved_chats:
+        parser.error("automatic cleanup is an owner-worker policy; set it on the owning command, not --connect")
     if args.data_dir.is_symlink():
         parser.error("data directory must not be a symlink")
     root = args.data_dir.resolve()
@@ -431,7 +443,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.error("another extension MCP owns this data directory")
-    queue = ExtensionQueue(root, args.account)
+    queue = ExtensionQueue(root, args.account, auto_delete_saved_chats=args.auto_delete_saved_chats)
     token_path = queue.root / "extension-token"
     if not token_path.exists():
         descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

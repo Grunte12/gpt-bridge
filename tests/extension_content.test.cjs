@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   let clicks = 0;
@@ -19,6 +19,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   let controlsState = controls;
   let dialogOpen = false;
   let remainingEditorDelay = editorDelayQueries;
+  let sendQueries = 0;
   const location = {origin: 'https://chatgpt.com', href: `https://chatgpt.com${temporaryChat ? '/?temporary-chat=true' : chatPath}`, pathname: chatPath};
   const hasConversation = () => user || (conversationTurns || []).length > 0;
   const sent = [];
@@ -46,7 +47,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   const hiddenOldEditor = {value: 'completed conversation content', innerText: 'completed conversation content',
     querySelector() { return null; }, getClientRects: () => []};
   const setEditorText = value => { if (newUi) editor.innerText = value; else editor._value = value; };
-  const send = {disabled: false, getClientRects: () => [{}], click() { clicks++; }};
+  const send = {get disabled() { return sendQueries <= sendDelayQueries + sendDisabledQueries; }, getClientRects: () => [{}], click() { clicks++; }};
+  const hiddenSend = {disabled: false, getClientRects: () => []};
   const picker = {textContent: label, getClientRects: () => [{}]};
   const button = (textContent, ariaLabel, isVisible, onClick = () => {}) => ({
     textContent, innerText: textContent, disabled: false, getAttribute(name) { return name === 'aria-label' ? ariaLabel : null; },
@@ -94,7 +96,6 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       if (selector === '[data-testid="model-switcher-dropdown-button"]' || selector.includes('[aria-label="Select ChatGPT model"]')) return picker;
       if (selector === '[data-testid="stop-button"]' || selector.includes('button[aria-label="Stop"]')) return busyState ? {getClientRects: () => [{}]} : null;
       if (selector.includes('[aria-label="Conversation"]')) return conversation;
-      if (selector === '[data-testid="send-button"]' || selector.includes('[aria-label="Send"]')) return send;
       if (selector === 'button[aria-label="New chat"]') return newChatButton;
       if (selector === 'button[aria-label="Add files and more"]') return filesButton;
       if (selector === 'button[aria-label="More"]') return moreButton;
@@ -105,6 +106,16 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       return null;
     },
     querySelectorAll(selector) {
+      if (selector.includes('[data-testid="send-button"]') || selector.includes('button[aria-label="Send"]')) {
+        sendQueries++;
+        if (sendQueries === changeAfterSendQueries) {
+          if (changeDuringSend === 'text') setEditorText(`${composerText()} changed`);
+          if (changeDuringSend === 'chip') imageMode = false;
+          if (changeDuringSend === 'busy') busyState = true;
+        }
+        if (sendQueries <= sendDelayQueries) return [];
+        return hiddenFirstSend ? [hiddenSend, send] : [send];
+      }
       if (selector.includes('[role="textbox"]') || selector.includes('textarea#prompt-textarea'))
         return hiddenRetainedEditor ? [hiddenOldEditor, editor] : [editor];
       if (selector === '[role="menuitem"]') return [deleteItem];
@@ -179,9 +190,11 @@ async function startCollect(harness, expectedModel = 'Create image', prompt = 'd
   return accepted;
 }
 
-async function startPrepare(harness, expectedModel = 'Create image') {
+async function startPrepare(harness, expectedModel = 'Create image', prompt) {
   let result;
-  harness.receive({type: 'image-prepare', job: {expected_model: expectedModel}}, {}, value => { result = value; });
+  const job = {expected_model: expectedModel};
+  if (prompt !== undefined) job.prompt = prompt;
+  harness.receive({type: 'image-prepare', job}, {}, value => { result = value; });
   await new Promise(resolve => setImmediate(resolve));
   return result;
 }
@@ -237,6 +250,16 @@ test('image preparation waits for a temporarily unmounted composer and does not 
   assert.equal(h.clicks, 0);
   assert.equal(h.editor.value, 'Create image');
   assert.equal(h.sent.length, 0);
+});
+
+test('image preparation accepts only a matching unsent image draft', async () => {
+  const prompt = 'draw a cat';
+  const draft = `Create one image. Return a generated image, not just a description.\n\n${prompt}`;
+  const h = contentHarness({draft});
+  const result = await startPrepare(h, 'Create image', prompt);
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.equal(h.editor.value, `Create image ${draft}`);
+  assert.equal(h.clicks, 0);
 });
 
 test('image preparation refuses drafts, running work, challenges, attachments, and wrong expected model', async () => {
@@ -458,6 +481,14 @@ test('pairing inspection rejects a draft or blank model without submitting', () 
   }
 });
 
+test('pairing inspection without a job refuses even an otherwise matching image draft', () => {
+  const h = contentHarness({draft: 'Create one image. Return a generated image, not just a description.\n\ndraw a cat'});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.match(result.error, /fresh empty chat/);
+  assert.equal(h.clicks, 0);
+});
+
 test('content refuses an incompatible route before touching the composer', async () => {
   const h = contentHarness();
   assert.equal((await startContent(h, {job_id: 'job-route', expected_model: 'GPT-6 Thinking', prompt: 'draw'})).accepted, true);
@@ -509,11 +540,65 @@ test('current ChatGPT contenteditable UI inserts exact prompt and clicks native 
   assert.match(h.sent[0].error, /Timed out/);
 });
 
+test('matching unsent prompt is reused without duplicate insertion before Send', async () => {
+  const prompt = 'draw a cat';
+  const draft = 'Create one image. Return a generated image, not just a description.\n\n' + prompt;
+  const h = contentHarness({newUi: true, draft});
+  await startContent(h, {job_id: 'job-reuse', expected_model: 'Create image', prompt});
+  assert.equal(h.clicks, 1);
+  assert.equal(h.editor.innerText, `Create image ${draft}`);
+  assert.equal(h.sent.length, 1);
+});
+
+test('native Send lookup waits for a delayed button mount', async () => {
+  const h = contentHarness({sendDelayQueries: 3});
+  await startContent(h);
+  assert.equal(h.clicks, 1);
+  assert.match(h.sent[0].error, /Submission attempted/);
+});
+
+test('native Send lookup waits until the mounted button is enabled', async () => {
+  const h = contentHarness({sendDisabledQueries: 4});
+  await startContent(h);
+  assert.equal(h.clicks, 1);
+  assert.match(h.sent[0].error, /Submission attempted/);
+});
+
+test('native Send lookup skips a hidden matching button and clicks the visible one', async () => {
+  const h = contentHarness({hiddenFirstSend: true});
+  await startContent(h);
+  assert.equal(h.clicks, 1);
+  assert.match(h.sent[0].error, /Submission attempted/);
+});
+
+test('native Send that never becomes ready is not clicked', async () => {
+  const h = contentHarness({sendDisabledQueries: 1000});
+  await startContent(h);
+  assert.equal(h.clicks, 0);
+  assert.match(h.sent[0].error, /Not submitted.*Native send button unavailable/);
+});
+
+test('draft, lost image chip, busy state, or changed text while waiting for Send fails closed', async () => {
+  for (const [name, changeDuringSend, error] of [
+    ['unrelated draft', null, /fresh empty chat/],
+    ['lost image chip', 'chip', /Native send button unavailable/],
+    ['busy state', 'busy', /fresh empty chat/],
+    ['changed text', 'text', /Composer text changed/]
+  ]) {
+    const options = name === 'unrelated draft' ? {draft: 'keep this'} : {changeDuringSend};
+    const h = contentHarness({...options, sendDelayQueries: name === 'unrelated draft' ? 0 : 1});
+    await startContent(h);
+    assert.equal(h.clicks, 0, `${name} must not click Send`);
+    assert.match(h.sent[0].error, error, `${name} must fail closed`);
+    assert.match(h.sent[0].error, /Not submitted/);
+  }
+});
+
 test('losing the native Create image chip during insertion fails closed before Send', async () => {
   const h = contentHarness({newUi: true, loseImageChipOnInsert: true});
   await startContent(h);
   assert.equal(h.clicks, 0);
-  assert.match(h.sent[0].error, /Not submitted.*Create image selection did not match/);
+  assert.match(h.sent[0].error, /Not submitted.*Native send button unavailable/);
 });
 
 test('contenteditable paragraph newline inflation does not reject the correct prompt', async () => {
@@ -530,7 +615,7 @@ test('whitespace normalization does not accept changed prompt words', async () =
   const h = contentHarness({newUi: true, inflateWhitespace: true, corruptInsertion: true});
   await startContent(h, {job_id: 'job-4', expected_model: expectedModel, prompt: 'draw a cat'});
   assert.equal(h.clicks, 0);
-  assert.match(h.sent[0].error, /Not submitted.*Create image selection did not match/);
+  assert.match(h.sent[0].error, /Not submitted.*Composer text changed/);
 });
 
 test('collection-only accepts one existing conversation and never inserts or clicks Send', async () => {

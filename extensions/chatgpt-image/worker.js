@@ -176,7 +176,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const state = await request(config, "/cleanup", {client_id: config.clientId, job_id: active.jobId,
         cleanup_status: "confirmation_required"});
       await chrome.storage.local.set({lastJob: state});
-      await connection("confirmation_required", "บันทึกไฟล์ภาพแล้ว ให้เอเจนต์ขอยืนยันจากคุณก่อนลบแชทผ่าน MCP");
+      await connection("confirmation_required", state.cleanup_confirmation === "requested"
+        ? "บันทึกและตรวจไฟล์แล้ว กำลังลบแชตของงานนี้ตามนโยบายอัตโนมัติ"
+        : "บันทึกไฟล์ภาพแล้ว ให้เอเจนต์ขอยืนยันจากคุณก่อนลบแชทผ่าน MCP");
       return {ok: true};
     }
     if (message.type === "image-result") {

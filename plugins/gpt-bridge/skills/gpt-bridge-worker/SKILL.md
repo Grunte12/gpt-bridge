@@ -5,49 +5,51 @@ description: "Use the user's local GPT Bridge CLI for one-account chat, research
 
 # GPT Bridge Worker
 
-## Native image generation — extension 0.1.9
+## Native image generation — extension 0.1.10
 
-For the owner's current image-generation tasks, prefer the `gpt-bridge-extension`
-MCP tools over the legacy direct CLI image commands below. Test/use only `second`;
-do not call `main`, refresh captures, or silently fall back to direct HTTP.
+Prefer the `gpt-bridge-extension` MCP tools for the owner's image-generation
+tasks. Test/use only `second`; never silently use `main` or direct HTTP.
 
 1. Call `extension_status()`. Require `account=second`, `paired=true` and
-   `extension_online=true`. `tab_ready=false` alone does not block a new image:
-   the extension prepares a fresh native image chat when the new job arrives.
+   `extension_online=true`. `tab_ready=false` alone is not a blocker: a new
+   explicit job prepares its native Create image chat automatically.
 2. Call `extension_image(prompt=..., expected_model="Create image")` once.
-3. Poll `extension_status(job_id=...)`. Success requires `state=complete` with a
-   saved image path, dimensions and hash; inspect that image.
-   After the saved-file receipt, the extension opens native Delete confirmation
-   for only that generated chat. `cleanup_status=confirmation_required` awaits
-   the owner's action-time approval for this exact job and its `chat_path`.
-   After that approval, call `extension_confirm_delete(job_id=..., owner_confirmed=true)`
-   once through MCP, then poll for `cleanup_status=deleted`. No browser-control
-   tool is needed. Never infer approval from a general cleanup preference.
-   Pending cleanup blocks the next image. Failure never means regenerate the
-   saved image or repeat deletion blindly. No unrelated chat is cleaned up.
-4. On interruption, failure or uncertainty, inspect the existing ChatGPT work;
-   never resend automatically. `extension_resolve` releases local work only after
-   that inspection and does not cancel upstream generation.
+3. Poll `extension_status(job_id=...)`. A saved image needs `state=complete`,
+   a local path, dimensions and hash; inspect that file.
+   - If `cleanup_policy=automatic_saved_chats`, the owner has opted into
+     permanent deletion after validated saves. The script deletes only each
+     newly Bridge-created image chat. Wait for `cleanup_status=deleted`;
+     do not ask per image or call `extension_confirm_delete`.
+   - Otherwise `confirmation_required` needs approval for that exact saved
+     job/chat, then one `extension_confirm_delete(job_id=..., owner_confirmed=true)`.
+   Pending cleanup blocks the next image. Cleanup failure never means regenerate
+   the saved image or retry deletion. It cannot be re-armed in this version.
+4. On failure/uncertainty, inspect existing work; never resend automatically.
+   `extension_resolve` releases local work after inspection, not upstream
+   generation or drafts. A new explicitly requested image may reuse an unsent
+   native image draft only when its entire normalized prompt matches; it never
+   clears an unrelated draft. The Send control is awaited, not clicked early.
 
-One local worker owns the paired tab. Other agent hosts must launch the same
-module with `--account second --connect`, not another owning worker. Clients
-share the existing worker and do not add listeners or queue files. The owner
-worker must remain running. The extension reuses its saved local pairing after
-restarts; do not ask for ChatGPT cookies/tokens or repeat initial pairing.
-A worker restart invalidates pending deletion approval; inspect that chat rather
-than repeating deletion. The four MCP tools require reconnecting an older host's
-stdio MCP client at an idle point; extension reconnect alone cannot update its schema.
+One local worker owns the paired tab. With the owner's explicit standing
+authorization, start that owner command with
+`--account second --auto-delete-saved-chats`; do not enable it for another user
+without their authorization. Other hosts use `--account second --connect`,
+not another owning worker; the auto-delete flag belongs only on the owner.
+Status reports the active policy. Default mode still requires per-job approval.
+Policy applies only to jobs created while enabled, never old chats/jobs.
 
-For each explicitly requested new image, the extension uses the paired tab's
-native New chat and Create image controls automatically. No manual tab preparation
-is needed. It preserves unrelated old conversations and refuses drafts, attachments,
-verification screens or running work rather than clearing or interrupting them.
-Use browser control only for initial setup, a closed paired tab, login or a real
-UI failure—not ordinary preparation, submission or polling. This route does not
-yet support reference edits/batches or guarantee
-GPT-6 Pro/High, highest quality, or original-download resolution. If its MCP tools
-are missing, reload/reconnect that host's MCP at a safe point; do not restart busy
-sessions or run old image commands as a substitute.
+Keep the owner running. Pairing reconnects after restarts without tokens/cookies
+or repeated setup. Restart invalidates pending cleanup; never replay it. The four
+tool names/arguments are unchanged. An older host may still cache schema text;
+read `cleanup_policy` from live status. Reload an old MCP host only at an idle
+point, never by restarting a busy session.
+
+No manual tab preparation is needed. Attachments, verification, running work,
+changed prompts and unrelated drafts fail closed. Use browser control only for
+initial setup/reload, a closed paired tab, login or necessary failure diagnosis,
+not ordinary submission, receipt or deletion. This route does not yet support
+reference edits/batches or guarantee Pro/High, highest quality, or original-download
+resolution. Missing MCP tools are not a reason to use old direct image commands.
 
 ## Preflight
 

@@ -206,7 +206,66 @@ ineffective workaround was removed. Its local-server panel has no reconnect
 control. Reopen/resume the same saved Claude session at an idle point to load
 the fourth tool; do not repeatedly restart transports, create a replacement
 conversation, or claim that extension reconnect alone refreshes host schemas.
-Native discovery of all four tools in that existing session is still pending.
+After the owner reopened the same Adobe session, Claude supplied native
+ToolSearch metadata for all four tools, including `extension_resolve`. Its real
+production job `abbff561606240528950570699b42872` saved a 1448 × 1086 PNG with
+SHA-256 `2dd6beb3e295d10d57bb184fdd7fe96f40c5fe6d0dcea32b959fb9fa61d4c625`.
+Cleanup expired after the 15-minute confirmation window and was handled manually
+by the owner. The next saved job, `475455182ca9476a8e2603a8583b058f`, reached
+`cleanup_status=deleted` through Claude's native MCP after owner approval.
+
+### Owner-authorized automatic cleanup (0.1.10)
+
+The owner explicitly requested permanent automatic deletion of Bridge-created
+image-generation chats after validated local saves, without per-image questions.
+Enable this only on the owning worker:
+
+```sh
+python -m chatgpt_api.extension_bridge --account second --auto-delete-saved-chats
+```
+
+Other clients keep `--account second --connect`; no new tools, listeners or queues
+are added. Live status reports `cleanup_policy=automatic_saved_chats`. The default
+without this flag remains `per_job_confirmation`. Each new job snapshots the
+opt-in; old jobs/chats are never retroactively authorized. Only after the validated
+file receipt and exact native chat/prompt checks does the server authorize that
+job's final Delete once. Agents wait for `cleanup_status=deleted` without calling
+`extension_confirm_delete`. A restart invalidates unfinished cleanup rather than
+replaying deletion. Saved files and hashes survive cleanup failure.
+
+The post-delete Send readiness fix replaces the fixed 400 ms delay with a bounded
+wait for a visible enabled native Send control, revalidating the live composer.
+It ignores hidden retained controls. A new explicit image job can reuse an exact
+matching unsent image draft without inserting twice; unrelated drafts, changed
+text, attachments and running work remain protected. No failed job is auto-retried.
+
+Live acceptance passed on 2026-10-16 after the owner reloaded the extension and
+refreshed the paired second-account tab. Luna used real stdio MCP only: listed
+the same four tools, checked account/pairing/online/policy and no active work,
+then made one explicit `extension_image` request using the previously failed
+production prompt. Job `142a894ac35d4cf286d0bfc57988f911` saved a 1448 × 1086 PNG,
+SHA-256 `d376ab7c9d6b090718831ef68bc47ab23ce06e421af9e22f71d547de7fb4624d`.
+The local file matched the receipt and visual inspection showed the requested
+photorealistic citrus-and-spice flatlay. Automatic cleanup reached `deleted` with
+single-use confirmation `consumed` for only that job's generated chat,
+`/c/6ad1bced-6ec8-83ec-8484-757674570011`. No `extension_confirm_delete`, resolve,
+browser-control action, or retry was used. Whether the reload blanked the prior
+draft or the matching-draft path reused it was not observed and is not claimed.
+Offline verification: 121 extension tests, 61 worker/client tests, and four skill
+validators passed. This proves one live automatic save/delete flow, not batch
+reliability, reference inputs, or Pro/High model selection.
+Claude subsequently reported five additional sequential production jobs
+(`f4bee24f`, `876604ca`, `04f48b56`, `935028f8`, `510e5439`) complete and
+automatically deleted without confirmation calls; these are host-reported
+follow-up results, separate from Luna's file/hash-verified acceptance above.
+An isolated export of the exact staged release also passed all 121 Node tests,
+61 Python tests and both exported skill validators, without unstaged changes.
+
+Requested follow-up (not supported by 0.1.10): accept two actual local reference
+images through MCP for the approved affiliate still pilot. Keep that change
+separate from this cleanup release; it needs local-file/image validation and
+native attachment handling before any production media is generated. Filenames
+inside prompt text are not reference attachments.
 
 ### Popup and reconnect state
 

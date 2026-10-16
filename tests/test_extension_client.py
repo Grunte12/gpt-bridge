@@ -306,3 +306,21 @@ def test_connect_refuses_main_account_alias_before_touching_data(tmp_path, monke
         main()
     assert error.value.code == 2
     assert not missing.exists()
+
+
+def test_connect_rejects_auto_cleanup_policy_before_reading_token_or_starting_worker(tmp_path, monkeypatch):
+    data_dir = tmp_path / "must-stay-absent"
+    monkeypatch.setattr("sys.argv", [
+        "extension", "--account", "second", "--connect", "--auto-delete-saved-chats",
+        "--data-dir", str(data_dir),
+    ])
+    monkeypatch.setattr("chatgpt_api.extension_bridge.read_token", lambda *_: pytest.fail("read token"))
+    monkeypatch.setattr("chatgpt_api.extension_bridge.ExtensionClient", lambda *_: pytest.fail("created client"))
+    monkeypatch.setattr("chatgpt_api.extension_bridge.ExtensionQueue", lambda *_: pytest.fail("created queue"))
+    monkeypatch.setattr("chatgpt_api.extension_bridge.ThreadingHTTPServer", lambda *_: pytest.fail("started worker"))
+
+    with pytest.raises(SystemExit) as error:
+        main()
+
+    assert error.value.code == 2
+    assert not data_dir.exists()

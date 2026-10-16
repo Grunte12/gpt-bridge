@@ -6,7 +6,7 @@ const path = require('node:path');
 
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 
-function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image'}, preparation = {fresh: true, model: 'Create image'}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false} = {}) {
+function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image'}, preparation = {fresh: true, model: 'Create image'}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false} = {}) {
   let listener;
   let alarmListener;
   const storage = sharedStorage || {};
@@ -46,6 +46,11 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
           const reply = await new Promise(resolve => listener({type: 'image-delete-prompt', jobId: message.jobId},
             {tab: {id}, url: `https://chatgpt.com${message.chatPath}`}, resolve));
           if (!reply?.ok) throw new Error(reply?.error || 'Deletion confirmation was not recorded');
+          if (autoDeleteConfirmation) {
+            const approval = await new Promise(resolve => listener({type: 'image-delete-confirmation', jobId: message.jobId},
+              {tab: {id}, url: `https://chatgpt.com${message.chatPath}`}, resolve));
+            if (approval?.confirmed !== true) throw new Error('Automatic deletion approval was not confirmed');
+          }
           if (holdDeleteConfirmation) await deleteGate;
           return deleteResponse;
         }
@@ -477,6 +482,33 @@ test('saved paired image opens Delete confirmation and records owner-confirmed d
   const duplicate = await send(h, message, sender);
   assert.ok(duplicate.error);
   assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
+});
+
+test('automatic saved-chat deletion follows requested confirmation through the existing native handshake', async () => {
+  const active = {jobId: 'job-1', tabId: 7};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, autoDeleteConfirmation: true, responses: {
+    result: {state: 'complete'},
+    cleanup: [
+      {state: 'complete', cleanup_status: 'confirmation_required', cleanup_confirmation: 'requested'},
+      {state: 'complete', cleanup_status: 'deleted'}
+    ],
+    'cleanup-confirmation': {confirmed: true}
+  }});
+  Object.assign(h.storage, {active, config});
+  const {message, sender} = pairedImageResult();
+
+  const response = await send(h, message, sender);
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)),
+    ['result', 'cleanup', 'cleanup-confirmation', 'cleanup']);
+  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
+  assert.deepEqual(h.requests[2].body, {client_id: 'client', job_id: 'job-1'});
+  assert.equal(h.requests[3].body.cleanup_status, 'deleted');
+  assert.equal(h.requests.some(call => call.url.endsWith('/agentconfirm')), false);
+  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
+  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
 });
 
 test('image-delete-prompt requires the currently finishing paired job', async t => {

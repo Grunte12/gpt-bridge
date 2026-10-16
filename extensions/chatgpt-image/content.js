@@ -13,6 +13,9 @@
     const chip = imageChip(element);
     return normalizedText(chip ? text.replace(chip.innerText, " ") : text);
   };
+  const jobPrompt = job => "Create one image. Return a generated image, not just a description.\n\n" + job.prompt;
+  const matchingDraft = (job, editor) => typeof job?.prompt === "string" &&
+    visible(imageChip(editor)) && promptText(editor) === normalizedText(jobPrompt(job));
   const busy = () => visible(document.querySelector('[data-testid="stop-button"], button[aria-label="Stop"]'));
   const assistants = () => [...document.querySelectorAll('[data-message-author-role="assistant"]')];
   const conversation = () => document.querySelector('[role="region"][aria-label="Conversation"]');
@@ -23,14 +26,15 @@
   const editorElement = () => [...document.querySelectorAll('#prompt-textarea[contenteditable="true"], textarea#prompt-textarea, [role="textbox"][contenteditable="true"][aria-label="Ask ChatGPT"]')].find(visible);
   const hasTurns = () => assistants().length || document.querySelector('[data-message-author-role="user"]') ||
     turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length;
-  function idleEditor() {
+  function idleEditor(job) {
     if (location.origin !== "https://chatgpt.com") throw new Error("Wrong site");
     if (verificationRequired()) throw new Error("Owner action required: complete verification in ChatGPT. Nothing was submitted.");
     if (new URL(location.href).searchParams.get("temporary-chat") === "true")
       throw new Error("Use a normal ChatGPT chat, not temporary chat. Nothing was submitted.");
     const editor = editorElement();
     if (!visible(editor)) throw new Error("ChatGPT composer unavailable. Nothing was submitted.");
-    if (busy() || promptText(editor)) throw new Error("Preserve the draft or running work. Nothing was submitted.");
+    if (busy() || (promptText(editor) && !matchingDraft(job, editor)))
+      throw new Error("Preserve the draft or running work. Nothing was submitted.");
     if (document.querySelector('input[type="file"]')?.files?.length ||
         document.querySelector('[data-testid="file-upload-progress"], [data-testid="attachment-preview"], [data-testid="file-thumbnail"]'))
       throw new Error("Remove existing attachments before using the image worker");
@@ -51,14 +55,14 @@
     // React may briefly unmount the composer just after an image completes.
     // Wait for that UI, without navigating or clearing an unseen draft.
     await waitFor(() => visible(editorElement()) && editorElement(), "ChatGPT composer unavailable");
-    let editor = idleEditor();
+    let editor = idleEditor(job);
     if (hasTurns()) {
       const newChat = [...document.querySelectorAll('button[aria-label="New chat"]')].find(visible) ||
         [...document.querySelectorAll("button")].find(el => visible(el) && normalizedText(el.textContent) === "New chat");
       if (!newChat) throw new Error("Native New chat control unavailable. Nothing was submitted.");
       newChat.click();
       await waitFor(() => !hasTurns() && visible(editorElement()) && editorElement(), "Fresh chat did not become ready");
-      editor = idleEditor();
+      editor = idleEditor(job);
     }
     if (!visible(imageChip(editor))) {
       const tools = [...document.querySelectorAll('button[aria-label="Add files and more"]')].find(visible);
@@ -82,7 +86,8 @@
     if (job.expected_model !== "Create image")
       throw new Error("Visible model label does not match expected_model. Native image mode is Create image.");
     if (busy() || assistants().length || document.querySelector('[data-message-author-role="user"]') ||
-        turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length || promptText(editor))
+        turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length ||
+        (promptText(editor) && !matchingDraft(job, editor)))
       throw new Error("Use a fresh empty chat with no draft or running work. Nothing was submitted.");
     if (document.querySelector('input[type="file"]')?.files?.length ||
         document.querySelector('[data-testid="file-upload-progress"], [data-testid="attachment-preview"], [data-testid="file-thumbnail"]'))
@@ -149,7 +154,7 @@
   async function run(job, collectOnly = false) {
     let submitted = collectOnly;
     try {
-      const prompt = "Create one image. Return a generated image, not just a description.\n\n" + job.prompt;
+      const prompt = jobPrompt(job);
       if (collectOnly) {
         if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
           throw new Error("Wrong site or model; existing image was not collected");
@@ -161,19 +166,26 @@
       } else {
         const editor = inspect(job);
         editor.focus();
-        if (editor instanceof HTMLTextAreaElement) {
-          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(editor, prompt);
-          editor.dispatchEvent(new Event("input", {bubbles: true}));
-        } else {
-          // insertText enters text through the contenteditable editor, not its HTML.
-          if (!document.execCommand("insertText", false, prompt)) throw new Error("Editor rejected text insertion");
-          editor.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: prompt}));
+        // A new explicit request may reuse only its exact unsent image draft.
+        if (!matchingDraft(job, editor)) {
+          if (editor instanceof HTMLTextAreaElement) {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(editor, prompt);
+            editor.dispatchEvent(new Event("input", {bubbles: true}));
+          } else {
+            // insertText enters text through the contenteditable editor, not its HTML.
+            if (!document.execCommand("insertText", false, prompt)) throw new Error("Editor rejected text insertion");
+            editor.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: prompt}));
+          }
         }
-        await sleep(400);
-        if (!visible(imageChip(editor)) || promptText(editor) !== normalizedText(prompt)) throw new Error("Composer text or Create image selection did not match; not submitted");
-        if (verificationRequired()) throw new Error("Owner action required: complete verification in ChatGPT. Nothing was submitted.");
-        const send = document.querySelector('[data-testid="send-button"], button[aria-label="Send"]');
-        if (!visible(send) || send.disabled) throw new Error("Native send button unavailable; not submitted");
+        const send = await waitFor(() => {
+          const current = editorElement();
+          if (!visible(current) || !visible(imageChip(current))) return null;
+          if (promptText(current) !== normalizedText(prompt))
+            throw new Error("Composer text changed; not submitted");
+          inspect(job);
+          return [...document.querySelectorAll('[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]')]
+            .find(button => visible(button) && !button.disabled);
+        }, "Native send button unavailable; not submitted");
         submitted = true;  // From here an uncertain result MUST NOT be retried.
         send.click();
       }

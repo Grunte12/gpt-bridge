@@ -636,3 +636,104 @@ def test_http_cleanup_confirmation_claim_consumes_authorization_before_reply(tmp
         "client_id": CLIENT_ID, "job_id": submitted["job_id"],
     })
     assert status == 200 and result == {"confirmed": False}
+
+
+def _automatic_cleanup_queue(root, enabled=True):
+    queue = ExtensionQueue(root, ACCOUNT, auto_delete_saved_chats=enabled)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image")
+    return queue
+
+
+def test_saved_chat_auto_cleanup_is_opt_in_and_default_stays_per_job(tmp_path):
+    queue = _paired_queue(tmp_path)
+    assert queue.status()["cleanup_policy"] == "per_job_confirmation"
+    submitted = queue.submit("Default policy job.", "Create image")
+    queue.claim(CLIENT_ID)
+    image_base64, _ = _png_base64()
+    queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
+                 cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+
+    awaiting = queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+    assert awaiting.get("auto_delete_saved_chat", False) is False
+    assert "cleanup_confirmation" not in awaiting
+    assert queue.claim_delete_confirmation(CLIENT_ID, submitted["job_id"]) == {"confirmed": False}
+    assert queue.confirm_delete(submitted["job_id"], True)["cleanup_confirmation"] == "requested"
+
+
+def test_opted_in_job_auto_authorizes_only_after_native_saved_chat_receipt(tmp_path):
+    queue = _automatic_cleanup_queue(tmp_path / "queue")
+    assert queue.status()["cleanup_policy"] == "automatic_saved_chats"
+    submitted = queue.submit("Opted-in saved chat.", "Create image")
+    assert submitted["auto_delete_saved_chat"] is True
+    queue.claim(CLIENT_ID)
+    image_base64, raw = _png_base64()
+    complete = queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
+                            cleanup_pending=True,
+                            chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    awaiting = queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+    assert awaiting["cleanup_status"] == "confirmation_required"
+    assert awaiting["cleanup_confirmation"] == "requested"
+    assert awaiting["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert queue.claim_delete_confirmation(CLIENT_ID, submitted["job_id"]) == {"confirmed": True}
+    assert queue.status(submitted["job_id"])["cleanup_confirmation"] == "consumed"
+    assert queue.claim_delete_confirmation(CLIENT_ID, submitted["job_id"]) == {"confirmed": False}
+    deleted = queue.cleanup(CLIENT_ID, submitted["job_id"], "deleted")
+    assert deleted["cleanup_status"] == "deleted"
+    assert (queue.root / submitted["job_id"] / "image.png").read_bytes() == raw
+
+
+def test_failed_or_malformed_auto_job_cannot_authorize_cleanup(tmp_path):
+    queue = _automatic_cleanup_queue(tmp_path / "queue")
+    failed = queue.submit("Synthetic failed job.", "Create image")
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, failed["job_id"], error="synthetic render failure")
+    with pytest.raises(ValueError, match="original saved-image dialog"):
+        queue.claim_delete_confirmation(CLIENT_ID, failed["job_id"])
+    with pytest.raises(ValueError, match="saved-image chat"):
+        queue.confirm_delete(failed["job_id"], True)
+
+    malformed = queue.submit("Malformed image job.", "Create image")
+    queue.claim(CLIENT_ID)
+    with pytest.raises((ValueError, OSError)):
+        queue.result(CLIENT_ID, malformed["job_id"], image_base64="not base64",
+                     cleanup_pending=True,
+                     chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    assert queue.status(malformed["job_id"])["state"] == "claimed"
+    with pytest.raises(ValueError, match="original saved-image dialog"):
+        queue.claim_delete_confirmation(CLIENT_ID, malformed["job_id"])
+
+
+def test_runtime_auto_policy_does_not_retroactively_opt_in_existing_jobs(tmp_path):
+    queue = _automatic_cleanup_queue(tmp_path / "queue", enabled=False)
+    submitted = queue.submit("Job created under legacy policy.", "Create image")
+    assert submitted.get("auto_delete_saved_chat", False) is False
+    queue.auto_delete_saved_chats = True
+    queue.claim(CLIENT_ID)
+    image_base64, _ = _png_base64()
+    queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
+                 cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+
+    awaiting = queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+    assert "cleanup_confirmation" not in awaiting
+    assert queue.claim_delete_confirmation(CLIENT_ID, submitted["job_id"]) == {"confirmed": False}
+
+
+def test_restart_invalidates_auto_pending_cleanup_without_replay(tmp_path):
+    root = tmp_path / "queue"
+    queue = _automatic_cleanup_queue(root / "data")
+    submitted = queue.submit("Restart safety.", "Create image")
+    queue.claim(CLIENT_ID)
+    image_base64, raw = _png_base64()
+    queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
+                 cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+    assert queue.status(submitted["job_id"])["cleanup_confirmation"] == "requested"
+
+    restarted = ExtensionQueue(root / "data", ACCOUNT, auto_delete_saved_chats=True)
+    persisted = restarted.status(submitted["job_id"])
+    assert persisted["cleanup_status"] == "failed"
+    assert persisted["cleanup_confirmation"] == "invalidated"
+    assert persisted["sha256"] == hashlib.sha256(raw).hexdigest()
+    restarted.pair(CLIENT_ID, ACCOUNT)
+    with pytest.raises(ValueError, match="original saved-image dialog"):
+        restarted.claim_delete_confirmation(CLIENT_ID, submitted["job_id"])
