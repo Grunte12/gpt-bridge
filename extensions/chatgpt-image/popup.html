@@ -20,7 +20,7 @@
     #connection-title { display:flex; align-items:baseline; gap:9px; }
     #connection-title::before { content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--muted); }
     body[data-state="ready"] #connection-title::before, body[data-state="complete"] #connection-title::before { background:var(--good); }
-    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="interrupted"] #connection-title::before { background:var(--warn); }
+    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="interrupted"] #connection-title::before, body[data-state="confirmation_required"] #connection-title::before { background:var(--warn); }
     body[data-state="failed"] #connection-title::before, body[data-state="needs_pairing"] #connection-title::before { background:var(--bad); }
     #connection-detail, #last-job, .hint { color:var(--muted); }
     #last-job { margin-top:10px; font-size:12px; }
@@ -69,6 +69,7 @@
     <div class="options">
       <button id="relink" type="button">เชื่อมแท็บนี้แทน — ใช้รหัสเดิม</button>
       <button id="collect" type="button" hidden>รับภาพจากงานเดิม ไม่สร้างซ้ำ</button>
+      <button id="reload" type="button">โหลดส่วนขยายรุ่นล่าสุด</button>
       <button id="disconnect" type="button">ลืมการจับคู่</button>
     </div>
     <p class="hint">เปิดแท็บที่เชื่อมไว้ค้างไว้ ไม่เปลี่ยนบัญชีระหว่างทำงาน</p>

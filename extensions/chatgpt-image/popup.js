@@ -2,7 +2,8 @@ const $ = selector => document.querySelector(selector);
 const labels = {
   checking: "กำลังตรวจการเชื่อมต่อ", unpaired: "เชื่อมครั้งแรก",
   ready: "พร้อมรับงาน", busy: "กำลังสร้างภาพ", complete: "รับภาพเรียบร้อย",
-  needs_tab: "เชื่อมแล้ว เตรียมแท็บอีกนิด", offline: "รอ MCP กลับมา",
+  confirmation_required: "บันทึกภาพแล้ว รอยืนยันลบแชท",
+  needs_tab: "ไม่พบแท็บที่เชื่อมไว้", offline: "รอ MCP กลับมา",
   needs_pairing: "ต้องเชื่อมใหม่", interrupted: "ตรวจงานเดิมก่อน", failed: "งานไม่สำเร็จ"
 };
 let current = {configured: false, connection: {state: "checking"}};
@@ -27,9 +28,10 @@ function render(status) {
     : "รหัสนี้ไม่ใช่รหัสผ่านหรือโทเคน ChatGPT บัญชีที่ใช้ต้องตรวจด้วยตัวคุณเอง";
   $("#refresh").hidden = !status.configured;
   $("#advanced").hidden = !status.configured;
-  $("#collect").hidden = !status.active;
-  $("#disconnect").disabled = !!status.active || busy;
   const job = status.lastJob;
+  $("#collect").hidden = !status.active || (job?.job_id === status.active.jobId && job.state === "complete");
+  $("#disconnect").disabled = !!status.active || busy;
+  $("#reload").disabled = !!status.active || busy;
   $("#last-job").hidden = !job;
   $("#last-job").textContent = !job ? "" : job.state === "complete"
     ? "ภาพล่าสุดบันทึกแล้ว" + (job.dimensions ? ` · ${job.dimensions.join(" × ")} พิกเซล` : "")
@@ -66,6 +68,11 @@ $("#pair-form").onsubmit = event => {
   });
 };
 $("#refresh").onclick = () => void action(() => refresh());
+$("#reload").onclick = () => void action(async () => {
+  const status = await chrome.runtime.sendMessage({type: "get-status", refresh: false});
+  if (status?.error || status?.active) throw new Error("รอให้งานภาพที่กำลังทำอยู่จบก่อนโหลดส่วนขยายใหม่");
+  chrome.runtime.reload();
+});
 $("#relink").onclick = () => {
   relinking = true;
   render(current);

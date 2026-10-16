@@ -50,7 +50,7 @@ Configure Codex, Claude Code, Cursor, Antigravity and OpenCode
 with the same Python/module plus `--account second --connect`. These lightweight
 stdio MCP clients use the existing authenticated loopback worker; they never
 open another listener, lock/reload queue state, or interrupt running work.
-They expose the same three tools and share the one-in-flight guard. If the owner
+They expose the same four tools and share the one-in-flight guard. If the owner
 worker is offline, calls fail without retry; clients do not start a replacement.
 The local key stays in its existing private file, not agent configuration.
 Environment proxies and HTTP redirects are disabled for client requests.
@@ -75,9 +75,143 @@ Existing sessions may need to reload/reconnect this MCP at a safe point. Do not
 restart busy agents or create replacement sessions. Installed shared skills must
 route image tasks to these tools rather than the legacy direct-image commands.
 
+Live host acceptance on 2026-10-16 is separate from configuration installation:
+OpenCode, Cursor and Antigravity each called native `extension_status` from an
+existing conversation and read the completed second-account 1254 × 1254 receipt.
+OpenCode used its supported dynamic MCP registration endpoint on the existing
+server; the two closed desktop apps were opened and their existing chats reused.
+No agent conversation was created, running job stopped, or new image generated.
+The owner's later Claude Code screenshot confirms its new MCP is loaded and the
+extension is online. Codex subsequently called native `extension_status` in this
+existing chat successfully too. These are connection checks, not evidence that
+every host has generated a new image with automatic preparation.
+
+### Automatic next-image preparation (extension 0.1.7)
+
+An explicitly submitted new image job now prepares its own native image chat in
+the same owner-paired tab. If the tab contains a completed conversation, the
+extension clicks native New chat, then Add files and more → Create image, and
+verifies the actual `picture_v2` pill before inserting the prompt or clicking
+Send. Old conversations stay in ChatGPT history. No preparation or navigation
+happens during idle heartbeats, and no replacement tab is created.
+
+`tab_ready=false` is a snapshot, not a reason to ask the owner to prepare every
+image. Submit only when `account=second`, `paired=true`, `extension_online=true`
+and no nonterminal job exists. Preparation refuses a draft, attachments, running
+work, temporary chat, verification screen, missing controls or a closed paired
+tab. It does not clear input, interrupt work, switch accounts, or solve challenges.
+Login/verification and initial pairing remain manual.
+
+The Web app can retain an old hidden composer before the current visible one
+after New chat. Composer lookup must inspect all matching editors and select a
+visible match; selecting the first DOM match can time out even on an empty chat.
+After an extension update, reload the extension and refresh the paired tab once
+so its content script is current. This update step is not per-image preparation.
+Chrome may also redact a paired tab's URL after an extension reload. In that
+case the worker requires a response from its existing ChatGPT-only content
+receiver before claiming work; it does not request broader browser permissions.
+
+Live acceptance passed after selecting the visible composer and confirming the
+updated content script was actually loaded. Luna generated two consecutive
+independent images through native MCP only: `49354183d6b941f3a2e010b0a0dbea01`
+(blue vase) and `f67c5bee10f847d8a3cb703a89058299` (yellow mug), both validated
+1254 × 1254 PNGs. The lead inspected both files. No browser preparation was needed
+between requests. The existing Claude Code Adobe stock conversation then passed
+two real production requests, `78d03a33dae046c2aa0d6c17381ff664` and
+`a1cba268345a4f94834a6c30e677a4b0`, both 1448 × 1086, with the same MCP-only flow.
+No failed job was automatically replayed and no `main` operation occurred.
+
+An `interrupted` job is terminal and does not, by itself, occupy the worker's
+in-flight capacity. Do not ask the owner to clear terminal history as a readiness
+fix. Inspect uncertain upstream work before retrying; never automatically replay
+an interrupted request. A newly authorized independent job is not a replay.
+
+### Saved-image chat cleanup (extension 0.1.8)
+
+Each image uses a fresh chat. After the local worker validates and saves the
+image bytes and returns the file receipt, the extension opens the native Delete
+confirmation for only that generated chat. It checks the exact paired job, live
+chat path, single-turn conversation and original prompt before opening the menu.
+The native Create image badge is excluded from prompt comparison, including its
+saved-message markup. Chrome's MessageSender URL can retain an older SPA path;
+the content receiver therefore verifies the current path itself.
+
+Permanent deletion still requires the owner's action-time confirmation for the
+exact saved-image chat. Version 0.1.8 required a human click in the native dialog;
+version 0.1.9 adds the job-scoped MCP action below, without browser-control tools.
+`state=complete` means the image is saved, while `cleanup_status` separately shows:
+
+- `pending`: file saved; cleanup is being checked.
+- `confirmation_required`: native Delete dialog is open; request owner approval
+  for this job and its `chat_path`, then call `extension_confirm_delete` once.
+- `deleted`: the native confirmation was clicked and the chat navigated away.
+- `failed`: cleanup was cancelled, timed out or could not be verified; the saved
+  file remains valid. Inspect the existing chat; do not regenerate or retry
+  deletion automatically.
+
+During confirmation the worker keeps its authenticated heartbeat online but
+does not claim another image or change the tab. Unrelated navigation is not
+treated as successful deletion. No unrelated old conversation is cleaned up.
+Cleanup canaries saved their images but exposed sender-path, native-badge and
+menu-trigger checks. The More menu is a pointerdown trigger; a programmatic click
+alone did not open it. These checks were fixed without resubmitting any
+saved-image request.
+
+The updated native MCP canary `eab8f1c58a1a4dd8a3ffb0713ca7a402` saved a
+1254 × 1254 apple PNG and reached `confirmation_required` automatically. Its
+SHA-256 is `49e847b629688c7a849e84b165c8ade736f30f617388f69947eb56429231f5fa`.
+Claude Code independently read the receipt through its existing native MCP and
+matched the on-disk hash and dimensions. After the owner explicitly approved
+this exact chat at action time, the lead clicked its native final Delete chat
+button. MCP reported `cleanup_status=deleted`, ChatGPT returned to its empty
+home composer, and the saved file's SHA-256 remained unchanged. This verifies the
+confirmation-gated flow, not unattended permanent deletion. Offline checks pass:
+102 extension tests and 42 worker/client tests at that version.
+
+### Job-scoped deletion through MCP (extension 0.1.9)
+
+After the image is saved, inspect `extension_status(job_id=...)` and show the
+owner that job's `chat_path`. Request approval for permanent deletion of this
+exact generated chat. Only after actual action-time approval, call
+`extension_confirm_delete(job_id=..., owner_confirmed=true)` once and poll the
+same status until `cleanup_status=deleted` or a reported failure. The extension
+consumes the persisted approval once, rechecks the original native dialog and
+idle composer, then clicks its final Delete button. Browser control is not part
+of this functional route. A trusted owner click in the native dialog also works.
+
+Pending cleanup rejects another image submission or a pairing change; it does
+not silently queue work behind a confirmation dialog. A worker restart marks
+unfinished cleanup failed and invalidates any approval, preserving the saved
+image and hash. Do not repeat an uncertain deletion. Updating the owner worker
+and extension does not update the tool schema of an already-running stdio MCP
+client: reconnect that client's MCP safely, without restarting its conversation.
+
+Offline verification: 112 extension tests and 55 worker/client tests pass.
+Luna's live stdio MCP-only canary `aadda8f2719f462abb3b131784f82ce4`
+generated an emerald-green cup and saved a 1374 × 1145 PNG, SHA-256
+`badde575454ce7db46e4ffa1ec435dbb23fe0be8c09422d220739e09c8775f59`.
+After the owner approved this exact chat, Luna called `extension_confirm_delete`
+once. MCP reported `cleanup_status=deleted` and
+`cleanup_confirmation=consumed`; the local PNG retained its dimensions and hash.
+No browser-control action was used for generation, receipt, confirmation or
+deletion. Browser control was used only to reload the installed extension and
+refresh its content script before the test.
+
+The existing Claude Code Adobe session independently verified that saved-file
+receipt and on-disk hash. Its transport transparently respawned after an idle
+stdio client restart, but the desktop host retained its cached three-tool list.
+Even a correctly negotiated `tools.listChanged=true` and one real
+`notifications/tools/list_changed` did not refresh that session's list; that
+ineffective workaround was removed. Its local-server panel has no reconnect
+control. Reopen/resume the same saved Claude session at an idle point to load
+the fourth tool; do not repeatedly restart transports, create a replacement
+conversation, or claim that extension reconnect alone refreshes host schemas.
+Native discovery of all four tools in that existing session is still pending.
+
 ### Popup and reconnect state
 
-The popup now shows ready, busy, offline, incomplete-tab and result states.
+The popup now shows ready, busy, offline, incomplete-tab and result states, plus
+**บันทึกภาพแล้ว รอยืนยันลบแชท** while the native Delete dialog awaits confirmation.
 Ordinary reconnect hides the key form. A local-key rotation or explicitly choosing
 **ลืมการจับคู่** still requires a new initial pairing; ordinary MCP restarts do not.
 If the paired tab was closed, use **ตัวเลือก → เชื่อมแท็บนี้แทน — ใช้รหัสเดิม** on a
@@ -87,8 +221,8 @@ second account. It never silently selects another tab/account.
 The 30-second alarm is restored when the worker starts. Reconnect can take one
 alarm interval, and browser scheduling may delay it. A live server connection and
 a ready image composer are separate states: MCP exposes `extension_online` and
-`tab_ready`, and rejects new work when the last heartbeat says the tab is not
-ready. Every actual send still rechecks the composer. Work interrupted by a server
+`tab_ready`; version 0.1.7 accepts a new explicit job while the tab is not ready
+so the extension can prepare it safely. Every actual send still rechecks the composer. Work interrupted by a server
 restart remains interrupted and is never resubmitted automatically.
 
 Two live idle-MCP restart cycles on 2026-10-16 reconnected through the installed
@@ -117,7 +251,8 @@ codex mcp add gpt-bridge-extension -- /Users/grunte/Workspace/repos/gpt-bridge/.
 ```
 
 Reload the MCP connection if the host does not discover newly registered servers.
-It exposes only `extension_status`, `extension_image`, and `extension_resolve`.
+It exposes `extension_status`, `extension_image`, `extension_confirm_delete`, and
+`extension_resolve`.
 The owning worker listens on `127.0.0.1:18767` while it remains running. It is a
 separate process/data directory; existing direct Bridge jobs are unaffected.
 
@@ -148,7 +283,7 @@ a job is running. Login and any verification remain manual.
 
 ## One bounded smoke test
 
-Call `extension_status` first. When `extension_online=true` and `tab_ready=true`, call
+Call `extension_status` first. When `account=second`, `paired=true` and `extension_online=true`, call
 `extension_image` once with `prompt` and `expected_model`. `expected_model` must
 be **`Create image`**, matching the verified native image route. This is not a
 claim that an image uses GPT-6 High/Pro or a specific rendering-quality setting.
@@ -170,9 +305,9 @@ it never solves them or automatically resends after you complete them. To releas
 generation. The extension checks terminal state before clearing its active slot,
 including after a server restart; disconnect cannot silently drop running work.
 Use the popup's saved-key relink option to change tabs, or explicitly forget the
-pairing to clear its stored key. A fresh empty chat is
-required for the next image; automatic conversation navigation and image editing
-are intentionally not included in this first version.
+pairing to clear its stored key. The extension prepares a fresh empty native
+image chat for the next explicitly requested image. Reference editing and batch
+generation are not implemented.
 
 If a UI fix required reloading the extension and the original completed chat,
 keep the MCP server running and use **ตัวเลือก → รับภาพจากงานเดิม ไม่สร้างซ้ำ** in

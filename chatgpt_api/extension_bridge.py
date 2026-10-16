@@ -68,6 +68,9 @@ class ExtensionClient:
     def resolve(self, job_id: str) -> dict:
         return self.call("resolve", {"job_id": job_id, "inspected_chatgpt": True})
 
+    def confirm_delete(self, job_id: str, owner_confirmed: bool = False) -> dict:
+        return self.call("confirm-delete", {"job_id": job_id, "owner_confirmed": owner_confirmed})
+
 
 class ExtensionQueue:
     def __init__(self, root: Path, account: str):
@@ -95,6 +98,10 @@ class ExtensionQueue:
             if record.get("state") not in TERMINAL:
                 record.update(state="interrupted", error="Server restarted; inspect ChatGPT before resubmitting.")
                 self._save(record)
+            elif record.get("cleanup_status") in {"pending", "confirmation_required"}:
+                record.update(cleanup_status="failed", cleanup_confirmation="invalidated",
+                              cleanup_error="Server restarted before cleanup was verified; inspect the chat, do not repeat deletion automatically.")
+                self._save(record)
 
     def _save(self, job):
         directory = self.root / job["job_id"]
@@ -110,7 +117,7 @@ class ExtensionQueue:
         if not isinstance(visible_model, str) or len(visible_model) > 100:
             raise ValueError("invalid visible model label")
         with self.lock:
-            if any(j["state"] not in TERMINAL for j in self.jobs.values()):
+            if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
                 raise ValueError("finish or resolve the current job before pairing again")
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
                            "tab_ready": True}
@@ -139,14 +146,12 @@ class ExtensionQueue:
     def submit(self, prompt: str, expected_model: str) -> dict:
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 16000:
             raise ValueError("prompt must contain 1..16000 characters")
-        if not isinstance(expected_model, str) or not 1 <= len(expected_model.strip()) <= 100:
-            raise ValueError("expected_model must be the exact visible model-picker label")
+        if expected_model != "Create image":
+            raise ValueError('expected_model must be exactly "Create image"')
         with self.lock:
             if not self.client or time.monotonic() - self.client["seen"] > 90:
                 raise ValueError("pair a logged-in ChatGPT tab and wait for its heartbeat first")
-            if not self.client["tab_ready"]:
-                raise ValueError("paired tab is not ready; use a fresh normal chat with Create image selected")
-            if any(j["state"] not in TERMINAL for j in self.jobs.values()):
+            if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
                 raise ValueError("one image job at a time; inspect existing job before resubmitting")
             job = {"job_id": uuid.uuid4().hex, "state": "queued", "prompt": prompt, "account": self.account,
                    "expected_model": expected_model.strip(), "client_id": self.client["client_id"]}
@@ -165,7 +170,12 @@ class ExtensionQueue:
             return {}
 
     def result(self, client_id: str, job_id: str, *, image_base64: str | None = None,
-               error: str | None = None, source: str = "rendered-image") -> dict:
+               error: str | None = None, source: str = "rendered-image", cleanup_pending: bool = False,
+               chat_path: str | None = None) -> dict:
+        if type(cleanup_pending) is not bool:
+            raise ValueError("invalid cleanup flag")
+        if chat_path is not None and (not isinstance(chat_path, str) or not re.fullmatch(r"/c/[a-f0-9-]{36}", chat_path)):
+            raise ValueError("invalid generated chat path")
         with self.lock:
             self._client(client_id)
             job = self.jobs.get(job_id)
@@ -191,7 +201,57 @@ class ExtensionQueue:
                     output.write(raw)
                 job.update(state="complete", image_path=str(path), dimensions=dimensions,
                            sha256=hashlib.sha256(raw).hexdigest(), source=source,
+                           cleanup_status="pending" if cleanup_pending else "not_requested",
                            quality_note="Rendered asset; original download resolution not verified.")
+                if chat_path is not None:
+                    job["chat_path"] = chat_path
+            self._save(job)
+            return self.status(job_id)
+
+    def confirm_delete(self, job_id: str, owner_confirmed: bool = False) -> dict:
+        """Authorize this one pending native dialog only after actual owner approval."""
+        if owner_confirmed is not True:
+            raise ValueError("actual owner confirmation is required for this exact chat at action time")
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job or job["state"] != "complete" or job.get("cleanup_status") != "confirmation_required" or not job.get("chat_path"):
+                raise ValueError("this saved-image chat is not awaiting deletion confirmation")
+            if not self.client or job["client_id"] != self.client["client_id"] or time.monotonic() - self.client["seen"] > 90:
+                raise ValueError("the original paired extension must be online")
+            if job.get("cleanup_confirmation"):
+                raise ValueError("deletion confirmation is single-use; inspect status, never repeat")
+            job["cleanup_confirmation"] = "requested"
+            self._save(job)
+            return self.status(job_id)
+
+    def claim_delete_confirmation(self, client_id: str, job_id: str) -> dict:
+        with self.lock:
+            self._client(client_id)
+            job = self.jobs.get(job_id)
+            if not job or job["client_id"] != client_id or job["state"] != "complete" or job.get("cleanup_status") != "confirmation_required":
+                raise ValueError("only the original saved-image dialog can claim confirmation")
+            confirmed = job.get("cleanup_confirmation") == "requested"
+            if confirmed:
+                job["cleanup_confirmation"] = "consumed"
+                self._save(job)  # Consume before delivery; never repeat an uncertain delete.
+            return {"confirmed": confirmed}
+
+    def cleanup(self, client_id: str, job_id: str, cleanup_status: str, error: str = "") -> dict:
+        """Record native deletion confirmation/outcome without changing a saved image."""
+        if cleanup_status not in {"confirmation_required", "deleted", "failed"} or not isinstance(error, str):
+            raise ValueError("invalid cleanup outcome")
+        with self.lock:
+            self._client(client_id)
+            job = self.jobs.get(job_id)
+            if not job or job["client_id"] != client_id or job["state"] != "complete" or job.get("cleanup_status") not in {"pending", "confirmation_required"}:
+                raise ValueError("cleanup is not pending for this extension's saved image")
+            if cleanup_status == "confirmation_required" and job["cleanup_status"] != "pending":
+                raise ValueError("deletion confirmation is already pending")
+            if cleanup_status == "deleted" and job["cleanup_status"] != "confirmation_required":
+                raise ValueError("deletion must follow the native confirmation step")
+            job.update(cleanup_status=cleanup_status)
+            if cleanup_status == "failed":
+                job["cleanup_error"] = error[:500]
             self._save(job)
             return self.status(job_id)
 
@@ -204,7 +264,8 @@ class ExtensionQueue:
                         "visible_model": self.client["visible_model"] if self.client else None,
                         "tab_ready": bool(self.client and self.client["tab_ready"]),
                         "extension_online": bool(self.client and time.monotonic() - self.client["seen"] <= 90),
-                        "jobs": [{"job_id": j["job_id"], "state": j["state"]} for j in list(self.jobs.values())[-10:]]}
+                        "jobs": [{k: j[k] for k in ("job_id", "state", "cleanup_status", "chat_path") if k in j}
+                                 for j in list(self.jobs.values())[-10:]]}
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
             return {k: v for k, v in self.jobs[job_id].items() if k not in {"prompt", "client_id"}}
@@ -282,12 +343,18 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                     result = queue.claim(data["client_id"])
                 elif self.path == "/result":
                     result = queue.result(**data)
+                elif self.path == "/cleanup":
+                    result = queue.cleanup(**data)
+                elif self.path == "/cleanup-confirmation":
+                    result = queue.claim_delete_confirmation(**data)
                 elif self.path == "/state":
                     result = queue.client_status(data["client_id"], data["job_id"])
                 elif self.path == "/agent/status":
                     result = queue.status(**data)
                 elif self.path == "/agent/image":
                     result = queue.submit(**data)
+                elif self.path == "/agent/confirm-delete":
+                    result = queue.confirm_delete(**data)
                 elif self.path == "/agent/resolve":
                     if data.get("inspected_chatgpt") is not True:
                         raise ValueError("inspect ChatGPT before resolving uncertain work")
@@ -306,13 +373,18 @@ def create_mcp(queue):
 
     @server.tool()
     def extension_status(job_id: str = "") -> dict:
-        """Check pairing or an image job. Complete requires a validated saved image."""
+        """Check a saved image job. confirmation_required blocks new images; show its chat_path and request owner approval, then call extension_confirm_delete once. deleted confirms cleanup. Cleanup failure never means regenerate the saved image."""
         return queue.status(job_id)
 
     @server.tool()
     def extension_image(prompt: str, expected_model: str) -> dict:
-        """Generate ONE image in the paired tab. expected_model is its exact visible picker label; no model switching or retry. Tab must be a fresh empty chat."""
+        """Generate ONE image on second. Use expected_model='Create image'. The paired extension prepares a fresh native image chat for this new job; it never clears drafts, interrupts running work, or retries uncertain submissions. Check status first; pairing and extension_online are required, tab_ready may be false."""
         return queue.submit(prompt, expected_model)
+
+    @server.tool()
+    def extension_confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
+        """Permanently delete only this saved-image chat via MCP/extension, without browser-control tools. Require actual owner approval at action time for the exact job and chat_path; never infer it from a cleanup preference. Pass owner_confirmed=true only after that approval. Single-use: poll status, never retry uncertain deletion."""
+        return queue.confirm_delete(job_id, owner_confirmed)
 
     @server.tool()
     def extension_resolve(job_id: str, inspected_chatgpt: bool = False) -> dict:

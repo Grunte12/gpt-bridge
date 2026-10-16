@@ -7,11 +7,11 @@ const path = require('node:path');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/popup.js'), 'utf8');
 const ids = [
   'notice', 'connection-title', 'connection-detail', 'identity', 'pair-form', 'token-row', 'token',
-  'pair-hint', 'refresh', 'advanced', 'collect', 'disconnect', 'last-job', 'relink',
+  'pair-hint', 'refresh', 'advanced', 'collect', 'disconnect', 'last-job', 'relink', 'reload',
   'confirm-account', 'pair'
 ];
 
-function harness(initialStatus, {statusError = null, tabId = 7} = {}) {
+function harness(initialStatus, {statusError = null, reloadStatusError = null, tabId = 7} = {}) {
   const elements = Object.fromEntries(ids.map(id => [id, {
     id, textContent: '', hidden: true, disabled: false, required: false, value: '', checked: false,
     focus() {}
@@ -19,8 +19,9 @@ function harness(initialStatus, {statusError = null, tabId = 7} = {}) {
   elements['confirm-account'].required = true;
   const body = {dataset: {state: 'checking'}};
   const messages = [];
+  let reloads = 0;
   let changedListener;
-  const buttons = ['pair', 'refresh', 'relink', 'collect', 'disconnect'].map(id => elements[id]);
+  const buttons = ['pair', 'refresh', 'relink', 'collect', 'disconnect', 'reload'].map(id => elements[id]);
   const document = {
     body,
     querySelector(selector) { return elements[selector.slice(1)]; },
@@ -29,14 +30,17 @@ function harness(initialStatus, {statusError = null, tabId = 7} = {}) {
   const chrome = {
     runtime: {async sendMessage(message) {
       messages.push(message);
-      if (message.type === 'get-status') return statusError ? {error: statusError} : initialStatus;
+      if (message.type === 'get-status') {
+        const error = message.refresh === false ? reloadStatusError : statusError;
+        return error ? {error} : initialStatus;
+      }
       return {ok: true};
-    }},
+    }, reload() { reloads++; }},
     tabs: {async query() { return [{id: tabId}]; }},
     storage: {onChanged: {addListener(fn) { changedListener = fn; }}}
   };
   vm.runInNewContext(source, {document, chrome}, {filename: 'popup.js'});
-  return {elements, body, messages, changedListener};
+  return {elements, body, messages, changedListener, get reloads() { return reloads; }};
 }
 
 async function settle() {
@@ -130,4 +134,57 @@ test('popup initialization error never displays a ready state', async () => {
   assert.notEqual(h.elements['connection-title'].textContent, 'พร้อมรับงาน');
   assert.equal(h.elements.notice.hidden, false);
   assert.notEqual(h.elements.notice.textContent, '');
+});
+
+test('reload requires cached idle status and reloads the extension once', async t => {
+  await t.test('idle status reloads once without a fresh poll', async () => {
+    const h = harness({configured: true, account: 'second', tabId: 7,
+      connection: {state: 'ready'}, active: null, lastJob: null});
+    await settle();
+
+    assert.equal(h.elements.reload.disabled, false);
+    h.elements.reload.onclick();
+    await settle();
+
+    assert.equal(h.reloads, 1);
+    assert.ok(h.messages.some(message => message.type === 'get-status' && message.refresh === false));
+  });
+
+  await t.test('active job disables reload and cached status refuses it', async () => {
+    const h = harness({configured: true, account: 'second', tabId: 7,
+      connection: {state: 'busy'}, active: {jobId: 'job-1'}, lastJob: null});
+    await settle();
+
+    assert.equal(h.elements.reload.disabled, true);
+    h.elements.reload.onclick();
+    await settle();
+
+    assert.equal(h.reloads, 0);
+    assert.ok(h.messages.some(message => message.type === 'get-status' && message.refresh === false));
+  });
+
+  await t.test('status error refuses reload', async () => {
+    const h = harness({configured: true, account: 'second', tabId: 7,
+      connection: {state: 'ready'}, active: null, lastJob: null}, {reloadStatusError: 'worker unavailable'});
+    await settle();
+    h.elements.reload.onclick();
+    await settle();
+
+    assert.equal(h.reloads, 0);
+    assert.equal(h.elements.notice.hidden, false);
+  });
+});
+
+test('saved image awaiting owner Delete confirmation keeps destructive controls locked', async () => {
+  const h = harness({configured: true, account: 'second', tabId: 7,
+    connection: {state: 'confirmation_required', detail: 'Confirm Delete chat in ChatGPT'},
+    active: {jobId: 'job-1'}, lastJob: {job_id: 'job-1', state: 'complete'}});
+  await settle();
+
+  assert.equal(h.elements['connection-title'].textContent, 'บันทึกภาพแล้ว รอยืนยันลบแชท');
+  assert.equal(h.elements['connection-detail'].textContent, 'Confirm Delete chat in ChatGPT');
+  assert.equal(h.elements['pair-form'].hidden, true);
+  assert.equal(h.elements.reload.disabled, true);
+  assert.equal(h.elements.disconnect.disabled, true);
+  assert.equal(h.elements.collect.hidden, true);
 });

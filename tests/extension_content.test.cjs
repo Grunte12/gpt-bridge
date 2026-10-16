@@ -8,39 +8,78 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationBodies = [], imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   let clicks = 0;
+  let finalDeleteClicks = 0;
+  let menuOpen = false;
+  let busyState = busy;
+  let challengeState = challenge;
+  let controlsState = controls;
+  let dialogOpen = false;
+  let remainingEditorDelay = editorDelayQueries;
+  const location = {origin: 'https://chatgpt.com', href: `https://chatgpt.com${temporaryChat ? '/?temporary-chat=true' : chatPath}`, pathname: chatPath};
+  const hasConversation = () => user || (conversationTurns || []).length > 0;
   const sent = [];
   const chip = {innerText: 'Create image', getClientRects: () => [{}]};
   const composerText = () => `${imageMode ? 'Create image' : ''}${draft ? (imageMode ? ' ' : '') + draft : ''}`;
   class Textarea {
     constructor() { this._value = composerText(); this.disabled = false; }
-    querySelector(selector) { return imageMode && selector.includes('data-inline-selection-pill') ? chip : null; }
+    querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
     get value() { return this._value; }
     focus() {}
     dispatchEvent() {}
-    getClientRects() { return [{}]; }
+    getClientRects() { return editorAvailable ? [{}] : []; }
     click() { clicks++; }
   }
   Object.defineProperty(Textarea.prototype, 'value', {get() { return this._value; }, set(v) { this._value = v; }});
   class ContentEditable {
     constructor() { this.innerText = composerText(); this.disabled = false; }
-    querySelector(selector) { return imageMode && selector.includes('data-inline-selection-pill') ? chip : null; }
+    querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
     get textContent() { return this.innerText; }
     focus() {}
     dispatchEvent() {}
-    getClientRects() { return [{}]; }
+    getClientRects() { return editorAvailable ? [{}] : []; }
   }
   const editor = newUi ? new ContentEditable() : new Textarea();
+  const hiddenOldEditor = {value: 'completed conversation content', innerText: 'completed conversation content',
+    querySelector() { return null; }, getClientRects: () => []};
+  const setEditorText = value => { if (newUi) editor.innerText = value; else editor._value = value; };
   const send = {disabled: false, getClientRects: () => [{}], click() { clicks++; }};
   const picker = {textContent: label, getClientRects: () => [{}]};
+  const button = (textContent, ariaLabel, isVisible, onClick = () => {}) => ({
+    textContent, innerText: textContent, disabled: false, getAttribute(name) { return name === 'aria-label' ? ariaLabel : null; },
+    getClientRects: () => isVisible() ? [{}] : [], click() { clicks++; onClick(); }
+  });
+  const newChatButton = button('New chat', 'New chat', () => controlsState && hasConversation(), () => {
+    user = false; conversationTurns = []; conversationBodies = []; imageMode = false; draft = ''; setEditorText(''); menuOpen = false;
+  });
+  const filesButton = button('Add files and more', 'Add files and more', () => controlsState && !hasConversation() && !busyState && !challengeState && !challengeAfterSend && !attachments, () => { menuOpen = true; });
+  const createImageButton = button('Create imageVisualize anything', null, () => controlsState && menuOpen, () => {
+    imageMode = true; setEditorText('Create image'); menuOpen = false;
+  });
+  const moreButton = {...button('More', 'More', () => controlsState), dispatchEvent(event) {
+    if (event.type === 'pointerdown' && event.bubbles && event.button === 0 &&
+        event.pointerType === 'mouse' && event.isPrimary) {
+      clicks++;
+      menuOpen = true;
+    }
+  }};
+  const deleteItem = {textContent: 'Delete', getClientRects: () => menuOpen ? [{}] : [], click() { clicks++; dialogOpen = true; menuOpen = false; }};
+  const finalDeleteButton = {textContent: 'Delete chat', listeners: new Set(), getClientRects: () => dialogOpen ? [{}] : [],
+    addEventListener(type, fn) { if (type === 'click') this.listeners.add(fn); },
+    removeEventListener(type, fn) { if (type === 'click') this.listeners.delete(fn); },
+    click(event = {isTrusted: false}) { clicks++; finalDeleteClicks++; for (const fn of this.listeners) fn(event); location.pathname = '/'; dialogOpen = false; }};
+  const deleteDialog = {getClientRects: () => dialogOpen ? [{}] : [], querySelectorAll(selector) { return selector === 'button' ? [finalDeleteButton] : []; }};
+  const displayedImage = {src: 'https://chatgpt.com/generated.png', currentSrc: 'https://chatgpt.com/generated.png',
+    complete: true, naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}]};
   const conversation = {getClientRects: () => [{}], querySelectorAll(selector) {
+    if (selector === 'img') return imageReady ? [displayedImage] : [];
     if (selector === 'h4') return (conversationTurns || []).map((textContent, index) => ({
       textContent, nextElementSibling: conversationBodies[index] ? {
         innerText: conversationBodies[index],
-        querySelector(selector) { return imageMode && selector.includes('data-inline-selection-pill') ? chip : null; }
+        querySelector(selector) { return imageMode && (promptLinkBadge ? selector.includes('data-prompt-link-href') : selector.includes('data-inline-selection-pill')) ? chip : null; }
       } : null,
       getClientRects: () => [{}]
     }));
@@ -48,17 +87,31 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   }};
   const document = {
     querySelector(selector) {
-      if (newUi && selector.includes('[aria-label="Ask ChatGPT"]')) return editor;
-      if (selector.startsWith('#prompt-textarea')) return editor;
+      if ((newUi && selector.includes('[aria-label="Ask ChatGPT"]')) || selector.startsWith('#prompt-textarea')) {
+        if (remainingEditorDelay > 0) { remainingEditorDelay--; return null; }
+        return editor;
+      }
       if (selector === '[data-testid="model-switcher-dropdown-button"]' || selector.includes('[aria-label="Select ChatGPT model"]')) return picker;
-      if (selector === '[data-testid="stop-button"]' || selector.includes('button[aria-label="Stop"]')) return busy ? {getClientRects: () => [{}]} : null;
+      if (selector === '[data-testid="stop-button"]' || selector.includes('button[aria-label="Stop"]')) return busyState ? {getClientRects: () => [{}]} : null;
       if (selector.includes('[aria-label="Conversation"]')) return conversation;
       if (selector === '[data-testid="send-button"]' || selector.includes('[aria-label="Send"]')) return send;
+      if (selector === 'button[aria-label="New chat"]') return newChatButton;
+      if (selector === 'button[aria-label="Add files and more"]') return filesButton;
+      if (selector === 'button[aria-label="More"]') return moreButton;
+      if (selector === '[role="dialog"]') return dialogOpen ? deleteDialog : null;
+      if (selector.includes('input[type="file"]')) return attachments ? {files: [{}]} : null;
+      if (selector.includes('[data-testid="file-upload-progress"]') || selector.includes('[data-testid="attachment-preview"]') || selector.includes('[data-testid="file-thumbnail"]')) return attachments ? {} : null;
       if (selector === '[data-message-author-role="user"]') return user ? {} : null;
       return null;
     },
     querySelectorAll(selector) {
-      if (selector.includes('challenges.cloudflare.com') && (challenge || (challengeAfterSend && clicks)))
+      if (selector.includes('[role="textbox"]') || selector.includes('textarea#prompt-textarea'))
+        return hiddenRetainedEditor ? [hiddenOldEditor, editor] : [editor];
+      if (selector === '[role="menuitem"]') return [deleteItem];
+      if (selector === '[role="dialog"]') return dialogOpen ? [deleteDialog] : [];
+      if (selector.startsWith('button')) return [newChatButton, filesButton, createImageButton, moreButton].filter(item =>
+        selector === 'button' || selector.includes(`aria-label="${item.getAttribute('aria-label')}"`));
+      if (selector.includes('challenges.cloudflare.com') && (challengeState || (challengeAfterSend && clicks)))
         return [{getClientRects: () => [{}]}];
       if (selector.includes('h4') && !selector.startsWith('region'))
         return (conversationTurns || []).map(textContent => ({textContent, getClientRects: () => [{}]}));
@@ -77,17 +130,39 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   class SimDate extends NativeDate { static now() { return now; } }
   const chrome = {runtime: {
     onMessage: {addListener(fn) { listener = fn; }},
-    async sendMessage(message) { sent.push(message); return {}; }
+    async sendMessage(message) {
+      sent.push(message);
+      if (message.type === 'image-delete-prompt') return {ok: true};
+      if (message.type === 'image-delete-confirmation') {
+        onConfirmation?.(message);
+        return typeof confirmationResponse === 'function' ? confirmationResponse(message) : (confirmationResponse || {});
+      }
+      return {};
+    }
   }};
   const context = {
-    chrome, document, location: {origin: 'https://chatgpt.com', href: 'https://chatgpt.com/'},
-    HTMLTextAreaElement: Textarea, Event: class {}, InputEvent: class {}, Date: SimDate,
-    setTimeout(fn, ms) { now += ms; queueMicrotask(fn); return 1; }, clearTimeout() {},
-    URL, AbortSignal, fetch() { throw new Error('fetch should not be reached in guard tests'); },
-    FileReader: class {}
+    chrome, document, location,
+    HTMLTextAreaElement: Textarea, Event: class {}, InputEvent: class {},
+    PointerEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } }, Date: SimDate,
+    setTimeout(fn, ms) {
+      if (waitForHumanDelete && ms === 250) { now += ms; setImmediate(fn); }
+      else { now += ms; queueMicrotask(fn); }
+      return 1;
+    }, clearTimeout() {},
+    URL, AbortSignal, async fetch() { return {ok: true, async blob() { return {type: 'image/png', size: 32}; }}; },
+    FileReader: class { readAsDataURL() { this.result = 'data:image/png;base64,cG5n'; this.onload(); } }
   };
   vm.runInNewContext(contentSource, context, {filename: 'content.js'});
-  return {receive: listener, sent, get clicks() { return clicks; }, editor};
+  return {receive: listener, sent, get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, editor, location,
+    clickMore() { moreButton.click(); }, get deleteMenuOpen() { return menuOpen; },
+    setBusy(value) { busyState = value; }, setChallenge(value) { challengeState = value; },
+    setControls(value) { controlsState = value; }, setConversationBodies(value) { conversationBodies = value; },
+    confirmDelete() { for (const fn of finalDeleteButton.listeners) fn({isTrusted: true}); dialogOpen = false; location.pathname = '/'; },
+    trustedClickClosesDialog() { for (const fn of finalDeleteButton.listeners) fn({isTrusted: true}); dialogOpen = false; },
+    syntheticDeleteClick() { finalDeleteButton.click({isTrusted: false}); },
+    closeDeleteDialog() { dialogOpen = false; },
+    setFinalDeleteDisabled(value) { finalDeleteButton.disabled = value; },
+    delayedPathChange() { setImmediate(() => { location.pathname = '/'; }); }};
 }
 
 async function startContent(harness, job = {job_id: 'job-1', expected_model: 'Create image', prompt: 'draw a cat'}) {
@@ -103,6 +178,265 @@ async function startCollect(harness, expectedModel = 'Create image', prompt = 'd
   await new Promise(resolve => setImmediate(resolve));
   return accepted;
 }
+
+async function startPrepare(harness, expectedModel = 'Create image') {
+  let result;
+  harness.receive({type: 'image-prepare', job: {expected_model: expectedModel}}, {}, value => { result = value; });
+  await new Promise(resolve => setImmediate(resolve));
+  return result;
+}
+
+async function primeArchiveTarget(overrides = {}) {
+  const prompt = 'Create one image. Return a generated image, not just a description.\n\ndraw a cat';
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: [`Create image ${prompt}`], imageReady: true, promptLinkBadge: true, waitForHumanDelete: true, ...overrides});
+  const accepted = await startCollect(h);
+  assert.ok(accepted?.accepted);
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-result' && message.imageBase64); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.sent.some(message => message.type === 'image-result' && message.imageBase64), 'saved image receipt must exist before cleanup');
+  return h;
+}
+
+async function requestDelete(harness, overrides = {}) {
+  let result;
+  harness.receive({type: 'image-delete', jobId: 'job-collect', chatPath: harness.location.pathname, ...overrides}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  return result;
+}
+
+test('image preparation leaves an already-fresh native image chat unchanged', async () => {
+  const h = contentHarness();
+  const result = await startPrepare(h);
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.equal(h.clicks, 0);
+  assert.equal(h.editor.value, 'Create image');
+});
+
+test('inspection selects the visible composer when a hidden retained composer comes first', () => {
+  const h = contentHarness({newUi: true, hiddenRetainedEditor: true});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.equal(h.clicks, 0);
+  assert.equal(h.editor.innerText, 'Create image');
+});
+
+test('image preparation turns a completed chat into a fresh native image chat through visible controls', async () => {
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'], imageMode: false, hiddenRetainedEditor: true});
+  const result = await startPrepare(h);
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.equal(h.clicks, 3);
+  assert.equal(h.editor.innerText, 'Create image');
+});
+
+test('image preparation waits for a temporarily unmounted composer and does not submit', async () => {
+  const h = contentHarness({editorDelayQueries: 3});
+  const result = await startPrepare(h);
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image'});
+  assert.equal(h.clicks, 0);
+  assert.equal(h.editor.value, 'Create image');
+  assert.equal(h.sent.length, 0);
+});
+
+test('image preparation refuses drafts, running work, challenges, attachments, and wrong expected model', async () => {
+  for (const [name, options, expectedModel] of [
+    ['draft', {draft: 'keep this'}, 'Create image'],
+    ['running work', {busy: true}, 'Create image'],
+    ['challenge', {challenge: true}, 'Create image'],
+    ['attachments', {attachments: true}, 'Create image'],
+    ['temporary chat', {temporaryChat: true}, 'Create image'],
+    ['missing composer', {editorAvailable: false}, 'Create image'],
+    ['wrong expected model', {}, 'GPT-6 Thinking']
+  ]) {
+    const h = contentHarness(options);
+    const originalText = h.editor.value;
+    const result = await startPrepare(h, expectedModel);
+    assert.ok(result?.error, `${name} should be refused`);
+    assert.equal(h.clicks, 0, `${name} should not activate UI controls`);
+    assert.equal(h.editor.value, originalText, `${name} should preserve the editor`);
+  }
+});
+
+test('image preparation fails closed when visible new-chat or image-mode controls are unavailable', async () => {
+  for (const options of [
+    {user: true, conversationTurns: ['You said:'], controls: false},
+    {controls: false, imageMode: false}
+  ]) {
+    const h = contentHarness(options);
+    const originalText = h.editor.value;
+    const result = await startPrepare(h);
+    assert.ok(result?.error);
+    assert.equal(h.clicks, 0);
+    assert.equal(h.editor.value, originalText);
+  }
+});
+
+test('delete requires a saved image receipt from this worker before it can target a chat', async () => {
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['Create image Create one image. Return a generated image, not just a description. draw a cat']});
+  const result = await requestDelete(h);
+  assert.match(result.error, /Only this worker's saved image chat can be deleted/);
+  assert.equal(h.clicks, 0);
+  assert.match(h.location.pathname, /^\/c\//);
+});
+
+test('delete opens exact native Delete confirmation after the saved image receipt but never clicks final Delete chat', async () => {
+  const h = await primeArchiveTarget();
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.equal(receipt.chatPath, h.location.pathname);
+  assert.equal(receipt.jobId, 'job-collect');
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.sent.some(message => message.type === 'image-delete-prompt' && message.jobId === 'job-collect'));
+  assert.equal(h.clicks, 2, 'only More and the menu Delete are clicked; final Delete chat remains human-confirmed');
+  assert.match(h.location.pathname, /^\/c\//);
+  h.confirmDelete(); // simulate the human's separate final action
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({...result}, {deleted: true});
+  assert.equal(h.clicks, 2, 'the final confirmation button was never clicked by the extension');
+  const repeated = await requestDelete(h);
+  assert.match(repeated.error, /Only this worker's saved image chat can be deleted/);
+  assert.equal(h.clicks, 2);
+});
+
+test('More menu opens only from the native primary mouse pointerdown, not click()', () => {
+  const h = contentHarness();
+  h.clickMore();
+  assert.equal(h.deleteMenuOpen, false);
+  h.receive({type: 'image-delete'}, {}, () => {});
+  assert.equal(h.deleteMenuOpen, false);
+});
+
+test('navigation without a trusted final Delete chat click refuses', async () => {
+  const h = await primeArchiveTarget();
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++) await new Promise(resolve => setImmediate(resolve));
+  h.location.pathname = '/';
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(result.error, /without deletion confirmation/);
+  assert.equal(h.clicks, 2);
+});
+
+test('an untrusted synthetic final Delete chat click does not authorize deletion', async () => {
+  const h = await primeArchiveTarget();
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++) await new Promise(resolve => setImmediate(resolve));
+  h.syntheticDeleteClick();
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(result.error, /without deletion confirmation/);
+  assert.equal(h.clicks, 3, 'one synthetic click plus the two automated menu clicks; no trusted action');
+});
+
+test('trusted user final click followed by path change passes', async () => {
+  const h = await primeArchiveTarget();
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++) await new Promise(resolve => setImmediate(resolve));
+  h.confirmDelete();
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({...result}, {deleted: true});
+  assert.equal(h.clicks, 2, 'the final button is confirmed by a trusted user event, never extension-clicked');
+});
+
+test('trusted click may close dialog before delayed path change', async () => {
+  const h = await primeArchiveTarget();
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++) await new Promise(resolve => setImmediate(resolve));
+  h.trustedClickClosesDialog();
+  h.delayedPathChange();
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({...result}, {deleted: true});
+  assert.equal(h.clicks, 2);
+});
+
+test('one explicit MCP approval clicks final Delete once and completes cleanup', async () => {
+  const h = await primeArchiveTarget({confirmationResponse: {confirmed: true}});
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({...result}, {deleted: true});
+  assert.equal(h.finalDeleteClicks, 1);
+  assert.equal(h.clicks, 3, 'two menu activations plus one approved final click');
+  assert.equal(h.sent.filter(message => message.type === 'image-delete-confirmation').length, 1,
+    'the successful job-scoped approval is consumed once');
+});
+
+test('false MCP confirmation never clicks final Delete', async () => {
+  const h = await primeArchiveTarget({confirmationResponse: {confirmed: false}, onConfirmation() { h.closeDeleteDialog(); }});
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(result.error, /Deletion was not confirmed/);
+  assert.equal(h.finalDeleteClicks, 0);
+  assert.equal(h.sent.filter(message => message.type === 'image-delete-confirmation').length, 1);
+});
+
+test('MCP approval fails closed if dialog, path, draft, or button state changed', async () => {
+  const cases = [
+    ['dialog', h => h.closeDeleteDialog()],
+    ['path', h => { h.location.pathname = '/'; }],
+    ['draft', h => { h.editor.innerText = 'Create image unsent draft'; }],
+    ['disabled button', h => h.setFinalDeleteDisabled(true)]
+  ];
+  for (const [name, mutate] of cases) {
+    let harness;
+    harness = await primeArchiveTarget({confirmationResponse: {confirmed: true}, onConfirmation: () => mutate(harness)});
+    let result;
+    harness.receive({type: 'image-delete', jobId: 'job-collect', chatPath: harness.location.pathname}, {}, value => { result = value; });
+    for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(result?.error, `${name} change must fail closed`);
+    assert.equal(harness.finalDeleteClicks, 0, `${name} change must not click final Delete`);
+    assert.equal(harness.sent.filter(message => message.type === 'image-delete-confirmation').length, 1);
+  }
+});
+
+test('delete refuses an unknown job or mismatched chat path without opening menus', async () => {
+  for (const overrides of [{jobId: 'other-job'}, {chatPath: '/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}]) {
+    const h = await primeArchiveTarget();
+    const result = await requestDelete(h, overrides);
+    assert.ok(result?.error);
+    assert.equal(h.clicks, 0);
+    assert.match(h.location.pathname, /^\/c\//);
+  }
+});
+
+test('closing the native confirmation without changing chat path fails without a final Delete chat click', async () => {
+  const h = await primeArchiveTarget();
+  let result;
+  h.receive({type: 'image-delete', jobId: 'job-collect', chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 10 && !h.sent.some(message => message.type === 'image-delete-prompt'); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.sent.some(message => message.type === 'image-delete-prompt'));
+  h.closeDeleteDialog();
+  for (let i = 0; i < 10 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(result.error, /Deletion was not confirmed/);
+  assert.equal(h.clicks, 2);
+  assert.match(h.location.pathname, /^\/c\//);
+});
+
+test('delete refuses changed prompt, draft, running work, challenge, or unavailable controls', async () => {
+  const cases = [
+    ['changed prompt', h => h.setConversationBodies(['wrong prompt', 'assistant'])],
+    ['draft', h => { h.editor.innerText = 'unsent draft'; }],
+    ['running work', h => h.setBusy(true)],
+    ['challenge', h => h.setChallenge(true)],
+    ['missing controls', h => h.setControls(false)]
+  ];
+  for (const [name, mutate] of cases) {
+    const h = await primeArchiveTarget();
+    mutate(h);
+    const result = await requestDelete(h);
+    assert.ok(result?.error, `${name} must fail closed`);
+    assert.equal(h.clicks, 0, `${name} must not click More or Archive`);
+    assert.match(h.location.pathname, /^\/c\//);
+  }
+});
 
 test('pairing inspection reports native Create image mode without touching the composer', () => {
   const h = contentHarness();

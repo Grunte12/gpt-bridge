@@ -4,6 +4,8 @@ import io
 import json
 import stat
 import asyncio
+import base64
+from PIL import Image
 
 import pytest
 
@@ -110,6 +112,28 @@ def test_two_stdio_clients_share_the_worker_queue_and_only_one_claims(tmp_path):
     assert second.status(job["job_id"])["state"] == "claimed"
 
 
+def test_confirm_delete_client_proxies_explicit_owner_approval_to_shared_worker(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image")
+    handler = make_handler(queue, TOKEN, 18767)
+    client = ExtensionClient(TOKEN)
+    client.http = _LocalWorkerTransport(handler)
+    submitted = client.submit("One saved image.", "Create image")
+    queue.claim(CLIENT_ID)
+    image = Image.new("RGB", (512, 512), (40, 90, 180))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    image_base64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
+                 cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+
+    approved = client.confirm_delete(submitted["job_id"], owner_confirmed=True)
+    assert approved["cleanup_confirmation"] == "requested"
+    with pytest.raises(ValueError, match="No automatic retry"):
+        client.confirm_delete(submitted["job_id"], owner_confirmed=False)
+
+
 def test_worker_enforces_one_active_image_even_across_clients(tmp_path):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
     queue.pair(CLIENT_ID, ACCOUNT, "Create image")
@@ -214,6 +238,35 @@ def test_mcp_resolve_calls_client_only_after_explicit_inspection():
     }))
     assert calls == ["synthetic"]
     assert "interrupted" in result[0].text
+
+
+def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval(tmp_path):
+    from chatgpt_api.extension_bridge import create_mcp
+
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image")
+    submitted = queue.submit("MCP delete test.", "Create image")
+    queue.claim(CLIENT_ID)
+    image = Image.new("RGB", (512, 512), (40, 90, 180))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    queue.result(CLIENT_ID, submitted["job_id"], image_base64=base64.b64encode(buffer.getvalue()).decode(),
+                 cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
+    queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
+    server = create_mcp(queue)
+    tools = server._tool_manager.list_tools()
+    assert {tool.name for tool in tools} == {
+        "extension_status", "extension_image", "extension_confirm_delete", "extension_resolve",
+    }
+
+    with pytest.raises(Exception, match="actual owner confirmation"):
+        asyncio.run(server.call_tool("extension_confirm_delete", {
+            "job_id": submitted["job_id"], "owner_confirmed": False,
+        }))
+    result = asyncio.run(server.call_tool("extension_confirm_delete", {
+        "job_id": submitted["job_id"], "owner_confirmed": True,
+    }))
+    assert "requested" in result[0].text
 
 
 def test_connect_mode_uses_existing_token_without_queue_or_listener(tmp_path, monkeypatch):

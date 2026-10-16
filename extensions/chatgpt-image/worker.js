@@ -2,6 +2,7 @@
 const endpoint = "http://127.0.0.1:18767";
 let polling = false;
 let managing = false;
+let finishing = false;
 async function request(config, path, data) {
   const response = await fetch(endpoint + path, {method: "POST", cache: "no-store",
     headers: {"Authorization": "Bearer " + config.token, "Content-Type": "application/json"},
@@ -29,16 +30,27 @@ async function poll() {
       await connection("needs_pairing", "การจับคู่เดิมไม่ถูกต้อง กรุณาเชื่อมบัญชี second ใหม่");
       return;
     }
-    let ready = {fresh: false};
+    if (finishing) {
+      await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
+        visible_model: "Create image", tab_ready: false});
+      return;
+    }
+    let ready = {fresh: false}, available = false;
     try {
       const tab = await chrome.tabs.get(config.tabId);
-      if (new URL(tab.url || "about:blank").origin === "https://chatgpt.com")
+      // activeTab grants may expire after extension reload. A successful message
+      // to our ChatGPT-only content script still verifies the paired receiver;
+      // do not mistake a redacted tab URL for a closed tab or ask for tabs access.
+      if (!tab.url || new URL(tab.url).origin === "https://chatgpt.com") {
         ready = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect"}) || ready;
+        available = true;
+      }
     } catch (_) { /* A missing tab never changes the account or creates another tab. */ }
     await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
       visible_model: "Create image", tab_ready: ready.fresh === true && ready.model === "Create image"});
     if (active) {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
+      if (finishing) return;
       if (!["complete", "failed", "interrupted"].includes(state.state)) {
         await connection("busy", "กำลังรับภาพจากงานเดิม ไม่ส่งคำขอซ้ำ");
         return;
@@ -50,22 +62,29 @@ async function poll() {
         return;
       }
     }
-    if (ready.fresh !== true || ready.model !== "Create image") {
-      await connection("needs_tab", "เปิดแชตปกติใหม่ในแท็บเดิม แล้วเลือก Create image หรือเชื่อมแท็บใหม่ในตัวเลือก");
+    if (!available) {
+      await connection("needs_tab", "เปิดแท็บ ChatGPT ที่เชื่อมไว้ หรือเชื่อมแท็บ second ใหม่ในตัวเลือก");
       return;
     }
-    await connection("ready", "รอคำสั่งสร้างภาพจากเอเจนต์ได้เลย");
+    await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");
     // Claims are durable and at-most-once. An extension restart never replays a job.
     const job = await request(config, "/next", {client_id: config.clientId});
     if (!job.job_id) return;
     await chrome.storage.local.set({active: {jobId: job.job_id, tabId: config.tabId, job}});
     await connection("busy", "กำลังสร้างภาพ ไม่ต้องพิมพ์ในแท็บที่เชื่อมไว้");
     try {
+      if (ready.fresh !== true || ready.model !== "Create image") {
+        const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare", job});
+        if (prepared?.fresh !== true || prepared.model !== "Create image")
+          throw new Error(prepared?.error || "Native image chat could not be prepared");
+        await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
+          visible_model: "Create image", tab_ready: true});
+      }
       const accepted = await chrome.tabs.sendMessage(config.tabId, {type: "image-job", job});
       if (!accepted?.accepted) throw new Error("Content worker did not accept this job");
-    } catch (_) {
+    } catch (error) {
       const result = await request(config, "/result", {client_id: config.clientId, job_id: job.job_id,
-        error: "Paired tab unavailable. No automatic resubmission; inspect ChatGPT first."});
+        error: "Not submitted or delivery uncertain. " + error.message + ". No automatic resubmission; inspect ChatGPT first."});
       await chrome.storage.local.set({lastJob: result});
       await chrome.storage.local.remove("active");
       await connection("failed", "แท็บไม่รับงาน ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการส่งซ้ำ");
@@ -147,19 +166,58 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       if (!result?.accepted) throw new Error(result?.error || "ยังรับภาพจากแท็บเดิมไม่ได้");
       return {ok: true};
     }
+    if (["image-delete-prompt", "image-delete-confirmation"].includes(message.type)) {
+      const {config, active} = await chrome.storage.local.get(["config", "active"]);
+      if (!finishing || !config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
+          new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId)
+        throw new Error("Deletion confirmation is not from the paired saved-image job");
+      if (message.type === "image-delete-confirmation")
+        return request(config, "/cleanup-confirmation", {client_id: config.clientId, job_id: active.jobId});
+      const state = await request(config, "/cleanup", {client_id: config.clientId, job_id: active.jobId,
+        cleanup_status: "confirmation_required"});
+      await chrome.storage.local.set({lastJob: state});
+      await connection("confirmation_required", "บันทึกไฟล์ภาพแล้ว ให้เอเจนต์ขอยืนยันจากคุณก่อนลบแชทผ่าน MCP");
+      return {ok: true};
+    }
     if (message.type === "image-result") {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);
       if (!config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
           new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId)
         throw new Error("Result is not from the paired job/tab");
-      const result = await request(config, "/result", {client_id: config.clientId, job_id: active.jobId,
-        ...(message.error ? {error: message.error} : {image_base64: message.imageBase64})});
-      await chrome.storage.local.set({lastJob: result});
-      await chrome.storage.local.remove("active");
-      await connection(message.error ? "failed" : "complete", message.error
-        ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
-        : "รับไฟล์ภาพแล้ว เปิดแชตใหม่ในแท็บเดิมเพื่อสร้างภาพถัดไป");
-      return {ok: true};
+      // ChatGPT changes chats through SPA navigation; sender.url can retain the
+      // previous document path. The paired content receiver verifies the live
+      // path and original prompt again before it opens Delete confirmation.
+      const cleanup = !message.error && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
+      finishing = true;
+      let result;
+      try {
+        result = await request(config, "/result", {client_id: config.clientId, job_id: active.jobId,
+          ...(message.error ? {error: message.error} : {image_base64: message.imageBase64, cleanup_pending: cleanup,
+            ...(cleanup ? {chat_path: message.chatPath} : {})})});
+        if (cleanup && result.state === "complete") {
+          let removed;
+          try {
+            removed = await chrome.tabs.sendMessage(config.tabId,
+              {type: "image-delete", jobId: active.jobId, chatPath: message.chatPath});
+          } catch (_) { removed = {error: "Deletion delivery uncertain; inspect this chat, do not repeat automatically"}; }
+          try {
+            result = await request(config, "/cleanup", {client_id: config.clientId, job_id: active.jobId,
+              cleanup_status: removed?.deleted === true ? "deleted" : "failed",
+              error: removed?.error || (removed?.deleted === true ? "" : "Deletion was not confirmed")});
+          } catch (_) {
+            result = {...result, cleanup_status: "pending", cleanup_error: "Saved image is safe; cleanup receipt unavailable. Do not regenerate or delete again automatically."};
+          }
+        }
+        await chrome.storage.local.set({lastJob: result});
+        await chrome.storage.local.remove("active");
+        await connection(message.error ? "failed" : "complete", message.error
+          ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
+          : cleanup && result.cleanup_status !== "deleted"
+            ? "รับไฟล์ภาพแล้ว แต่ยังยืนยันการลบไม่ได้ ตรวจแชตเดิม ไม่ต้องเจนซ้ำ"
+            : cleanup ? "รับไฟล์ภาพและลบแชตแล้ว พร้อมรับภาพถัดไป"
+              : "รับไฟล์ภาพแล้ว สั่งภาพถัดไปผ่าน MCP ได้เลย ส่วนขยายเตรียมแชตให้เอง");
+        return {ok: true};
+      } finally { finishing = false; }
     }
     throw new Error("Unknown extension message");
     } finally {
