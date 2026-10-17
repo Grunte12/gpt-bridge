@@ -8,15 +8,15 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.23 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.23');
+test('0.1.24 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.24');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
     assert.equal(manifest.permissions.includes(permission), false);
 });
 
-function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = ''} = {}) {
+function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, chatgptTabs = [], active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = ''} = {}) {
   let listener;
   let alarmListener;
   const storage = sharedStorage || {};
@@ -51,6 +51,7 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
     alarms: {onAlarm: {addListener(fn) { alarmListener = fn; }}, async create(...args) { alarms.push(args); }, async clear(...args) { alarms.push(['clear', ...args]); }},
     tabs: {
       async get(id) { tabLookups.push(id); if (holdTabLookup) await tabGate; return tabExists ? {id, ...(tabUrlRedacted ? {} : {url: tabUrl})} : null; },
+      async query(info) { return info?.url === "https://chatgpt.com/*" ? chatgptTabs : []; },
       async sendMessage(id, message) {
         tabMessages.push({id, message});
         if (message.type === 'image-inspect') {
@@ -644,7 +645,7 @@ test('only a known no-receiver condition gets one exact-target reinjection attem
     ['denied scripting API', {inspectError: noReceiver, scriptingAvailable: true, scriptingError: 'private native failure'}, 1],
     ['active job', {inspectError: noReceiver, scriptingAvailable: true, active: {jobId: 'old-job', tabId: 7}}, 0],
     ['wrong origin', {tabUrl: 'https://example.com/', inspectError: noReceiver, scriptingAvailable: true}, 0],
-    ['redacted URL', {tabUrlRedacted: true, inspectError: noReceiver, scriptingAvailable: true}, 0],
+    ['redacted URL', {tabUrlRedacted: true, inspectError: noReceiver, scriptingAvailable: true, inspectErrorAfterInjection: noReceiver}, 1],
     ['closed message port', {inspectError: 'The message port closed before a response was received.', scriptingAvailable: true}, 0]
   ];
   for (const [name, options, expectedInjections] of cases) await t.test(name, async () => {
@@ -703,7 +704,71 @@ test('a URL-redacted tab without a responding content script is not claimed', as
   assert.equal(h.requests[0].body.tab_ready, false);
   assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-inspect']);
   assert.equal(h.storage.active, undefined);
-  assert.equal(h.storage.connection.state, 'needs_tab');
+  assert.equal(h.storage.connection.state, 'needs_receiver');
+  assert.match(h.storage.connection.detail, /แท็บที่เชื่อมไว้เปิดอยู่/);
+  assert.equal(h.storage.connection.reason, 'no_receiver');
+  assert.equal(h.requests[0].body.tab_present, true);
+});
+
+test('a missing saved tab adopts the only open ChatGPT tab and does not guess among several', async t => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+
+  await t.test('exactly one open ChatGPT tab replaces the closed tab id', async () => {
+    const h = harness({tabExists: false, chatgptTabs: [{id: 9, url: 'https://chatgpt.com/'}],
+      inspection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: {}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 9);
+    assert.equal(h.storage.config.clientId, 'saved-client');
+    assert.equal(h.requests[0].body.tab_present, true);
+    assert.equal(h.requests[0].body.open_chatgpt_tabs, 1);
+    assert.equal(h.requests[0].body.content_receiver, 'available');
+    assert.equal(h.storage.connection.state, 'ready');
+    assert.equal(h.requests.some(call => call.url.endsWith('/pair')), false);
+  });
+
+  await t.test('two open ChatGPT tabs stay unpaired to a new tab', async () => {
+    const h = harness({tabExists: false, chatgptTabs: [
+      {id: 9, url: 'https://chatgpt.com/'}, {id: 10, url: 'https://chatgpt.com/'}], next: {job_id: 'must-not-claim'}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_present, false);
+    assert.equal(h.requests[0].body.open_chatgpt_tabs, 2);
+    assert.equal(h.requests[0].body.receiver_error, 'tab_missing');
+    assert.equal(h.storage.connection.state, 'needs_tab');
+    assert.match(h.storage.connection.detail, /2 แท็บ/);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  });
+
+  await t.test('an active job never moves to another tab', async () => {
+    const h = harness({tabExists: false, chatgptTabs: [{id: 9, url: 'https://chatgpt.com/'}],
+      active: {jobId: 'old-job', tabId: 7}, state: {state: 'claimed', expected_model: 'Create image'}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  });
+});
+
+test('a redacted paired tab gets one receiver reinjection and can then accept work', async () => {
+  const config = {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'};
+  const h = harness({tabUrlRedacted: true, inspectError: 'Receiving end does not exist.', scriptingAvailable: true,
+    inspectionAfterInjection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: {}});
+  Object.assign(h.storage, {config});
+  h.fireAlarm();
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(h.scriptInjections)), [{target: {tabId: 7}, files: ['content.js']}]);
+  assert.equal(h.requests[0].body.tab_present, true);
+  assert.equal(h.requests[0].body.content_receiver, 'available');
+  assert.equal(h.requests[0].body.receiver_error, '');
+  assert.equal(h.storage.connection.state, 'ready');
+  assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  assert.equal(h.tabMessages.some(call => ['image-prepare', 'image-job', 'image-delete'].includes(call.message.type)), false);
 });
 
 test('a claimed job prepares the paired tab before dispatch and heartbeats readiness', async () => {

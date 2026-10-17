@@ -23,7 +23,7 @@
     #connection-title { display:flex; align-items:baseline; gap:9px; }
     #connection-title::before { content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--muted); }
     body[data-state="ready"] #connection-title::before, body[data-state="complete"] #connection-title::before { background:var(--good); }
-    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="interrupted"] #connection-title::before, body[data-state="confirmation_required"] #connection-title::before { background:var(--warn); }
+    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="needs_receiver"] #connection-title::before, body[data-state="interrupted"] #connection-title::before, body[data-state="confirmation_required"] #connection-title::before { background:var(--warn); }
     body[data-state="failed"] #connection-title::before, body[data-state="needs_pairing"] #connection-title::before { background:var(--bad); }
     #connection-detail, #last-job, .hint { color:var(--muted); }
     #connection-detail, #last-job-diagnostic { overflow-wrap:anywhere; }

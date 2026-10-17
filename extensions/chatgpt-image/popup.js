@@ -3,7 +3,7 @@ const labels = {
   checking: "กำลังตรวจการเชื่อมต่อ", unpaired: "เชื่อมครั้งแรก",
   ready: "เชื่อมต่อแล้ว", busy: "กำลังทำงาน", complete: "เชื่อมต่อแล้ว", preflight_complete: "เชื่อมต่อแล้ว",
   confirmation_required: "บันทึกภาพแล้ว รอยืนยันลบแชท",
-  needs_tab: "ไม่พบแท็บที่เชื่อมไว้", offline: "รอ MCP กลับมา",
+  needs_tab: "ไม่พบแท็บที่เชื่อมไว้", needs_receiver: "แท็บเปิดอยู่ แต่ตัวรับยังไม่ตอบ", offline: "รอ MCP กลับมา",
   needs_pairing: "ต้องเชื่อมใหม่", interrupted: "ตรวจงานเดิมก่อน", failed: "มีปัญหากับงานล่าสุด"
 };
 let current = {configured: false, connection: {state: "checking"}};

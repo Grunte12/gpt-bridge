@@ -61,8 +61,10 @@ async function request(config, path, data) {
   if (!response.ok) throw Object.assign(new Error("Local bridge request failed: " + response.status), {status: response.status});
   return response.json();
 }
-async function connection(state, detail) {
-  await chrome.storage.local.set({connection: {state, detail, checkedAt: Date.now()}});
+async function connection(state, detail, reason = "") {
+  const record = {state, detail, checkedAt: Date.now()};
+  if (reason) record.reason = reason;
+  await chrome.storage.local.set({connection: record});
 }
 async function publicStatus() {
   const {config, connection: status, active, lastJob} = await chrome.storage.local.get(["config", "connection", "active", "lastJob"]);
@@ -104,7 +106,9 @@ async function poll() {
   if (polling || managing) return;
   polling = true;
   try {
-    const {config, active} = await chrome.storage.local.get(["config", "active"]);
+    const stored = await chrome.storage.local.get(["config", "active"]);
+    let config = stored.config;
+    const active = stored.active;
     if (!config) return;
     if (config.account !== "second" || !Number.isInteger(config.tabId) || typeof config.token !== "string" ||
         typeof config.clientId !== "string") {
@@ -119,9 +123,24 @@ async function poll() {
     }
     let ready = {fresh: false}, available = false, tab;
     let contentReceiver = "tab_missing", receiverError = "tab_missing";
+    let openChatgptTabs = null;
     try {
       tab = await chrome.tabs.get(config.tabId);
     } catch (_) { /* Never forward native exception text, which may include private URLs. */ }
+    if (!tab && !active && chrome.tabs.query) {
+      let matches = [];
+      try { matches = await chrome.tabs.query({url: "https://chatgpt.com/*"}); } catch (_) { matches = []; }
+      if (!Array.isArray(matches)) matches = [];
+      openChatgptTabs = Math.min(matches.length, 20);
+      const candidate = matches.length === 1 ? matches[0] : null;
+      let originOk = false;
+      try { originOk = candidate && new URL(candidate.url || "about:blank").origin === "https://chatgpt.com"; } catch (_) {}
+      if (originOk && Number.isInteger(candidate.id)) {
+        config = {...config, tabId: candidate.id};
+        await chrome.storage.local.set({config});
+        tab = candidate;
+      }
+    }
     if (tab) {
       contentReceiver = "wrong_origin";
       receiverError = "wrong_origin";
@@ -151,7 +170,10 @@ async function poll() {
             receiverError = /receiving end does not exist|could not establish connection/i.test(message) ? "no_receiver"
               : /message port closed|message channel closed/i.test(message) ? "port_closed" : "message_failed";
             // Reattach only our bundled listener; never navigate or change a draft.
-            if (attempt === 0 && receiverError === "no_receiver" && !active && tab.url &&
+            // A redacted tab URL still identifies the saved tab. Host permission
+            // limits this injection to chatgpt.com, so an unknown origin is safe
+            // to try once. A known non-ChatGPT origin never reaches this branch.
+            if (attempt === 0 && receiverError === "no_receiver" && !active &&
                 receiverRecoveryTab !== config.tabId && chrome.scripting?.executeScript) {
               receiverRecoveryTab = config.tabId;
               try {
@@ -170,6 +192,8 @@ async function poll() {
       tab_idle: typeof ready.idle === "boolean" ? ready.idle : null,
       tab_error: receiverError ? "Native tab inspection failed: " + receiverError : String(ready.error || "").slice(0, 300),
       worker_version: workerVersion, content_receiver: contentReceiver, receiver_error: receiverError,
+      tab_present: Boolean(tab),
+      ...(Number.isInteger(openChatgptTabs) ? {open_chatgpt_tabs: openChatgptTabs} : {}),
       upload_dom: uploadDomDiagnostic(ready.upload_dom), result_dom: resultDomDiagnostic(ready.result_dom),
       prompt_dom: promptDomDiagnostic(ready.prompt_dom)});
     if (active) {
@@ -187,9 +211,11 @@ async function poll() {
       }
     }
     if (!available) {
-      await connection("needs_tab", receiverError === "no_receiver"
-        ? "ตัวรับในแท็บเดิมยังไม่พร้อม ตรวจสิทธิ์ส่วนขยายบน chatgpt.com ไม่ต้องจับคู่หรือกรอกรหัสใหม่"
-        : "เปิดแท็บ ChatGPT ที่เชื่อมไว้ หรือเชื่อมแท็บ second ใหม่ในตัวเลือก");
+      const tabOpen = Boolean(tab) && receiverError !== "tab_missing" && receiverError !== "wrong_origin";
+      await connection(tabOpen ? "needs_receiver" : "needs_tab", tabOpen
+        ? "แท็บที่เชื่อมไว้เปิดอยู่ แต่ตัวรับยังไม่ตอบ ระบบลองใส่ตัวรับใหม่อัตโนมัติหนึ่งครั้ง กดตรวจสถานะอีกครั้ง ไม่ต้องจับคู่ใหม่"
+        : "ไม่พบแท็บที่เชื่อมไว้" + (Number.isInteger(openChatgptTabs) ? ` พบแท็บ ChatGPT ${openChatgptTabs} แท็บ จึงยังไม่เลือกให้` : "") + " เปิดแชตของบัญชี second แล้วใช้ตัวเลือกเพื่อเชื่อมแท็บนี้ด้วยรหัสเดิม",
+        receiverError);
       return;
     }
     await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");
@@ -213,7 +239,8 @@ async function poll() {
           visible_model: "Create image", tab_ready: true,
           input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
           tab_idle: typeof ready.idle === "boolean" ? ready.idle : null, tab_error: "",
-          worker_version: workerVersion, content_receiver: "available", receiver_error: ""});
+          worker_version: workerVersion, content_receiver: "available", receiver_error: "",
+          tab_present: true});
       }
       if ((job.images?.length || job.mode === "edit") && ![1, 2, 3, 4].includes(ready.input_protocol))
         throw new Error("Refresh the paired ChatGPT tab to load local image input support; not submitted");
