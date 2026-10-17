@@ -43,9 +43,11 @@ No additional daemon, tunnel, pairing file or batch queue was added.
 
 ### Multiple agent hosts: one worker, shared clients
 
-Keep exactly one owning MCP command (without `--connect`) running. This machine
-now keeps that command in one foreground terminal so it is not tied to a single
-agent chat. The terminal must remain open; no login/background daemon is installed.
+Keep exactly one owning worker running. The foreground command owns both the
+loopback listener and stdio MCP. `--serve` runs only that listener, so closing
+an agent does not stop the worker. Agent hosts use `--account second --connect`.
+`--serve` and `--connect` cannot be combined. No tunnel, paid API, cookie capture,
+or direct ChatGPT HTTP fallback is added.
 Configure Codex, Claude Code, Cursor, Antigravity and OpenCode
 with the same Python/module plus `--account second --connect`. These lightweight
 stdio MCP clients use the existing authenticated loopback worker; they never
@@ -59,8 +61,8 @@ From a fresh checkout, install the optional MCP dependency first:
 
 ```sh
 python -m pip install -e '.[mcp]'
-# One owner only:
-python -m chatgpt_api.extension_bridge --account second
+# One owner. Use --serve when an OS user service should keep the listener up:
+python -m chatgpt_api.extension_bridge --account second --serve
 # Every additional local agent:
 python -m chatgpt_api.extension_bridge --account second --connect
 ```
@@ -418,6 +420,27 @@ job, closed port, other message error or denied injection never triggers a
 generation or unsafe fallback. Failed recovery is not repeated for that tab in
 the same worker lifetime. Duplicate injection is guarded with native listener
 registration checks, so an invalidated old marker cannot suppress a new listener.
+
+
+#### Open tab with a redacted URL (extension 0.1.24)
+
+Live MCP status on the deployed 0.1.23 worker reported `content_receiver=tab_missing` and `receiver_error=tab_missing` while the extension stayed online and paired. That means the saved tab id was gone. A different open ChatGPT tab does not answer that id, so the popup correctly said the paired tab was missing. 0.1.24 asks Chrome only for `https://chatgpt.com/*` tabs. Exactly one match replaces the saved tab id and keeps the existing client and local key. Zero or several matches are not chosen. The count is `extension_diagnostics.open_chatgpt_tabs` (0 through 20) and the popup names that count. This does not independently prove the tab is the second account; several open ChatGPT tabs still need the existing relink confirmation.
+
+Chrome can hide the saved tab URL after an extension reload. That tab is still
+open. 0.1.12 skipped receiver repair whenever the URL was missing, and the popup
+title said the paired tab was absent. 0.1.24 injects bundled `content.js` once
+into that same tab id when the only failure is `no_receiver` and no job is
+active. The `https://chatgpt.com/*` host permission rejects any other origin.
+It does not open a tab, switch accounts, or reuse a different ChatGPT tab.
+
+MCP `extension_diagnostics.tab_present` separates those cases. `false` with
+`receiver_error=tab_missing` means the saved tab is gone; use the popup option
+that reconnects the current second-account tab with the saved local key.
+`true` with `receiver_error=no_receiver` means the saved tab is open and the
+listener has not answered. The popup title for that state is
+"แท็บเปิดอยู่ แต่ตัวรับยังไม่ตอบ", not "ไม่พบแท็บที่เชื่อมไว้". Do not enter a
+new pairing code for either case. A failed injection is not repeated in that
+worker lifetime, and no queued image is claimed until a receiver answers.
 
 #### Explicitly return an empty composer after preflight (0.1.12, protocol 3)
 

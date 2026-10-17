@@ -33,7 +33,7 @@ MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT uploa
 TERMINAL = {"complete", "failed", "interrupted"}
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2}
 
 
 class LocalImageInput(BaseModel):
@@ -226,7 +226,8 @@ class ExtensionQueue:
                   tab_idle: bool | None = None, tab_error: str = "",
                   worker_version: str = "", content_receiver: str = "unreported",
                   receiver_error: str = "", upload_dom: dict | None = None, result_dom: dict | None = None,
-                  prompt_dom: dict | None = None) -> dict:
+                  prompt_dom: dict | None = None, tab_present: bool | None = None,
+                  open_chatgpt_tabs: int | None = None) -> dict:
         """Reconnect the already-authorized local extension, never replay old work."""
         if account != self.account or type(tab_ready) is not bool:
             raise ValueError("account or readiness mismatch")
@@ -259,6 +260,10 @@ class ExtensionQueue:
                 not isinstance(result_dom["chat_path"], str) or
                 (result_dom["chat_path"] != "" and not re.fullmatch(r"/c/[a-f0-9-]{36}", result_dom["chat_path"]))):
             raise ValueError("invalid result DOM diagnostic")
+        if tab_present is not None and type(tab_present) is not bool:
+            raise ValueError("invalid tab presence diagnostic")
+        if open_chatgpt_tabs is not None and (type(open_chatgpt_tabs) is not int or not 0 <= open_chatgpt_tabs <= 20):
+            raise ValueError("invalid open tab count")
         if prompt_dom is not None:
             counts = {"body_chars", "stripped_chars", "matched_chip_chars", "label_count"}
             flags = {"starts_with_label", "ends_with_label"}
@@ -282,7 +287,8 @@ class ExtensionQueue:
                 self._client(client_id)
             self.client.update(visible_model=visible_model, tab_ready=tab_ready, input_protocol=input_protocol,
                                tab_idle=tab_idle, tab_error=tab_error, worker_version=worker_version,
-                               content_receiver=content_receiver, receiver_error=receiver_error,
+                               content_receiver=content_receiver, receiver_error=receiver_error, tab_present=tab_present,
+                               open_chatgpt_tabs=open_chatgpt_tabs,
                                upload_dom=dict(upload_dom) if upload_dom is not None else None,
                                result_dom=dict(result_dom) if result_dom is not None else None,
                                prompt_dom=json.loads(json.dumps(prompt_dom)) if prompt_dom is not None else None)
@@ -558,6 +564,8 @@ class ExtensionQueue:
                             "content_receiver": self.client.get("content_receiver", "unreported") if self.client else "unreported",
                             "content_protocol": self.client.get("input_protocol", 0) if self.client else 0,
                             "receiver_error": self.client.get("receiver_error", "") if self.client else "",
+                            "tab_present": self.client.get("tab_present") if self.client else None,
+                            "open_chatgpt_tabs": self.client.get("open_chatgpt_tabs") if self.client else None,
                             "upload_dom": self.client.get("upload_dom") if self.client else None,
                             "result_dom": self.client.get("result_dom") if self.client else None,
                             "prompt_dom": self.client.get("prompt_dom") if self.client else None},
@@ -775,26 +783,31 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
 
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ToolAnnotations
     server = FastMCP("GPT Bridge Extension", instructions="Opt-in image generation via one owner-paired ChatGPT tab. No direct HTTP fallback. Check status first; never retry uncertain jobs.")
+    read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+    image_call = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
+    delete_call = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
+    resolve_call = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 
-    @server.tool()
+    @server.tool(annotations=read_only)
     def extension_status(job_id: str = "") -> dict:
-        """Check account, cleanup_policy and saved image receipt. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
+        """Check account, pairing, cleanup_policy and saved image receipt. extension_diagnostics.tab_present false means the saved tab is gone; receiver_error no_receiver means that tab is open but its listener has not answered. Do not treat those as the same failure. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
         return queue.status(job_id)
 
-    @server.tool()
+    @server.tool(annotations=image_call)
     def extension_image(prompt: str, expected_model: str, mode: Literal["create", "edit"] = "create",
                         images: list[LocalImageInput] | None = None, preflight_only: bool = False,
                         clear_preflight_uploads: bool = False) -> dict:
         """Create/edit ONE image on second, or preflight_only=true to verify actual uploads WITHOUT text insertion, Send or generation. Preflight normally preserves the unsent draft. With explicit owner approval, clear_preflight_uploads=true removes ONLY this job's verified uploads after readiness, requiring preflight_clear_uploads capability (protocol 3). create accepts ordered references; edit requires >=1 source. Local static PNG/JPEG/WebP, 8 MiB combined, <=40MP/8192px, no URLs/symlinks. Preserve order/roles. Check status/tab_idle. No retries or model/account parity promises."""
         return queue.submit(prompt, expected_model, mode, images, preflight_only, clear_preflight_uploads)
 
-    @server.tool()
+    @server.tool(annotations=delete_call)
     def extension_confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
         """Legacy per-job confirmation only; not needed when cleanup_policy=automatic_saved_chats. Permanently delete only this saved-image chat after exact-chat owner approval. Pass owner_confirmed=true only after that approval. Single-use: poll status, never retry uncertain deletion."""
         return queue.confirm_delete(job_id, owner_confirmed)
 
-    @server.tool()
+    @server.tool(annotations=resolve_call)
     def extension_resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False,
                           clear_failed_uploads: StrictBool = False, native_upload_names: list[str] | None = None,
                           recover_outputs: StrictBool = False, recovery_chat_path: str | None = None) -> dict:
@@ -825,8 +838,11 @@ def main():
     parser.add_argument("--account", required=True, choices=["second"],
                         help="Experimental runtime is restricted to the owner's second account")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".local/share/gpt-bridge/extension/second")
-    parser.add_argument("--connect", action="store_true",
-                        help="Share an already running local extension worker; do not create another queue or listener")
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument("--connect", action="store_true",
+                           help="Share an already running local extension worker; do not create another queue or listener")
+    lifecycle.add_argument("--serve", action="store_true",
+                           help="Run only the loopback worker, independent of MCP stdio; agent hosts use --connect")
     parser.add_argument("--auto-delete-saved-chats", action="store_true",
                         help="Owner opt-in: permanently delete only new Bridge-created image chats after validated local save, without per-image prompts")
     args = parser.parse_args()
@@ -859,9 +875,14 @@ def main():
         token = read_token(root)
     except (ValueError, OSError) as error:
         parser.error(str(error))
-    server = create_mcp(queue)
-
     http = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler(queue, token, PORT))
+    if args.serve:
+        try:
+            http.serve_forever()
+        finally:
+            http.server_close()
+        return
+    server = create_mcp(queue)
     http.daemon_threads = True
     threading.Thread(target=http.serve_forever, daemon=True).start()
     import sys

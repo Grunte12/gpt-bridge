@@ -300,3 +300,17 @@ test('cleared failed uploads are not labeled as a generated image', async () => 
   assert.match(h.elements['last-job'].textContent, /นำไฟล์แนบ.*หยุดก่อนส่ง.*ไม่ได้เจนภาพ/);
   assert.doesNotMatch(h.elements['last-job'].textContent, /ภาพ.*บันทึก/);
 });
+
+test('an open paired tab with no receiver is not described as a missing tab', async () => {
+  const h = harness({configured: true, account: 'second', connection: {
+    state: 'needs_receiver',
+    detail: 'แท็บที่เชื่อมไว้เปิดอยู่ แต่ตัวรับยังไม่ตอบ ระบบลองใส่ตัวรับใหม่อัตโนมัติหนึ่งครั้ง กดตรวจสถานะอีกครั้ง ไม่ต้องจับคู่ใหม่',
+    reason: 'no_receiver'
+  }, active: null, lastJob: null});
+  await settle();
+  assert.equal(h.elements['connection-title'].textContent, 'แท็บเปิดอยู่ แต่ตัวรับยังไม่ตอบ');
+  assert.match(h.elements['connection-detail'].textContent, /ไม่ต้องจับคู่ใหม่/);
+  assert.doesNotMatch(h.elements['connection-title'].textContent, /ไม่พบแท็บ/);
+  assert.equal(h.elements['pair-form'].hidden, true);
+  assert.equal(h.body.dataset.state, 'needs_receiver');
+});

@@ -269,6 +269,8 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_receiver": "unreported",
         "content_protocol": 0,
         "receiver_error": "",
+        "tab_present": None,
+        "open_chatgpt_tabs": None,
         "upload_dom": None,
         "result_dom": None,
         "prompt_dom": None,
@@ -280,6 +282,8 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_receiver": "unreported",
         "content_protocol": 0,
         "receiver_error": "",
+        "tab_present": None,
+        "open_chatgpt_tabs": None,
         "upload_dom": None,
         "result_dom": None,
         "prompt_dom": None,
@@ -301,6 +305,7 @@ def test_heartbeat_diagnostics_round_trip_with_current_protocol(tmp_path):
         worker_version="1.2.3",
         content_receiver="available",
         receiver_error="",
+        tab_present=True,
         upload_dom=UPLOAD_DOM,
     )
 
@@ -309,6 +314,8 @@ def test_heartbeat_diagnostics_round_trip_with_current_protocol(tmp_path):
         "content_receiver": "available",
         "content_protocol": 2,
         "receiver_error": "",
+        "tab_present": True,
+        "open_chatgpt_tabs": None,
         "upload_dom": UPLOAD_DOM,
         "result_dom": None,
         "prompt_dom": None,
@@ -471,6 +478,13 @@ def test_heartbeat_rejects_malformed_upload_dom_without_mutating_client(tmp_path
         ("receiver_error", 1),
         ("receiver_error", "unknown_error"),
         ("receiver_error", "private-token"),
+        ("tab_present", "true"),
+        ("tab_present", 1),
+        ("tab_present", 0),
+        ("open_chatgpt_tabs", -1),
+        ("open_chatgpt_tabs", 21),
+        ("open_chatgpt_tabs", True),
+        ("open_chatgpt_tabs", "1"),
     ],
 )
 def test_heartbeat_rejects_invalid_diagnostics_without_mutating_client(tmp_path, field, value):
