@@ -5,6 +5,8 @@ import json
 import stat
 import asyncio
 import base64
+import subprocess
+import sys
 from PIL import Image
 
 import pytest
@@ -442,6 +444,60 @@ def test_connect_mode_uses_existing_token_without_queue_or_listener(tmp_path, mo
     after = {p.name: (p.stat().st_mode, p.read_bytes()) for p in data_dir.iterdir()}
     assert after == before
     assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_connect_exits_when_stdin_is_already_closed(tmp_path):
+    root = tmp_path / "existing"
+    root.mkdir(mode=0o700)
+    _private_token(root / "extension-token")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "chatgpt_api.extension_bridge", "--account", "second", "--connect",
+         "--data-dir", str(root)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        raise
+    assert process.returncode is not None
+
+
+def test_serve_mode_keeps_worker_alive_without_stdio_mcp(tmp_path, monkeypatch):
+    root = tmp_path / "existing"
+    root.mkdir(mode=0o700)
+    _private_token(root / "extension-token")
+    calls = []
+
+    class HTTP:
+        def __init__(self, address, handler):
+            assert address == ("127.0.0.1", 18767)
+
+        def serve_forever(self):
+            calls.append("serve")
+
+        def server_close(self):
+            calls.append("close")
+
+    monkeypatch.setattr("sys.argv", ["extension", "--account", "second", "--serve",
+                                     "--data-dir", str(root)])
+    monkeypatch.setattr("chatgpt_api.extension_bridge.ThreadingHTTPServer", HTTP)
+    monkeypatch.setattr("chatgpt_api.extension_bridge.create_mcp",
+                        lambda *_: pytest.fail("started stdio MCP in background mode"))
+    monkeypatch.setattr("chatgpt_api.extension_bridge.threading.Thread",
+                        lambda **_: pytest.fail("started disposable HTTP thread"))
+    main()
+    assert calls == ["serve", "close"]
+
+
+def test_serve_and_connect_are_mutually_exclusive_before_touching_data(tmp_path, monkeypatch):
+    missing = tmp_path / "must-stay-absent"
+    monkeypatch.setattr("sys.argv", ["extension", "--account", "second", "--serve", "--connect",
+                                     "--data-dir", str(missing)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert not missing.exists()
 
 
 def test_connect_refuses_main_account_alias_before_touching_data(tmp_path, monkeypatch):

@@ -389,6 +389,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   }};
   const context = {
     chrome, document, location,
+    sessionStorage: {store: {}, getItem(key) { return this.store[key] ?? null; }, setItem(key, value) { this.store[key] = String(value); }},
     HTMLTextAreaElement: Textarea, Event: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     InputEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     File: FakeFile, DataTransfer: FakeDataTransfer, atob, crypto: webcrypto,
@@ -2215,4 +2216,23 @@ test('worker rejects unknown or unpaired content results and preserves the activ
     assert.equal(h.calls.length, 0);
     assert.equal(h.storage.active.jobId, 'job-1');
   });
+});
+
+test('content pairing marker round-trips only a client id and never page text', () => {
+  const h = contentHarness();
+  const clientId = '123e4567-e89b-12d3-a456-426614174001';
+  let bound;
+  h.receive({type: 'image-bind', clientId, prompt: 'private prompt'}, {}, value => { bound = value; });
+  assert.equal(bound.ok, true);
+  let identity;
+  h.receive({type: 'image-identity'}, {}, value => { identity = value; });
+  assert.equal(identity.client_id, clientId);
+  assert.equal(Object.keys(identity).join(), 'client_id');
+  assert.equal(JSON.stringify(identity).includes('private'), false);
+
+  const rejected = contentHarness();
+  let empty;
+  rejected.receive({type: 'image-bind', clientId: 'not-a-client'}, {}, () => {});
+  rejected.receive({type: 'image-identity'}, {}, value => { empty = value; });
+  assert.equal(empty.client_id, '');
 });

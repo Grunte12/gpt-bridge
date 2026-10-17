@@ -549,7 +549,28 @@
       void prepare(message.job).then(reply, error => reply({error: error.message})).finally(() => { running = false; });
       return true;
     }
+    if (message.type === "image-identity") {
+      let client_id = "";
+      try {
+        const stored = sessionStorage.getItem("gpt-bridge-pair");
+        if (typeof stored === "string" && /^[a-f0-9-]{36}$/.test(stored)) client_id = stored;
+      } catch (_) {}
+      reply({client_id});
+      return;
+    }
+    if (message.type === "image-bind") {
+      try {
+        if (typeof message.clientId === "string" && /^[a-f0-9-]{36}$/.test(message.clientId))
+          sessionStorage.setItem("gpt-bridge-pair", message.clientId);
+      } catch (_) {}
+      reply({ok: true});
+      return;
+    }
     if (message.type === "image-inspect") {
+      try {
+        if (typeof message.clientId === "string" && /^[a-f0-9-]{36}$/.test(message.clientId))
+          sessionStorage.setItem("gpt-bridge-pair", message.clientId);
+      } catch (_) {}
       let idle = false;
       try {
         if (running) throw new Error("Content worker already running");

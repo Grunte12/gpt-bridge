@@ -39,13 +39,16 @@ tools are only for missing setup/UI capabilities, not routine generation or
 polling. The extension retains the existing local key, client identity and paired
 tab in private Chrome extension storage. Its authenticated heartbeat reconnects
 that saved client after MCP restarts; it never copies ChatGPT cookies or tokens.
-No additional daemon, tunnel, pairing file or batch queue was added.
+At 0.1.6 no additional daemon, tunnel, pairing file or batch queue was added.
+The later optional background-worker lifecycle is described below.
 
 ### Multiple agent hosts: one worker, shared clients
 
-Keep exactly one owning MCP command (without `--connect`) running. This machine
-now keeps that command in one foreground terminal so it is not tied to a single
-agent chat. The terminal must remain open; no login/background daemon is installed.
+Keep exactly one owning worker running. For a background service, use `--serve`:
+it runs the same authenticated loopback listener without MCP stdio, so closing
+an agent or terminal does not signal end-of-input to the worker. On macOS the
+owner can supervise this command with a user LaunchAgent. The original foreground
+MCP owner mode remains available when a host intentionally owns its lifetime.
 Configure Codex, Claude Code, Cursor, Antigravity and OpenCode
 with the same Python/module plus `--account second --connect`. These lightweight
 stdio MCP clients use the existing authenticated loopback worker; they never
@@ -59,8 +62,8 @@ From a fresh checkout, install the optional MCP dependency first:
 
 ```sh
 python -m pip install -e '.[mcp]'
-# One owner only:
-python -m chatgpt_api.extension_bridge --account second
+# One service owner only (configure the OS service manager to supervise it):
+python -m chatgpt_api.extension_bridge --account second --serve
 # Every additional local agent:
 python -m chatgpt_api.extension_bridge --account second --connect
 ```
@@ -983,7 +986,33 @@ generation, retry, deletion, CUA or direct provider API was used in this accepta
 This verifies recovery of the inspected existing image, not every future native
 UI layout or original-download resolution.
 
-Call `extension_status` first. When `account=second`, `paired=true` and `extension_online=true`, call
+### 0.1.24 paired-tab recovery
+
+Live MCP status on the deployed 0.1.23 worker showed `paired=true`, `extension_online=true`,
+`content_receiver=tab_missing` and `receiver_error=tab_missing`. The popup title for that
+state said the paired tab was missing. That diagnosis is the saved tab id, not proof that
+every open ChatGPT tab was closed.
+
+0.1.24 keeps the saved local key. If Chrome replaces the paired tab, the extension follows
+the replacement id. If the saved id is gone, it asks open `chatgpt.com` tabs only for the
+saved client marker and rebinds when exactly one tab answers with that marker. An unmarked
+tab, a different marker, or two matching markers stay unpaired.
+
+0.1.25 opens `https://chatgpt.com/` once, in the Chrome profile that has this extension,
+only when that query returns zero tabs and no job is active. It binds the saved client
+marker and the existing image-prepare step selects Create image. It does not type
+credentials, switch accounts, solve a challenge, or choose among several ChatGPT tabs.
+`next_action=verify_second_tab` means the opened tab needs the owner to finish sign-in
+or verification; the queued image is left unclaimed. A failed saved-chat cleanup whose
+error is `Chat changed after generation; nothing was deleted` is not retried, because
+the owned chat was no longer the page being deleted.
+No new pairing code is requested. Status `next_action` is `confirm_second_tab`,
+`open_second_tab`, `verify_second_tab`, `refresh_paired_tab_once`, `submit_via_mcp`, `inspect_tab`, or
+`wait_for_extension`. Diagnostics add `tab_recovery` (`none`, `rebound`, `unmatched`) and
+`chatgpt_tabs` (a count). They do not include a page URL, title, or prompt.
+
+Call `extension_status` first. When `account=second`, `paired=true`, `extension_online=true`
+and `next_action=submit_via_mcp`, call
 `extension_image` once with `prompt` and `expected_model`. `expected_model` must
 be **`Create image`**, matching the verified native image route. This is not a
 claim that an image uses GPT-6 High/Pro or a specific rendering-quality setting.

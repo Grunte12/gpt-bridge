@@ -3,8 +3,23 @@ const labels = {
   checking: "กำลังตรวจการเชื่อมต่อ", unpaired: "เชื่อมครั้งแรก",
   ready: "เชื่อมต่อแล้ว", busy: "กำลังทำงาน", complete: "เชื่อมต่อแล้ว", preflight_complete: "เชื่อมต่อแล้ว",
   confirmation_required: "บันทึกภาพแล้ว รอยืนยันลบแชท",
-  needs_tab: "ไม่พบแท็บที่เชื่อมไว้", offline: "รอ MCP กลับมา",
+  needs_tab: "ยังไม่มีแท็บที่เชื่อม", needs_relink: "ยืนยันแท็บ second", offline: "รอ MCP กลับมา",
   needs_pairing: "ต้องเชื่อมใหม่", interrupted: "ตรวจงานเดิมก่อน", failed: "มีปัญหากับงานล่าสุด"
+};
+const nextActions = {
+  checking: "รอผลการตรวจสักครู่",
+  unpaired: "เปิดแชตปกติ เลือก Create image แล้วเชื่อมครั้งแรก",
+  ready: "สั่งภาพผ่าน MCP ได้เลย",
+  busy: "รอให้งานนี้จบ อย่าส่งซ้ำ",
+  complete: "สั่งภาพถัดไปผ่าน MCP ได้",
+  preflight_complete: "สั่งงานถัดไปผ่าน MCP ได้",
+  confirmation_required: "รอให้การลบแชตของงานนี้จบ",
+  needs_tab: "เปิดแท็บ ChatGPT บัญชี second แล้วยืนยันด้านล่าง",
+  needs_relink: "ยืนยันว่าแท็บที่เปิดอยู่เป็นบัญชี second แล้วกดเชื่อมด้วยรหัสเดิม",
+  offline: "รอ MCP กลับมา ไม่ต้องกรอกรหัสใหม่",
+  needs_pairing: "กรอกรหัสจับคู่ครั้งนี้ครั้งเดียว แล้วยืนยันบัญชี second",
+  interrupted: "ตรวจงานเดิมใน ChatGPT ก่อนสั่งใหม่",
+  failed: "ตรวจงานล่าสุดก่อนสั่งใหม่"
 };
 let current = {configured: false, connection: {state: "checking"}};
 let relinking = false;
@@ -27,6 +42,7 @@ function render(status) {
   document.body.dataset.state = state;
   $("#connection-title").textContent = labels[state] || labels.checking;
   $("#connection-detail").textContent = status.connection?.detail || "เชื่อมแท็บเพียงครั้งเดียว ครั้งต่อไปไม่ต้องกรอกรหัสซ้ำ";
+  $("#next-action").textContent = nextActions[state] || nextActions.checking;
   const checkedAt = status.connection?.checkedAt;
   const checkedDate = typeof checkedAt === "number" && Number.isFinite(checkedAt) && checkedAt > 0
     ? new Date(checkedAt) : null;
@@ -34,13 +50,14 @@ function render(status) {
     ? `ตรวจล่าสุด: ${checkedDate.toLocaleString()}`
     : "ตรวจล่าสุด: ยังไม่ได้ตรวจ";
   $("#identity").hidden = !status.configured;
-  $("#pair-form").hidden = status.configured && !relinking && state !== "needs_pairing";
+  const showPair = !status.configured || relinking || ["needs_pairing", "needs_relink", "needs_tab"].includes(state);
+  $("#pair-form").hidden = !showPair;
   $("#token-row").hidden = status.configured && state !== "needs_pairing";
   $("#token").required = !$("#token-row").hidden;
   $("#pair-hint").textContent = status.configured && state !== "needs_pairing"
     ? "ใช้รหัสที่จำไว้แล้ว ยืนยันบัญชีของแท็บนี้ก่อนเปลี่ยนแท็บ"
     : "รหัสนี้ไม่ใช่รหัสผ่านหรือโทเคน ChatGPT บัญชีที่ใช้ต้องตรวจด้วยตัวคุณเอง";
-  $("#refresh").hidden = !status.configured;
+  $("#refresh").hidden = !status.configured || showPair;
   $("#advanced").hidden = !status.configured;
   const job = status.lastJob;
   $("#collect").hidden = !status.active || (job?.job_id === status.active.jobId && job.state === "complete");
