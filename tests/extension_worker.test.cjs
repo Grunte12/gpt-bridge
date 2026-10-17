@@ -8,15 +8,15 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.23 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.23');
+test('0.1.24 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.24');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
     assert.equal(manifest.permissions.includes(permission), false);
 });
 
-function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = ''} = {}) {
+function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, httpError = 0, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = '', candidateTabs = [], identities = {}, queryError = ''} = {}) {
   let listener;
   let alarmListener;
   const storage = sharedStorage || {};
@@ -35,6 +35,7 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
   let activeInspection = inspection;
   let activeInspectError = inspectError;
   let reloadCalls = 0;
+  let replacedListener;
   const scripting = scriptingAvailable ? {async executeScript(details) {
     scriptInjections.push(details);
     if (scriptingError) throw new Error(scriptingError);
@@ -50,9 +51,20 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
     runtime: {onMessage: {addListener(fn) { listener = fn; }}, getManifest() { return {version: manifest.version}; }, reload() { reloadCalls++; }},
     alarms: {onAlarm: {addListener(fn) { alarmListener = fn; }}, async create(...args) { alarms.push(args); }, async clear(...args) { alarms.push(['clear', ...args]); }},
     tabs: {
-      async get(id) { tabLookups.push(id); if (holdTabLookup) await tabGate; return tabExists ? {id, ...(tabUrlRedacted ? {} : {url: tabUrl})} : null; },
+      onReplaced: {addListener(fn) { replacedListener = fn; }},
+      async query() { if (queryError) throw new Error(queryError); return candidateTabs; },
+      async get(id) {
+        tabLookups.push(id);
+        if (holdTabLookup) await tabGate;
+        const candidate = candidateTabs.find(tab => tab.id === id);
+        if (candidate) return {...candidate};
+        if (!tabExists) return null;
+        return {id, ...(tabUrlRedacted ? {} : {url: tabUrl})};
+      },
       async sendMessage(id, message) {
         tabMessages.push({id, message});
+        if (message.type === 'image-identity') return {client_id: identities[id] || ''};
+        if (message.type === 'image-bind') return {ok: true};
         if (message.type === 'image-inspect') {
           if (activeInspectError) throw new Error(activeInspectError);
           return activeInspection;
@@ -100,7 +112,8 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
     fireAlarm() { alarmListener({name: 'poll'}); },
     releaseNetwork() { releaseNetwork(); },
     releaseTabLookup() { releaseTabLookup(); },
-    releaseDeleteConfirmation() { releaseDeleteConfirmation(); }};
+    releaseDeleteConfirmation() { releaseDeleteConfirmation(); },
+    replaceTab(added, removed) { return replacedListener(added, removed); }};
 }
 
 const pairedImageResult = (overrides = {}) => ({
@@ -376,6 +389,84 @@ test('missing or wrong-domain paired tab heartbeats not-ready and never polls or
     assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
     assert.equal(h.storage.config, config);
     assert.equal(h.storage.connection.state, 'needs_tab');
+  });
+});
+
+test('a missing saved tab rebinds only a single matching client marker', async t => {
+  const clientId = '123e4567-e89b-12d3-a456-426614174001';
+  const config = {token: 'synthetic-token', clientId, tabId: 7, account: 'second'};
+  const chatgpt = id => ({id, url: 'https://chatgpt.com/'});
+
+  await t.test('one matching tab becomes the paired tab and can receive work', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)], identities: {9: clientId}, next: {}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 20 && h.storage.config.tabId !== 9; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.storage.config.tabId, 9);
+    assert.equal(h.storage.config.clientId, clientId);
+    const heartbeat = h.requests.find(call => call.url.endsWith('/heartbeat')).body;
+    assert.equal(heartbeat.tab_recovery, 'rebound');
+    assert.equal(heartbeat.chatgpt_tabs, 1);
+    assert.equal(heartbeat.content_receiver, 'available');
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-identity' && call.id === 9), true);
+    assert.equal(JSON.stringify(h.tabMessages).includes('https://'), false);
+    assert.equal(h.storage.connection.state, 'ready');
+  });
+
+  await t.test('an unmarked open ChatGPT tab stays unpaired', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)], identities: {9: ''}, next: {job_id: 'job-1'}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-job' || call.message.type === 'image-prepare'), false);
+    const heartbeat = h.requests[0].body;
+    assert.equal(heartbeat.tab_recovery, 'unmatched');
+    assert.equal(heartbeat.chatgpt_tabs, 1);
+    assert.equal(heartbeat.content_receiver, 'tab_missing');
+    assert.equal(h.storage.connection.state, 'needs_relink');
+  });
+
+  await t.test('two matching markers are ambiguous and are not adopted', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(8), chatgpt(9)],
+      identities: {8: clientId, 9: clientId}, next: {job_id: 'job-1'}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.requests[0].body.chatgpt_tabs, 2);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  });
+
+  await t.test('a different client marker is not adopted', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)],
+      identities: {9: '123e4567-e89b-12d3-a456-426614174099'}});
+    Object.assign(h.storage, {config: {...config}});
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.storage.connection.state, 'needs_relink');
+  });
+
+  await t.test('tab replacement keeps the same pairing without a new code', async () => {
+    const h = harness({next: {}});
+    Object.assign(h.storage, {config: {...config}});
+    await h.replaceTab(11, 7);
+    for (let i = 0; i < 10 && h.storage.config.tabId !== 11; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 11);
+    assert.equal(h.storage.config.token, config.token);
+    h.fireAlarm();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.requests[0].body.tab_recovery, 'none');
+    assert.equal(h.requests[0].body.content_receiver, 'available');
+    assert.equal(h.tabLookups.at(-1), 11);
   });
 });
 

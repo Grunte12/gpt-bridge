@@ -269,10 +269,13 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_receiver": "unreported",
         "content_protocol": 0,
         "receiver_error": "",
+        "tab_recovery": "none",
+        "chatgpt_tabs": 0,
         "upload_dom": None,
         "result_dom": None,
         "prompt_dom": None,
     }
+    assert queue.status()["next_action"] == "submit_via_mcp"
     legacy = queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True)
 
     assert legacy["extension_diagnostics"] == {
@@ -280,6 +283,8 @@ def test_heartbeat_diagnostics_default_for_legacy_clients_and_are_not_persisted(
         "content_receiver": "unreported",
         "content_protocol": 0,
         "receiver_error": "",
+        "tab_recovery": "none",
+        "chatgpt_tabs": 0,
         "upload_dom": None,
         "result_dom": None,
         "prompt_dom": None,
@@ -309,6 +314,8 @@ def test_heartbeat_diagnostics_round_trip_with_current_protocol(tmp_path):
         "content_receiver": "available",
         "content_protocol": 2,
         "receiver_error": "",
+        "tab_recovery": "none",
+        "chatgpt_tabs": 0,
         "upload_dom": UPLOAD_DOM,
         "result_dom": None,
         "prompt_dom": None,
@@ -383,6 +390,40 @@ def test_heartbeat_rejects_malformed_prompt_dom_without_mutating_client(tmp_path
     assert queue.client == client_before
     assert queue.status() == status_before
     assert list(queue.root.glob("*/state.json")) == []
+
+
+def test_tab_recovery_reports_one_next_action_without_adopting_a_count_as_identity(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+
+    missing = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, worker_version="0.1.24",
+        content_receiver="tab_missing", receiver_error="tab_missing", tab_recovery="none", chatgpt_tabs=0,
+    )
+    assert missing["next_action"] == "open_second_tab"
+    assert missing["extension_diagnostics"]["chatgpt_tabs"] == 0
+
+    unmatched = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, worker_version="0.1.24",
+        content_receiver="tab_missing", receiver_error="tab_missing", tab_recovery="unmatched", chatgpt_tabs=1,
+    )
+    assert unmatched["next_action"] == "confirm_second_tab"
+    assert unmatched["extension_diagnostics"]["tab_recovery"] == "unmatched"
+    assert "url" not in json.dumps(unmatched["extension_diagnostics"])
+
+    rebound = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4, worker_version="0.1.24",
+        content_receiver="available", tab_recovery="rebound", chatgpt_tabs=1,
+    )
+    assert rebound["next_action"] == "submit_via_mcp"
+    assert rebound["extension_diagnostics"]["tab_recovery"] == "rebound"
+
+    for bad in ({"tab_recovery": "adopted"}, {"tab_recovery": "https://chatgpt.com/"}, {"chatgpt_tabs": -1},
+                {"chatgpt_tabs": 21}, {"chatgpt_tabs": True}):
+        with pytest.raises(ValueError):
+            queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, worker_version="0.1.24",
+                            content_receiver="tab_missing", receiver_error="tab_missing", **bad)
+    assert queue.client["tab_recovery"] == "rebound"
 
 
 def test_no_receiver_heartbeat_keeps_upload_dom_unknown(tmp_path):

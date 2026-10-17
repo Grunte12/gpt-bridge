@@ -7,7 +7,7 @@ const path = require('node:path');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/popup.js'), 'utf8');
 const html = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/popup.html'), 'utf8');
 const ids = [
-  'notice', 'version-value', 'connection-title', 'connection-detail', 'checked-at', 'identity',
+  'notice', 'version-value', 'connection-title', 'connection-detail', 'next-action', 'checked-at', 'identity',
   'pair-form', 'token-row', 'token', 'pair-hint', 'refresh', 'advanced', 'collect', 'disconnect',
   'latest-job', 'last-job', 'last-job-details', 'last-job-diagnostic', 'relink', 'reload',
   'confirm-account', 'pair'
@@ -124,7 +124,7 @@ test('reload copy says it reloads installed local files and does not promise a d
 });
 
 test('popup keeps a stable root width and scrolls content without viewport-width feedback', () => {
-  assert.match(html, /html\s*\{(?=[^}]*width:\s*380px)(?=[^}]*min-width:\s*380px)[^}]*\}/s);
+  assert.match(html, /html\s*\{(?=[^}]*width:\s*440px)(?=[^}]*min-width:\s*440px)[^}]*\}/s);
   assert.match(html, /body\s*\{(?=[^}]*width:\s*100%)(?=[^}]*max-height:\s*600px)(?=[^}]*overflow-y:\s*auto)[^}]*\}/s);
   assert.doesNotMatch(html, /max-width:\s*100vw/);
   assert.match(html, /header\s*\{(?=[^}]*display:\s*flex)(?=[^}]*flex-wrap:\s*wrap)[^}]*\}/s);
@@ -133,6 +133,24 @@ test('popup keeps a stable root width and scrolls content without viewport-width
     .flatMap(([, selectors]) => selectors.split(',').map(selector => selector.trim()));
   assert.ok(nowrapSelectors.includes('h1'));
   assert.ok(nowrapSelectors.includes('#identity'));
+});
+
+test('needs relink shows one saved-key confirmation and does not ask for a new pairing code', async () => {
+  const h = harness({configured: true, account: 'second', tabId: 7,
+    connection: {state: 'needs_relink', detail: 'มีแท็บ ChatGPT เปิดอยู่ แต่ยังไม่ใช่แท็บที่จับคู่'},
+    active: null, lastJob: {state: 'failed', error: 'earlier failure'}});
+  await settle();
+
+  assert.equal(h.elements['version-value'].textContent, '0.1.14');
+  assert.equal(h.elements.identity.hidden, false);
+  assert.equal(h.elements['connection-title'].textContent, 'ยืนยันแท็บ second');
+  assert.equal(h.elements['next-action'].textContent, 'ยืนยันว่าแท็บที่เปิดอยู่เป็นบัญชี second แล้วกดเชื่อมด้วยรหัสเดิม');
+  assert.equal(h.elements['pair-form'].hidden, false);
+  assert.equal(h.elements['token-row'].hidden, true);
+  assert.equal(h.elements.token.required, false);
+  assert.equal(h.elements['refresh'].hidden, true);
+  assert.equal(h.elements['latest-job'].hidden, false);
+  assert.equal(h.body.dataset.state, 'needs_relink');
 });
 
 test('connected, offline, and busy states never expose saved key entry', async t => {

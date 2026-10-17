@@ -9,7 +9,7 @@
     @media (prefers-color-scheme:dark) { :root { --bg:#202124; --text:#f0f1f3; --muted:#b5bac3; --line:#484d55; --accent:#a7c7ff; --hover:#30343a; --good:#85d5a6; --warn:#f3c77e; --bad:#ffa69e; } }
     * { box-sizing:border-box; }
     /* Chrome sizes action popups from the document; viewport widths can shrink that loop. */
-    html { width:380px; min-width:380px; }
+    html { width:440px; min-width:440px; }
     body { width:100%; max-height:600px; overflow-y:auto; margin:0; padding:18px; background:var(--bg); color:var(--text); font:14px/1.55 system-ui,sans-serif; }
     [hidden] { display:none!important; }
     ::selection { background:var(--accent); color:var(--bg); }
@@ -23,9 +23,10 @@
     #connection-title { display:flex; align-items:baseline; gap:9px; }
     #connection-title::before { content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--muted); }
     body[data-state="ready"] #connection-title::before, body[data-state="complete"] #connection-title::before { background:var(--good); }
-    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="interrupted"] #connection-title::before, body[data-state="confirmation_required"] #connection-title::before { background:var(--warn); }
+    body[data-state="offline"] #connection-title::before, body[data-state="needs_tab"] #connection-title::before, body[data-state="needs_relink"] #connection-title::before, body[data-state="interrupted"] #connection-title::before, body[data-state="confirmation_required"] #connection-title::before { background:var(--warn); }
     body[data-state="failed"] #connection-title::before, body[data-state="needs_pairing"] #connection-title::before { background:var(--bad); }
     #connection-detail, #last-job, .hint { color:var(--muted); }
+    #next-action { margin-top:12px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--hover); }
     #connection-detail, #last-job-diagnostic { overflow-wrap:anywhere; }
     #checked-at { margin-top:7px; }
     #latest-job { margin:0 0 18px; padding:12px; border:1px solid var(--line); border-radius:10px; }
@@ -62,6 +63,7 @@
   <section id="connection" role="status" aria-live="polite" aria-atomic="true">
     <h2 id="connection-title">กำลังตรวจการเชื่อมต่อ</h2>
     <p id="connection-detail">รอสักครู่</p>
+    <p id="next-action">รอผลการตรวจสักครู่</p>
     <p id="checked-at" class="hint">ตรวจล่าสุด: ยังไม่ได้ตรวจ</p>
   </section>
   <section id="latest-job" aria-labelledby="latest-job-title" role="status" aria-live="polite" hidden>

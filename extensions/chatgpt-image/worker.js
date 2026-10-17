@@ -54,6 +54,35 @@ function validateImages(job) {
 const publicJob = job => job ? Object.fromEntries(Object.entries(job)
   .filter(([key]) => !["prompt", "client_id", "data_base64", "path"].includes(key))
   .map(([key, value]) => [key, key === "images" ? (Array.isArray(value) ? value.map(imageMetadata) : []) : value])) : null;
+function heartbeatFields(config, fields) {
+  const recovery = ["none", "rebound", "unmatched"].includes(fields.tab_recovery) ? fields.tab_recovery : "none";
+  const tabs = Number.isInteger(fields.chatgpt_tabs) && fields.chatgpt_tabs >= 0 ? Math.min(fields.chatgpt_tabs, 20) : 0;
+  return {client_id: config.clientId, account: config.account, visible_model: "Create image",
+    worker_version: workerVersion, ...fields, tab_recovery: recovery, chatgpt_tabs: tabs};
+}
+async function findPairedTab(config) {
+  // Match only the saved client marker. An open ChatGPT tab is not proof of the second account.
+  if (!chrome.tabs.query || !/^[a-f0-9-]{36}$/.test(config.clientId || "")) return {count: 0, tabId: null};
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({url: "https://chatgpt.com/*"}); }
+  catch (_) { return {count: 0, tabId: null}; }
+  if (!Array.isArray(tabs)) return {count: 0, tabId: null};
+  const ids = [];
+  for (const candidate of tabs) {
+    if (!candidate || !Number.isInteger(candidate.id) || ids.length >= 20) continue;
+    let originOk = !candidate.url;
+    try { if (candidate.url) originOk = new URL(candidate.url).origin === "https://chatgpt.com"; } catch (_) { originOk = false; }
+    if (originOk) ids.push(candidate.id);
+  }
+  const matches = [];
+  for (const id of ids) {
+    try {
+      const reply = await chrome.tabs.sendMessage(id, {type: "image-identity"});
+      if (reply?.client_id === config.clientId) matches.push(id);
+    } catch (_) { /* No marker: leave the tab unpaired. */ }
+  }
+  return {count: ids.length, tabId: matches.length === 1 ? matches[0] : null};
+}
 async function request(config, path, data) {
   const response = await fetch(endpoint + path, {method: "POST", cache: "no-store",
     headers: {"Authorization": "Bearer " + config.token, "Content-Type": "application/json"},
@@ -112,16 +141,26 @@ async function poll() {
       return;
     }
     if (finishing) {
-      await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-        visible_model: "Create image", tab_ready: false, worker_version: workerVersion,
-        content_receiver: "unreported", receiver_error: ""});
+      await request(config, "/heartbeat", heartbeatFields(config, {tab_ready: false,
+        content_receiver: "unreported", receiver_error: ""}));
       return;
     }
     let ready = {fresh: false}, available = false, tab;
     let contentReceiver = "tab_missing", receiverError = "tab_missing";
+    let tabRecovery = "none", chatgptTabs = 0;
     try {
       tab = await chrome.tabs.get(config.tabId);
     } catch (_) { /* Never forward native exception text, which may include private URLs. */ }
+    if (!tab) {
+      const recovered = await findPairedTab(config);
+      chatgptTabs = recovered.count;
+      if (Number.isInteger(recovered.tabId)) {
+        config.tabId = recovered.tabId;
+        await chrome.storage.local.set({config});
+        try { tab = await chrome.tabs.get(config.tabId); } catch (_) { tab = null; }
+        tabRecovery = tab ? "rebound" : "unmatched";
+      } else if (chatgptTabs > 0) tabRecovery = "unmatched";
+    }
     if (tab) {
       contentReceiver = "wrong_origin";
       receiverError = "wrong_origin";
@@ -133,7 +172,8 @@ async function poll() {
       if (chatgptTab) {
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
-            const inspected = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect"});
+            const inspected = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect",
+              ...(/^[a-f0-9-]{36}$/.test(config.clientId) ? {clientId: config.clientId} : {})});
             if (inspected && typeof inspected === "object" &&
                 (typeof inspected.fresh === "boolean" || typeof inspected.error === "string")) {
               ready = inspected;
@@ -164,14 +204,14 @@ async function poll() {
         }
       }
     }
-    await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-      visible_model: "Create image", tab_ready: ready.fresh === true && ready.model === "Create image",
+    await request(config, "/heartbeat", heartbeatFields(config, {
+      tab_ready: ready.fresh === true && ready.model === "Create image",
       input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
       tab_idle: typeof ready.idle === "boolean" ? ready.idle : null,
       tab_error: receiverError ? "Native tab inspection failed: " + receiverError : String(ready.error || "").slice(0, 300),
-      worker_version: workerVersion, content_receiver: contentReceiver, receiver_error: receiverError,
+      content_receiver: contentReceiver, receiver_error: receiverError, tab_recovery: tabRecovery, chatgpt_tabs: chatgptTabs,
       upload_dom: uploadDomDiagnostic(ready.upload_dom), result_dom: resultDomDiagnostic(ready.result_dom),
-      prompt_dom: promptDomDiagnostic(ready.prompt_dom)});
+      prompt_dom: promptDomDiagnostic(ready.prompt_dom)}));
     if (active) {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
@@ -187,9 +227,11 @@ async function poll() {
       }
     }
     if (!available) {
-      await connection("needs_tab", receiverError === "no_receiver"
-        ? "ตัวรับในแท็บเดิมยังไม่พร้อม ตรวจสิทธิ์ส่วนขยายบน chatgpt.com ไม่ต้องจับคู่หรือกรอกรหัสใหม่"
-        : "เปิดแท็บ ChatGPT ที่เชื่อมไว้ หรือเชื่อมแท็บ second ใหม่ในตัวเลือก");
+      await connection(tabRecovery === "unmatched" ? "needs_relink" : "needs_tab", receiverError === "no_receiver"
+        ? "รีเฟรชแท็บ ChatGPT ที่เชื่อมไว้ครั้งเดียว ตัวรับจะกลับมาเอง ไม่ต้องกรอกรหัสใหม่"
+        : tabRecovery === "unmatched"
+        ? "มีแท็บ ChatGPT เปิดอยู่ แต่ยังไม่ใช่แท็บที่จับคู่ เปิดแท็บ second แล้วยืนยันด้านล่าง ใช้รหัสเดิม"
+        : "เปิดแท็บ ChatGPT บัญชี second แล้วยืนยันด้านล่าง ใช้รหัสเดิมถ้าเคยเชื่อมแล้ว");
       return;
     }
     await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");
@@ -209,11 +251,10 @@ async function poll() {
         if (prepared?.fresh !== true || prepared.model !== "Create image")
           throw new Error(prepared?.error || "Native image chat could not be prepared");
         ready = prepared;
-        await request(config, "/heartbeat", {client_id: config.clientId, account: config.account,
-          visible_model: "Create image", tab_ready: true,
+        await request(config, "/heartbeat", heartbeatFields(config, {tab_ready: true,
           input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
           tab_idle: typeof ready.idle === "boolean" ? ready.idle : null, tab_error: "",
-          worker_version: workerVersion, content_receiver: "available", receiver_error: ""});
+          content_receiver: "available", receiver_error: "", tab_recovery: tabRecovery, chatgpt_tabs: chatgptTabs}));
       }
       if ((job.images?.length || job.mode === "edit") && ![1, 2, 3, 4].includes(ready.input_protocol))
         throw new Error("Refresh the paired ChatGPT tab to load local image input support; not submitted");
@@ -249,6 +290,12 @@ chrome.runtime.onStartup?.addListener(() => void resume());
 chrome.runtime.onInstalled?.addListener(() => void resume());
 void resume();
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "poll") void poll(); });
+chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => (async () => {
+  const {config} = await chrome.storage.local.get("config");
+  if (!config || config.tabId !== removedTabId || !Number.isInteger(addedTabId) || addedTabId === removedTabId) return;
+  config.tabId = addedTabId;
+  await chrome.storage.local.set({config});
+})());
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   void (async () => {
     const manage = !sender.tab && ["pair", "disconnect"].includes(message.type);
@@ -280,6 +327,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       await request(config, "/pair", {client_id: config.clientId, account: config.account, visible_model: ready.model,
         input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0});
       await chrome.storage.local.set({config});
+      try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
       resumePolling = true;
       await connection("ready", "รอคำสั่งสร้างภาพจากเอเจนต์ได้เลย");
       await chrome.alarms.create("poll", {periodInMinutes: 0.5});

@@ -33,7 +33,8 @@ MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT uploa
 TERMINAL = {"complete", "failed", "interrupted"}
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2}
+TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
 class LocalImageInput(BaseModel):
@@ -226,7 +227,7 @@ class ExtensionQueue:
                   tab_idle: bool | None = None, tab_error: str = "",
                   worker_version: str = "", content_receiver: str = "unreported",
                   receiver_error: str = "", upload_dom: dict | None = None, result_dom: dict | None = None,
-                  prompt_dom: dict | None = None) -> dict:
+                  prompt_dom: dict | None = None, tab_recovery: str = "none", chatgpt_tabs: int = 0) -> dict:
         """Reconnect the already-authorized local extension, never replay old work."""
         if account != self.account or type(tab_ready) is not bool:
             raise ValueError("account or readiness mismatch")
@@ -245,6 +246,10 @@ class ExtensionQueue:
         if not isinstance(receiver_error, str) or receiver_error not in {
                 "", "tab_missing", "wrong_origin", "no_receiver", "port_closed", "message_failed", "invalid_reply"}:
             raise ValueError("invalid receiver error diagnostic")
+        if not isinstance(tab_recovery, str) or tab_recovery not in TAB_RECOVERY:
+            raise ValueError("invalid tab recovery diagnostic")
+        if type(chatgpt_tabs) is not int or not 0 <= chatgpt_tabs <= 20:
+            raise ValueError("invalid ChatGPT tab count")
         upload_counts = {"file_inputs", "form_file_inputs", "image_inputs", "form_image_inputs",
                          "multiple_image_inputs", "unrestricted_inputs", "attachment_cards"}
         if upload_dom is not None and (not isinstance(upload_dom, dict) or
@@ -283,10 +288,28 @@ class ExtensionQueue:
             self.client.update(visible_model=visible_model, tab_ready=tab_ready, input_protocol=input_protocol,
                                tab_idle=tab_idle, tab_error=tab_error, worker_version=worker_version,
                                content_receiver=content_receiver, receiver_error=receiver_error,
+                               tab_recovery=tab_recovery, chatgpt_tabs=chatgpt_tabs,
                                upload_dom=dict(upload_dom) if upload_dom is not None else None,
                                result_dom=dict(result_dom) if result_dom is not None else None,
                                prompt_dom=json.loads(json.dumps(prompt_dom)) if prompt_dom is not None else None)
             return self.status()
+
+    def _next_action(self) -> str:
+        """One machine-readable next step. Never includes page content or a tab URL."""
+        if not self.client or time.monotonic() - self.client.get("seen", 0) > 90:
+            return "wait_for_extension"
+        tabs = self.client.get("chatgpt_tabs", 0)
+        recovery = self.client.get("tab_recovery", "none")
+        receiver = self.client.get("content_receiver", "unreported")
+        if recovery == "unmatched" or receiver == "wrong_origin" or (receiver == "tab_missing" and tabs > 0):
+            return "confirm_second_tab"
+        if receiver == "tab_missing":
+            return "open_second_tab"
+        if receiver == "unavailable" and self.client.get("receiver_error") == "no_receiver":
+            return "refresh_paired_tab_once"
+        if self.client.get("tab_ready") is True:
+            return "submit_via_mcp"
+        return "inspect_tab"
 
     def _client(self, client_id):
         if not isinstance(client_id, str) or not self.client or not hmac.compare_digest(self.client["client_id"], client_id):
@@ -553,11 +576,14 @@ class ExtensionQueue:
                         "tab_ready": bool(self.client and self.client["tab_ready"]),
                         "tab_idle": self.client.get("tab_idle") if self.client else None,
                         "tab_error": self.client.get("tab_error", "") if self.client else "",
+                        "next_action": self._next_action(),
                         "extension_diagnostics": {
                             "worker_version": (self.client.get("worker_version") or None) if self.client else None,
                             "content_receiver": self.client.get("content_receiver", "unreported") if self.client else "unreported",
                             "content_protocol": self.client.get("input_protocol", 0) if self.client else 0,
                             "receiver_error": self.client.get("receiver_error", "") if self.client else "",
+                            "tab_recovery": self.client.get("tab_recovery", "none") if self.client else "none",
+                            "chatgpt_tabs": self.client.get("chatgpt_tabs", 0) if self.client else 0,
                             "upload_dom": self.client.get("upload_dom") if self.client else None,
                             "result_dom": self.client.get("result_dom") if self.client else None,
                             "prompt_dom": self.client.get("prompt_dom") if self.client else None},
@@ -779,7 +805,7 @@ def create_mcp(queue):
 
     @server.tool()
     def extension_status(job_id: str = "") -> dict:
-        """Check account, cleanup_policy and saved image receipt. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
+        """Check account, cleanup_policy, next_action and saved image receipt. next_action is confirm_second_tab when ChatGPT tabs are open but none match the saved pairing. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
         return queue.status(job_id)
 
     @server.tool()
@@ -825,8 +851,11 @@ def main():
     parser.add_argument("--account", required=True, choices=["second"],
                         help="Experimental runtime is restricted to the owner's second account")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".local/share/gpt-bridge/extension/second")
-    parser.add_argument("--connect", action="store_true",
-                        help="Share an already running local extension worker; do not create another queue or listener")
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument("--connect", action="store_true",
+                           help="Share an already running local extension worker; do not create another queue or listener")
+    lifecycle.add_argument("--serve", action="store_true",
+                           help="Run only the loopback worker, independent of MCP stdio; agent hosts use --connect")
     parser.add_argument("--auto-delete-saved-chats", action="store_true",
                         help="Owner opt-in: permanently delete only new Bridge-created image chats after validated local save, without per-image prompts")
     args = parser.parse_args()
@@ -859,9 +888,14 @@ def main():
         token = read_token(root)
     except (ValueError, OSError) as error:
         parser.error(str(error))
-    server = create_mcp(queue)
-
     http = ThreadingHTTPServer(("127.0.0.1", PORT), make_handler(queue, token, PORT))
+    if args.serve:
+        try:
+            http.serve_forever()
+        finally:
+            http.server_close()
+        return
+    server = create_mcp(queue)
     http.daemon_threads = True
     threading.Thread(target=http.serve_forever, daemon=True).start()
     import sys
