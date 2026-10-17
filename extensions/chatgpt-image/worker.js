@@ -5,6 +5,7 @@ let polling = false;
 let managing = false;
 let finishing = false;
 let receiverRecoveryTab = null;
+let recoveryTabId = null;
 const maxInputBytes = 8 * 1024 * 1024; // Bridge messaging budget, not a provider count limit.
 const imageMetadata = image => Object.fromEntries(
   ["order", "role", "description", "name", "mime", "bytes", "sha256", "dimensions"].map(key => [key, image[key]]));
@@ -83,6 +84,35 @@ async function findPairedTab(config) {
   }
   return {count: ids.length, tabId: matches.length === 1 ? matches[0] : null};
 }
+async function openRecoveryTab(config) {
+  // One tab, only when this profile has none. Never chooses among existing accounts.
+  if (!chrome.tabs?.create || !/^[a-f0-9-]{36}$/.test(config.clientId || "")) return null;
+  if (recoveryTabId) {
+    try { return await chrome.tabs.get(recoveryTabId); } catch (_) { recoveryTabId = null; }
+  }
+  const created = await chrome.tabs.create({url: "https://chatgpt.com/", active: false});
+  if (!created || !Number.isInteger(created.id)) return null;
+  recoveryTabId = created.id;
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    let current;
+    try { current = await chrome.tabs.get(created.id); } catch (_) { return null; }
+    let originOk = false;
+    try { originOk = new URL(current.url || "about:blank").origin === "https://chatgpt.com"; } catch (_) {}
+    if (current.status === "complete" && originOk) {
+      if (chrome.scripting?.executeScript) {
+        try { await chrome.scripting.executeScript({target: {tabId: created.id}, files: ["content.js"]}); }
+        catch (_) { /* The declared content script may already be attached. */ }
+      }
+      try {
+        await chrome.tabs.sendMessage(created.id, {type: "image-bind", clientId: config.clientId});
+      } catch (_) { /* Keep the tab. A later poll can attach the receiver. Do not open another. */ }
+      return current;
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  return null;
+}
 async function request(config, path, data) {
   const response = await fetch(endpoint + path, {method: "POST", cache: "no-store",
     headers: {"Authorization": "Bearer " + config.token, "Content-Type": "application/json"},
@@ -159,6 +189,15 @@ async function poll() {
         await chrome.storage.local.set({config});
         try { tab = await chrome.tabs.get(config.tabId); } catch (_) { tab = null; }
         tabRecovery = tab ? "rebound" : "unmatched";
+      } else if (chatgptTabs === 0 && !active) {
+        const opened = await openRecoveryTab(config);
+        if (opened && Number.isInteger(opened.id)) {
+          config.tabId = opened.id;
+          await chrome.storage.local.set({config});
+          tab = opened;
+          tabRecovery = "rebound";
+          chatgptTabs = 1;
+        }
       } else if (chatgptTabs > 0) tabRecovery = "unmatched";
     }
     if (tab) {
@@ -174,7 +213,12 @@ async function poll() {
           try {
             const inspected = await chrome.tabs.sendMessage(config.tabId, {type: "image-inspect",
               ...(/^[a-f0-9-]{36}$/.test(config.clientId) ? {clientId: config.clientId} : {})});
-            if (inspected && typeof inspected === "object" &&
+            const ownerBlocked = typeof inspected?.error === "string" && inspected.error.startsWith("Owner action required");
+            if (ownerBlocked) {
+              ready = inspected;
+              contentReceiver = "available";
+              receiverError = "";
+            } else if (inspected && typeof inspected === "object" &&
                 (typeof inspected.fresh === "boolean" || typeof inspected.error === "string")) {
               ready = inspected;
               available = true;
@@ -227,11 +271,14 @@ async function poll() {
       }
     }
     if (!available) {
-      await connection(tabRecovery === "unmatched" ? "needs_relink" : "needs_tab", receiverError === "no_receiver"
+      const ownerAction = typeof ready.error === "string" && ready.error.startsWith("Owner action required");
+      await connection(tabRecovery === "unmatched" ? "needs_relink" : "needs_tab", ownerAction
+        ? "ต้องยืนยันตัวตนในแท็บ ChatGPT ที่เปิดไว้ ไม่มีการส่งงาน"
+        : receiverError === "no_receiver"
         ? "รีเฟรชแท็บ ChatGPT ที่เชื่อมไว้ครั้งเดียว ตัวรับจะกลับมาเอง ไม่ต้องกรอกรหัสใหม่"
         : tabRecovery === "unmatched"
         ? "มีแท็บ ChatGPT เปิดอยู่ แต่ยังไม่ใช่แท็บที่จับคู่ เปิดแท็บ second แล้วยืนยันด้านล่าง ใช้รหัสเดิม"
-        : "เปิดแท็บ ChatGPT บัญชี second แล้วยืนยันด้านล่าง ใช้รหัสเดิมถ้าเคยเชื่อมแล้ว");
+        : "ยังไม่มีแท็บ ChatGPT ส่วนขยายจะเปิดให้หนึ่งแท็บเมื่อไม่มีแท็บอื่น ถ้ามีหลายแท็บให้ยืนยันบัญชี second");
       return;
     }
     await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");

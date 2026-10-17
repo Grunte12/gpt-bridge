@@ -401,6 +401,12 @@ def test_tab_recovery_reports_one_next_action_without_adopting_a_count_as_identi
         content_receiver="tab_missing", receiver_error="tab_missing", tab_recovery="none", chatgpt_tabs=0,
     )
     assert missing["next_action"] == "open_second_tab"
+    blocked = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, content_receiver="available",
+        tab_error="Owner action required: complete verification in ChatGPT. Nothing was submitted.",
+        tab_recovery="rebound", chatgpt_tabs=1,
+    )
+    assert blocked["next_action"] == "verify_second_tab"
     assert missing["extension_diagnostics"]["chatgpt_tabs"] == 0
 
     unmatched = queue.heartbeat(

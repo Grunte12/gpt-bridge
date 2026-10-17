@@ -996,10 +996,18 @@ every open ChatGPT tab was closed.
 0.1.24 keeps the saved local key. If Chrome replaces the paired tab, the extension follows
 the replacement id. If the saved id is gone, it asks open `chatgpt.com` tabs only for the
 saved client marker and rebinds when exactly one tab answers with that marker. An unmarked
-tab, a different marker, or two matching markers stay unpaired. The popup then shows one
-next action: confirm that the open tab is account `second` and connect with the saved key.
+tab, a different marker, or two matching markers stay unpaired.
+
+0.1.25 opens `https://chatgpt.com/` once, in the Chrome profile that has this extension,
+only when that query returns zero tabs and no job is active. It binds the saved client
+marker and the existing image-prepare step selects Create image. It does not type
+credentials, switch accounts, solve a challenge, or choose among several ChatGPT tabs.
+`next_action=verify_second_tab` means the opened tab needs the owner to finish sign-in
+or verification; the queued image is left unclaimed. A failed saved-chat cleanup whose
+error is `Chat changed after generation; nothing was deleted` is not retried, because
+the owned chat was no longer the page being deleted.
 No new pairing code is requested. Status `next_action` is `confirm_second_tab`,
-`open_second_tab`, `refresh_paired_tab_once`, `submit_via_mcp`, `inspect_tab`, or
+`open_second_tab`, `verify_second_tab`, `refresh_paired_tab_once`, `submit_via_mcp`, `inspect_tab`, or
 `wait_for_extension`. Diagnostics add `tab_recovery` (`none`, `rebound`, `unmatched`) and
 `chatgpt_tabs` (a count). They do not include a page URL, title, or prompt.
 

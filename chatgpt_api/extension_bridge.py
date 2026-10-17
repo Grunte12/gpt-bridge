@@ -33,7 +33,7 @@ MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT uploa
 TERMINAL = {"complete", "failed", "interrupted"}
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -301,6 +301,8 @@ class ExtensionQueue:
         tabs = self.client.get("chatgpt_tabs", 0)
         recovery = self.client.get("tab_recovery", "none")
         receiver = self.client.get("content_receiver", "unreported")
+        if (self.client.get("tab_error") or "").startswith("Owner action required"):
+            return "verify_second_tab"
         if recovery == "unmatched" or receiver == "wrong_origin" or (receiver == "tab_missing" and tabs > 0):
             return "confirm_second_tab"
         if receiver == "tab_missing":
