@@ -33,7 +33,7 @@ MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT uploa
 TERMINAL = {"complete", "failed", "interrupted"}
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -125,13 +125,13 @@ class ExtensionClient:
         self.token = token
         self.http = build_opener(ProxyHandler({}), NoRedirect())
 
-    def call(self, action: str, data: dict) -> dict:
+    def call(self, action: str, data: dict, timeout: float = 10) -> dict:
         request = Request(f"http://127.0.0.1:{PORT}/agent/{action}",
                           data=json.dumps(data).encode(), method="POST",
                           headers={"Authorization": "Bearer " + self.token,
                                    "Content-Type": "application/json"})
         try:
-            with self.http.open(request, timeout=10) as response:
+            with self.http.open(request, timeout=timeout) as response:
                 raw = response.read(128 * 1024 + 1)
             if len(raw) > 128 * 1024:
                 raise ValueError("oversized worker response")
@@ -144,6 +144,9 @@ class ExtensionClient:
 
     def status(self, job_id: str = "") -> dict:
         return self.call("status", {"job_id": job_id})
+
+    def wait_for_job(self, job_id: str, timeout_seconds: int = 120) -> dict:
+        return self.call("wait", {"job_id": job_id, "timeout_seconds": timeout_seconds}, timeout=timeout_seconds + 15)
 
     def submit(self, prompt: str, expected_model: str, mode: str = "create", images=None,
                preflight_only: bool = False, clear_preflight_uploads: bool = False) -> dict:
@@ -178,6 +181,7 @@ class ExtensionQueue:
         self.account = account
         self.auto_delete_saved_chats = auto_delete_saved_chats
         self.lock = threading.RLock()
+        self.finished = threading.Condition(self.lock)
         self.client = None
         self.jobs: dict[str, dict] = {}
         for path in self.root.glob("*/state.json"):
@@ -207,6 +211,8 @@ class ExtensionQueue:
         temporary.write_text(json.dumps(job))
         temporary.chmod(0o600)
         temporary.replace(directory / "state.json")
+        with self.finished:
+            self.finished.notify_all()
 
     def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0) -> dict:
         if account != self.account or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
@@ -558,6 +564,34 @@ class ExtensionQueue:
             self._save(job)
             return self.status(job_id)
 
+    def _receipt(self, job: dict, *, wait_timed_out: bool = False) -> dict:
+        output = job.get("outputs")[0] if isinstance(job.get("outputs"), list) and job.get("outputs") else {}
+        return {"job_id": job["job_id"], "state": job["state"],
+                "image_path": job.get("image_path"), "dimensions": job.get("dimensions"),
+                "sha256": job.get("sha256"), "bytes": output.get("bytes"),
+                "cleanup_status": job.get("cleanup_status"), "error": job.get("error"),
+                "submitted": job.get("submitted"), "generated": job.get("generated"),
+                "wait_timed_out": wait_timed_out}
+
+    def wait_for_job(self, job_id: str, timeout_seconds: int = 120) -> dict:
+        """Block until the job is saved or failed. A timeout leaves the job running."""
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 120:
+            raise ValueError("timeout_seconds must be 1..120")
+        if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise ValueError("unknown job")
+        deadline = time.monotonic() + timeout_seconds
+        with self.finished:
+            while True:
+                job = self.jobs.get(job_id)
+                if not job:
+                    raise ValueError("unknown job")
+                if job["state"] in TERMINAL:
+                    return self._receipt(job)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._receipt(job, wait_timed_out=True)
+                self.finished.wait(remaining)
+
     def status(self, job_id: str = "") -> dict:
         with self.lock:
             if not job_id:
@@ -783,6 +817,8 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                     result = queue.client_status(data["client_id"], data["job_id"])
                 elif self.path == "/agent/status":
                     result = queue.status(**data)
+                elif self.path == "/agent/wait":
+                    result = queue.wait_for_job(data["job_id"], data.get("timeout_seconds", 120))
                 elif self.path == "/agent/image":
                     result = queue.submit(**data)
                 elif self.path == "/agent/confirm-delete":
@@ -807,14 +843,19 @@ def create_mcp(queue):
 
     @server.tool()
     def extension_status(job_id: str = "") -> dict:
-        """Check account, cleanup_policy, next_action and saved image receipt. next_action is confirm_second_tab when ChatGPT tabs are open but none match the saved pairing. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
+        """Check account, cleanup_policy, next_action and saved image receipt. A finished job's image_path, dimensions and sha256 are on that job. next_action is confirm_second_tab when ChatGPT tabs are open but none match the saved pairing. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
         return queue.status(job_id)
+
+    @server.tool()
+    def extension_wait(job_id: str, timeout_seconds: int = 120) -> dict:
+        """Wait until this job is complete or failed, up to 120 seconds. Returns image_path, dimensions, sha256, bytes and cleanup_status. Does not resend or generate again. A timeout leaves the job running; call again."""
+        return queue.wait_for_job(job_id, timeout_seconds)
 
     @server.tool()
     def extension_image(prompt: str, expected_model: str, mode: Literal["create", "edit"] = "create",
                         images: list[LocalImageInput] | None = None, preflight_only: bool = False,
                         clear_preflight_uploads: bool = False) -> dict:
-        """Create/edit ONE image on second, or preflight_only=true to verify actual uploads WITHOUT text insertion, Send or generation. Preflight normally preserves the unsent draft. With explicit owner approval, clear_preflight_uploads=true removes ONLY this job's verified uploads after readiness, requiring preflight_clear_uploads capability (protocol 3). create accepts ordered references; edit requires >=1 source. Local static PNG/JPEG/WebP, 8 MiB combined, <=40MP/8192px, no URLs/symlinks. Preserve order/roles. Check status/tab_idle. No retries or model/account parity promises."""
+        """Create/edit ONE image on second, or preflight_only=true to verify actual uploads WITHOUT text insertion, Send or generation. Then call extension_wait(job_id) and open image_path. The tool does not paste the image into chat. Preflight normally preserves the unsent draft. With explicit owner approval, clear_preflight_uploads=true removes ONLY this job's verified uploads after readiness, requiring preflight_clear_uploads capability (protocol 3). create accepts ordered references; edit requires >=1 source. Local static PNG/JPEG/WebP, 8 MiB combined, <=40MP/8192px, no URLs/symlinks. Preserve order/roles. Check status/tab_idle. No retries or model/account parity promises."""
         return queue.submit(prompt, expected_model, mode, images, preflight_only, clear_preflight_uploads)
 
     @server.tool()

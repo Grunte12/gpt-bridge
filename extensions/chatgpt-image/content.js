@@ -28,7 +28,13 @@
   const busy = () => visible(document.querySelector('[data-testid="stop-button"], button[aria-label="Stop"]'));
   const assistants = () => [...document.querySelectorAll('[data-message-author-role="assistant"]')];
   const conversation = () => document.querySelector('[role="region"][aria-label="Conversation"]');
-  const turnHeadings = text => [...(conversation()?.querySelectorAll("h4") || [])].filter(el => el.textContent.trim() === text);
+  const turnHeadings = text => {
+    const matches = root => [...(root?.querySelectorAll("h4") || [])].filter(el => visible(el) && el.textContent.trim() === text);
+    // The labeled conversation region can stay mounted but hidden while the
+    // visible "You said:" / "ChatGPT said:" turns render elsewhere.
+    const scoped = matches(conversation());
+    return scoped.length ? scoped : matches(document);
+  };
   // Never fall back to the whole conversation: it also contains uploaded references.
   const assistantBody = () => assistants().at(-1) || turnHeadings("ChatGPT said:").at(-1)?.nextElementSibling || null;
   const displayedImages = root => root ? [...root.querySelectorAll("img")].filter(img =>
@@ -245,10 +251,29 @@
       (images.length === 1 || input.multiple === true) && images.every(image => accepts(input, image)));
     // ChatGPT can mount both a generic document uploader and an image-only uploader.
     const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg", ".ico"]);
-    const imageOnly = compatible.filter(input => (input.accept || "").split(",").map(value => value.trim().toLowerCase())
-      .every(value => /^image\/[a-z0-9.+*-]+$/.test(value) || imageExtensions.has(value)));
-    const inputs = compatible.length === 1 ? compatible : imageOnly;
-    if (inputs.length !== 1) throw new Error(`Native image file input missing, ambiguous or incompatible; compatible=${compatible.length}, image_only=${imageOnly.length}; nothing uploaded`);
+    const acceptTokens = input => (input.accept || "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+    const imageToken = value => /^image\/[a-z0-9.+*-]+$/.test(value) || imageExtensions.has(value);
+    const concreteImageToken = value => imageExtensions.has(value) || (/^image\/[a-z0-9.+-]+$/.test(value) && !value.includes("*"));
+    const imageOnly = compatible.filter(input => {
+      const tokens = acceptTokens(input);
+      return tokens.length > 0 && tokens.every(imageToken);
+    });
+    // Prefer one typed picker over image/*. If every image-only picker is
+    // image/*, keep the single multi-file picker and ignore the one-file picker.
+    let inputs = compatible.length === 1 ? compatible : imageOnly;
+    if (inputs.length > 1) {
+      const typed = inputs.filter(input => acceptTokens(input).some(concreteImageToken));
+      if (typed.length === 1) inputs = typed;
+      else if (typed.length === 0) {
+        const multi = inputs.filter(input => input.multiple === true);
+        if (multi.length === 1) inputs = multi;
+      }
+    }
+    if (inputs.length !== 1) {
+      const typedCount = imageOnly.filter(input => acceptTokens(input).some(concreteImageToken)).length;
+      const detail = imageOnly.length > 1 ? `, typed=${typedCount}, wildcard=${imageOnly.length - typedCount}` : "";
+      throw new Error(`Native image file input missing, ambiguous or incompatible; compatible=${compatible.length}, image_only=${imageOnly.length}${detail}; nothing uploaded`);
+    }
     const input = inputs[0], transfer = new DataTransfer();
     let total = 0;
     for (const [index, image] of images.entries()) {
@@ -438,17 +463,25 @@
         throw new Error("Invalid inspected cleanup resume");
       const prompt = jobPrompt(job);
       if (collectOnly) {
-        if (job.output_binding_revision !== undefined && job.output_binding_revision !== 2)
-          throw new Error("Unsupported output prompt binding revision; image was not collected");
-        if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
-          throw new Error("Wrong site or model; existing image was not collected");
-        if (job.collect_only && location.pathname !== job.recovery_chat_path)
-          throw new Error("Existing result chat does not match this inspected job; nothing was submitted");
-        if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 || turnHeadings("ChatGPT said:").length !== 1)
-          throw new Error("Inspect the completed single-turn conversation before collecting; nothing was submitted");
-        promptBinding = originalPromptBinding(job);
-        if (typeof job.prompt !== "string" || (!promptBinding.root_match && !promptBinding.exact_matching_descendant_count))
-          throw new Error("Existing conversation does not match this job's prompt; image was not collected");
+        if (job.visible_output_only === true) {
+          if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
+            throw new Error("Wrong site or model; existing image was not collected");
+          if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 ||
+              turnHeadings("ChatGPT said:").length !== 1 || !outputImages().length)
+            throw new Error("Finished assistant image is not visible; nothing was submitted");
+        } else {
+          if (job.output_binding_revision !== undefined && job.output_binding_revision !== 2)
+            throw new Error("Unsupported output prompt binding revision; image was not collected");
+          if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
+            throw new Error("Wrong site or model; existing image was not collected");
+          if (job.collect_only && location.pathname !== job.recovery_chat_path)
+            throw new Error("Existing result chat does not match this inspected job; nothing was submitted");
+          if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 || turnHeadings("ChatGPT said:").length !== 1)
+            throw new Error("Inspect the completed single-turn conversation before collecting; nothing was submitted");
+          promptBinding = originalPromptBinding(job);
+          if (typeof job.prompt !== "string" || (!promptBinding.root_match && !promptBinding.exact_matching_descendant_count))
+            throw new Error("Existing conversation does not match this job's prompt; image was not collected");
+        }
       } else {
         const inputJob = job.preflight_cleanup_only === true ? bindInspectedPreflight(job) : job;
         if (job.preflight_cleanup_only !== true)

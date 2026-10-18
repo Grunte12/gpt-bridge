@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.25 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.25');
+test('0.1.29 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.29');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -804,9 +804,7 @@ test('only a known no-receiver condition gets one exact-target reinjection attem
   const cases = [
     ['missing scripting API', {inspectError: noReceiver}, 0],
     ['denied scripting API', {inspectError: noReceiver, scriptingAvailable: true, scriptingError: 'private native failure'}, 1],
-    ['active job', {inspectError: noReceiver, scriptingAvailable: true, active: {jobId: 'old-job', tabId: 7}}, 0],
     ['wrong origin', {tabUrl: 'https://example.com/', inspectError: noReceiver, scriptingAvailable: true}, 0],
-    ['redacted URL', {tabUrlRedacted: true, inspectError: noReceiver, scriptingAvailable: true}, 0],
     ['closed message port', {inspectError: 'The message port closed before a response was received.', scriptingAvailable: true}, 0]
   ];
   for (const [name, options, expectedInjections] of cases) await t.test(name, async () => {
@@ -837,6 +835,52 @@ test('only a known no-receiver condition gets one exact-target reinjection attem
     assert.equal(JSON.stringify(h.requests).includes('private native failure'), false);
     assert.equal(h.reloadCalls, 0);
   });
+
+  await t.test('a redacted paired-tab URL is reinjected without a manual refresh', async () => {
+    const h = harness({tabUrlRedacted: true, inspectError: noReceiver, scriptingAvailable: true,
+      inspectionAfterInjection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}, next: {}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+
+    assert.equal(h.scriptInjections.length, 1);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), true);
+    assert.equal(h.requests.some(call => call.url.endsWith('/result')), false);
+  });
+
+  await t.test('an active job still gets its dead content script back and is not resent', async () => {
+    const h = harness({inspectError: noReceiver, scriptingAvailable: true,
+      inspectionAfterInjection: {fresh: true, model: 'Create image', input_protocol: 4, idle: true},
+      active: {jobId: 'old-job', tabId: 7}, state: {state: 'claimed', job_id: 'old-job'},
+      next: {job_id: 'must-not-claim'}});
+    Object.assign(h.storage, {config});
+    h.fireAlarm();
+    await settle();
+
+    assert.equal(h.scriptInjections.length, 1);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-collect'), false);
+  });
+});
+
+test('a claimed job saves a finished visible assistant image without sending again', async () => {
+  const h = harness({
+    inspection: {fresh: false, error: 'Existing conversation preserved; inspect its job result instead of submitting again',
+      input_protocol: 4, idle: false, result_dom: resultDom({assistant_images: 1, conversation_images: 2})},
+    active: {jobId: 'job-1', tabId: 7, job: {job_id: 'job-1', prompt: 'draw', expected_model: 'Create image', mode: 'create'}},
+    state: {state: 'claimed', job_id: 'job-1'}
+  });
+  Object.assign(h.storage, {config: {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'}});
+  h.fireAlarm();
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  h.fireAlarm();
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const collects = h.tabMessages.filter(call => call.message.type === 'image-collect');
+  assert.equal(collects.length, 1);
+  assert.equal(collects[0].message.job.visible_output_only, true);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-job' || call.message.type === 'image-prepare'), false);
+  assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
 });
 
 test('a URL-redacted paired tab is checked through its content script before claiming', async () => {

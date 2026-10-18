@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -288,7 +288,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     removeEventListener(type, fn) { if (type === 'click') this.listeners.delete(fn); },
     click(event = {isTrusted: false}) { clicks++; finalDeleteClicks++; for (const fn of this.listeners) fn(event); location.pathname = '/'; dialogOpen = false; }};
   const deleteDialog = {getClientRects: () => dialogOpen ? [{}] : [], querySelectorAll(selector) { return selector === 'button' ? [finalDeleteButton] : []; }};
-  const conversation = {getClientRects: () => [{}], querySelectorAll(selector) {
+  const conversation = {getClientRects: () => visibleHeadingsOutsideRegion ? [] : [{}], querySelectorAll(selector) {
     if (selector === 'img') return allConversationImages;
     if (selector === 'h4') return currentConversationTurns().map((textContent, index) => ({
       textContent, nextElementSibling: {
@@ -304,7 +304,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
         },
         getClientRects: () => [{}]
       },
-      getClientRects: () => [{}]
+      getClientRects: () => visibleHeadingsOutsideRegion ? [] : [{}]
     }));
     return [];
   }};
@@ -360,7 +360,9 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       if (selector.includes('challenges.cloudflare.com') && (challengeState || (challengeAfterSend && clicks)))
         return [{getClientRects: () => [{}]}];
       if (selector.includes('h4') && !selector.startsWith('region'))
-        return currentConversationTurns().map(textContent => ({textContent, getClientRects: () => [{}]}));
+        return visibleHeadingsOutsideRegion
+          ? conversation.querySelectorAll('h4').map(heading => ({...heading, getClientRects: () => [{}]}))
+          : currentConversationTurns().map(textContent => ({textContent, getClientRects: () => [{}]}));
       return [];
     },
     execCommand(_cmd, _ui, value) {
@@ -747,6 +749,37 @@ test('delete refuses changed prompt, draft, running work, challenge, or unavaila
     assert.equal(h.clicks, 0, `${name} must not click More or Archive`);
     assert.match(h.location.pathname, /^\/c\//);
   }
+});
+
+test('a finished visible assistant image is saved without resending when the conversation region is hidden', async () => {
+  const h = contentHarness({visibleHeadingsOutsideRegion: true, newUi: true, user: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: ['unrelated visible text'],
+    userImageSources: ['https://chatgpt.com/reference.png'],
+    assistantImageSources: ['https://chatgpt.com/generated.png']});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {visible_output_only: true});
+  assert.equal(accepted?.accepted, true);
+  await waitForContentResult(h);
+
+  const saved = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(saved, 'the visible assistant image is saved');
+  assert.equal(saved.chatPath, h.location.pathname);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.fetchCalls, 1);
+});
+
+test('visible turn headings outside a hidden conversation region still identify the assistant image', () => {
+  const h = contentHarness({visibleHeadingsOutsideRegion: true, user: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'],
+    userImageSources: ['https://chatgpt.com/reference.png'],
+    assistantImageSources: ['https://chatgpt.com/generated.png']});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+
+  assert.equal(result.result_dom.user_headings, 1);
+  assert.equal(result.result_dom.assistant_headings, 1);
+  assert.equal(result.result_dom.assistant_body_found, true);
+  assert.equal(result.result_dom.assistant_images, 1);
 });
 
 test('pairing inspection reports native Create image mode without touching the composer', () => {
@@ -1469,12 +1502,70 @@ test('upload preflight prefers one image-only multi-file input over a general fi
   assert.equal(h.fileReaderReads, 0);
 });
 
+test('create preflight with one reference uses the typed image picker when a wildcard picker is also mounted', async () => {
+  const images = [imageInput(1)];
+  const h = contentHarness({uploadInputSpecs: [
+    {accept: 'image/*', multiple: true},
+    {accept: '.png,.jpg,.jpeg,.webp', multiple: true},
+    {accept: 'image/png,application/pdf', multiple: false},
+    {accept: '', multiple: false}
+  ]});
+  let inspection;
+  h.receive({type: 'image-inspect'}, {}, value => { inspection = value; });
+  assert.deepEqual(JSON.parse(JSON.stringify(inspection.upload_dom)), {
+    editor_form: true, file_inputs: 4, form_file_inputs: 4, image_inputs: 3, form_image_inputs: 3,
+    multiple_image_inputs: 2, unrestricted_inputs: 1, attachment_cards: 0
+  });
+
+  await startContent(h, {job_id: 'job-preflight-typed-reference', expected_model: 'Create image', mode: 'create',
+    prompt: 'draw', images, preflight_only: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.ok(receipt, 'one reference image should select the typed picker');
+  assert.deepEqual(h.fileInputs.map(input => input.files.length), [0, images.length, 0, 0]);
+  assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name));
+  assert.deepEqual(h.inputEvents, ['input', 'change']);
+  assert.equal(h.insertTextCalls, 0);
+  assert.equal(h.sendQueries, 0);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.fileReaderReads, 0);
+});
+
+test('one reference uses the multi-file image picker when a one-file image picker is also mounted', async () => {
+  const images = [imageInput(1)];
+  const h = contentHarness({uploadInputSpecs: [
+    {accept: 'image/*', multiple: false},
+    {accept: 'image/*,video/*', multiple: true},
+    {accept: 'image/*', multiple: true},
+    {accept: '', multiple: false}
+  ]});
+  let inspection;
+  h.receive({type: 'image-inspect'}, {}, value => { inspection = value; });
+  assert.deepEqual(JSON.parse(JSON.stringify(inspection.upload_dom)), {
+    editor_form: true, file_inputs: 4, form_file_inputs: 4, image_inputs: 3, form_image_inputs: 3,
+    multiple_image_inputs: 2, unrestricted_inputs: 1, attachment_cards: 0
+  });
+
+  await startContent(h, {job_id: 'job-preflight-live-wildcard-reference', expected_model: 'Create image', mode: 'create',
+    prompt: 'draw', images, preflight_only: true});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.preflightReady === true);
+  assert.ok(receipt, 'one reference should use the multi-file image/* picker');
+  assert.deepEqual(h.fileInputs.map(input => input.files.length), [0, 0, images.length, 0]);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.fetchCalls, 0);
+});
+
 test('upload preflight rejects ambiguous or mixed-token image inputs before any upload', async t => {
   const images = [imageInput(1), imageInput(2), imageInput(3)];
   const cases = [
-    ['two image-only inputs', {uploadInputSpecs: [
-      {accept: 'image/*', multiple: true}, {accept: '.png,.jpg,.webp', multiple: true}
-    ]}, 'compatible=2, image_only=2'],
+    ['two concrete image-only inputs', {uploadInputSpecs: [
+      {accept: '.png,.jpg,.webp', multiple: true},
+      {accept: 'image/png,image/jpeg,image/webp', multiple: true}
+    ]}, 'compatible=2, image_only=2, typed=2, wildcard=0'],
     ['mixed image and unknown MIME tokens', {uploadInputSpecs: [
       {accept: 'image/*,application/pdf', multiple: true},
       {accept: 'image/png,application/x-unknown', multiple: true}

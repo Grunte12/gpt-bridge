@@ -563,6 +563,43 @@ def test_extension_runtime_rejects_main_account_before_creating_data_dir(tmp_pat
     assert not data_dir.exists()
 
 
+def test_wait_returns_saved_image_receipt_and_timeout_leaves_the_job_running(tmp_path):
+    import threading
+
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("Draw a green pear.", "Create image")["job_id"]
+    queue.claim(CLIENT_ID)
+
+    waiting = queue.wait_for_job(job_id, timeout_seconds=1)
+    assert waiting["state"] == "claimed"
+    assert waiting["wait_timed_out"] is True
+    assert waiting["image_path"] is None
+    assert "prompt" not in waiting
+
+    image, raw = _png_base64()
+    digest = hashlib.sha256(raw).hexdigest()
+    box = {}
+
+    def wait():
+        box["receipt"] = queue.wait_for_job(job_id, timeout_seconds=2)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    threading.Timer(0.05, lambda: queue.result(
+        CLIENT_ID, job_id, image_base64=image, chat_path=RESULT_CHAT_PATH, cleanup_pending=False)).start()
+    thread.join(3)
+    assert thread.is_alive() is False
+    receipt = box["receipt"]
+    assert receipt["state"] == "complete"
+    assert receipt["wait_timed_out"] is False
+    assert receipt["generated"] is True
+    assert receipt["image_path"].endswith("/image.png")
+    assert receipt["dimensions"] == [512, 512]
+    assert receipt["sha256"] == digest
+    assert receipt["bytes"] > 0
+    assert "prompt" not in receipt
+
+
 def test_claim_is_at_most_once_and_public_status_hides_private_fields(tmp_path):
     queue = _paired_queue(tmp_path)
     job = queue.submit("Draw a green pear.", "Create image")

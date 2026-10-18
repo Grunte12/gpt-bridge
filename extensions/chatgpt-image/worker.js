@@ -5,6 +5,7 @@ let polling = false;
 let managing = false;
 let finishing = false;
 let receiverRecoveryTab = null;
+let soonTimer = null;
 let recoveryTabId = null;
 const maxInputBytes = 8 * 1024 * 1024; // Bridge messaging budget, not a provider count limit.
 const imageMetadata = image => Object.fromEntries(
@@ -55,6 +56,18 @@ function validateImages(job) {
 const publicJob = job => job ? Object.fromEntries(Object.entries(job)
   .filter(([key]) => !["prompt", "client_id", "data_base64", "path"].includes(key))
   .map(([key, value]) => [key, key === "images" ? (Array.isArray(value) ? value.map(imageMetadata) : []) : value])) : null;
+function pageHasFinishedOutput(ready) {
+  const dom = ready?.result_dom;
+  return !!dom && dom.busy === false && dom.assistant_body_found === true &&
+    dom.user_headings === 1 && dom.assistant_headings === 1 &&
+    Number.isInteger(dom.assistant_images) && dom.assistant_images >= 1 && dom.assistant_images <= 4 &&
+    typeof dom.chat_path === "string" && /^\/c\/[a-f0-9-]{36}$/.test(dom.chat_path);
+}
+function scheduleSoon() {
+  if (soonTimer) return;
+  soonTimer = setTimeout(() => { soonTimer = null; void poll(); }, 3000);
+  if (typeof soonTimer.unref === "function") soonTimer.unref();
+}
 function heartbeatFields(config, fields) {
   const recovery = ["none", "rebound", "unmatched"].includes(fields.tab_recovery) ? fields.tab_recovery : "none";
   const tabs = Number.isInteger(fields.chatgpt_tabs) && fields.chatgpt_tabs >= 0 ? Math.min(fields.chatgpt_tabs, 20) : 0;
@@ -235,7 +248,7 @@ async function poll() {
             receiverError = /receiving end does not exist|could not establish connection/i.test(message) ? "no_receiver"
               : /message port closed|message channel closed/i.test(message) ? "port_closed" : "message_failed";
             // Reattach only our bundled listener; never navigate or change a draft.
-            if (attempt === 0 && receiverError === "no_receiver" && !active && tab.url &&
+            if (attempt === 0 && receiverError === "no_receiver" &&
                 receiverRecoveryTab !== config.tabId && chrome.scripting?.executeScript) {
               receiverRecoveryTab = config.tabId;
               try {
@@ -260,7 +273,21 @@ async function poll() {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
       if (!["complete", "failed", "interrupted"].includes(state.state)) {
+        const alreadyRunning = typeof ready.error === "string" && ready.error.startsWith("Content worker already running");
+        if (!alreadyRunning && available && pageHasFinishedOutput(ready) && active.visibleOutputSaved !== true) {
+          active.visibleOutputSaved = true;
+          await chrome.storage.local.set({active});
+          try {
+            const accepted = await chrome.tabs.sendMessage(config.tabId, {type: "image-collect",
+              job: {...(active.job || {}), job_id: active.jobId, expected_model: "Create image", visible_output_only: true}});
+            if (!accepted?.accepted) throw new Error(accepted?.error || "Content worker did not accept the finished image");
+          } catch (_) {
+            active.visibleOutputSaved = false;
+            await chrome.storage.local.set({active});
+          }
+        }
         await connection("busy", "กำลังรับภาพจากงานเดิม ไม่ส่งคำขอซ้ำ");
+        scheduleSoon();
         return;
       }
       await chrome.storage.local.set({lastJob: state});
