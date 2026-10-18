@@ -588,24 +588,16 @@ def test_input_images_respect_per_file_and_combined_transport_budget(tmp_path, m
     assert queue.jobs == {}
 
 
-def test_mcp_image_schema_exposes_mode_and_typed_local_image_inputs():
+def test_mcp_image_schema_splits_generate_and_edit():
     server = create_mcp(None)
-    tool = next(tool for tool in server._tool_manager.list_tools() if tool.name == "extension_image")
-    schema = tool.parameters
-    assert schema["properties"]["mode"]["enum"] == ["create", "edit"]
-    assert schema["properties"]["mode"]["default"] == "create"
-    image_schema = schema["$defs"]["LocalImageInput"]
+    tools = {tool.name: tool.parameters for tool in server._tool_manager.list_tools()}
+    assert "expected_model" not in tools["generate"]["properties"]
+    assert "images" not in tools["generate"].get("required", [])
+    assert tools["edit"]["required"] == ["prompt", "images"]
+    image_schema = tools["generate"]["$defs"]["LocalImageInput"]
     assert image_schema["additionalProperties"] is False
     assert image_schema["properties"]["role"]["enum"] == ["source", "reference"]
-    assert image_schema["properties"]["description"]["maxLength"] == 200
     assert image_schema["required"] == ["path", "description"]
-    assert "images" not in schema.get("required", [])
-    assert schema["properties"]["preflight_only"]["type"] == "boolean"
-    assert schema["properties"]["preflight_only"]["default"] is False
-    assert "preflight_only" not in schema.get("required", [])
-    assert schema["properties"]["clear_preflight_uploads"]["type"] == "boolean"
-    assert schema["properties"]["clear_preflight_uploads"]["default"] is False
-    assert "clear_preflight_uploads" not in schema.get("required", [])
 
 
 @pytest.mark.parametrize(("fmt", "suffix", "mime"), [

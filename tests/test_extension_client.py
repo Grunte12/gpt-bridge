@@ -299,7 +299,7 @@ def test_mcp_resolve_requires_inspection_before_calling_client(arguments):
     server = create_mcp(client)
 
     with pytest.raises(Exception, match="inspect ChatGPT"):
-        asyncio.run(server.call_tool("extension_resolve", arguments))
+        asyncio.run(server.call_tool("resolve", arguments))
     assert calls == []
 
 
@@ -325,7 +325,7 @@ def test_mcp_resolve_rejects_non_boolean_inspection_and_cleanup_flags(arguments)
     server = create_mcp(client)
 
     with pytest.raises(Exception):
-        asyncio.run(server.call_tool("extension_resolve", arguments))
+        asyncio.run(server.call_tool("resolve", arguments))
     assert calls == []
 
 
@@ -339,13 +339,13 @@ def test_mcp_resolve_calls_client_only_after_explicit_inspection():
     ) or {"state": "interrupted"}
     server = create_mcp(client)
 
-    result = asyncio.run(server.call_tool("extension_resolve", {
+    result = asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True,
     }))
     assert calls == [("synthetic", False)]
     assert "interrupted" in result[0].text
 
-    result = asyncio.run(server.call_tool("extension_resolve", {
+    result = asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": True,
     }))
     assert calls == [("synthetic", False), ("synthetic", True)]
@@ -360,7 +360,7 @@ def test_mcp_failed_upload_cleanup_forwards_only_explicit_inspected_names():
     client.resolve = lambda *args: calls.append(args) or {"state": "queued"}
     server = create_mcp(client)
     names = ["input-001(1).png", "input-002(1).png"]
-    asyncio.run(server.call_tool("extension_resolve", {
+    asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True,
         "clear_failed_uploads": True, "native_upload_names": names,
     }))
@@ -376,7 +376,7 @@ def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
     server = create_mcp(client)
     chat_path = "/c/123e4567-e89b-12d3-a456-426614174000"
 
-    result = asyncio.run(server.call_tool("extension_resolve", {
+    result = asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic-job",
         "inspected_chatgpt": True,
         "recover_outputs": True,
@@ -403,14 +403,14 @@ def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval
     server = create_mcp(queue)
     tools = server._tool_manager.list_tools()
     assert {tool.name for tool in tools} == {
-        "extension_status", "extension_image", "extension_confirm_delete", "extension_resolve",
+        "status", "generate", "edit", "wait", "confirm_delete", "resolve",
     }
 
     with pytest.raises(Exception, match="actual owner confirmation"):
-        asyncio.run(server.call_tool("extension_confirm_delete", {
+        asyncio.run(server.call_tool("confirm_delete", {
             "job_id": submitted["job_id"], "owner_confirmed": False,
         }))
-    result = asyncio.run(server.call_tool("extension_confirm_delete", {
+    result = asyncio.run(server.call_tool("confirm_delete", {
         "job_id": submitted["job_id"], "owner_confirmed": True,
     }))
     assert "requested" in result[0].text

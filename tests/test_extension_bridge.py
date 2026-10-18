@@ -1912,7 +1912,7 @@ def test_inspected_failed_generation_cleanup_accepts_exact_ordered_numeric_alias
     native_names = [_native_duplicate_name(images[0]["name"], 1), images[1]["name"]]
     server = create_mcp(queue)
 
-    response = asyncio.run(server.call_tool("extension_resolve", {
+    response = asyncio.run(server.call_tool("resolve", {
         "job_id": job_id,
         "inspected_chatgpt": True,
         "clear_failed_uploads": True,
