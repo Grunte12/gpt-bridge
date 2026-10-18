@@ -5,7 +5,7 @@ description: "Use the user's local GPT Bridge CLI for one-account chat, research
 
 # GPT Bridge Worker
 
-## Native image generation — extension 0.1.10
+## Native image generation — extension
 
 Prefer the `gpt-bridge-extension` MCP tools for the owner's image-generation
 tasks. Test/use only `second`; never silently use `main` or direct HTTP.
@@ -14,8 +14,9 @@ tasks. Test/use only `second`; never silently use `main` or direct HTTP.
    `extension_online=true`. `tab_ready=false` alone is not a blocker: a new
    explicit job prepares its native Create image chat automatically.
 2. Call `extension_image(prompt=..., expected_model="Create image")` once.
-3. Poll `extension_status(job_id=...)`. A saved image needs `state=complete`,
-   a local path, dimensions and hash; inspect that file.
+3. Call `extension_wait(job_id)`. A saved image needs `state=complete`,
+   `image_path`, dimensions and sha256. Open that file. The tool does not paste
+   the image into chat. If `wait_timed_out` is true, call `extension_wait` again.
    - If `cleanup_policy=automatic_saved_chats`, the owner has opted into
      permanent deletion after validated saves. The script deletes only each
      newly Bridge-created image chat. Wait for `cleanup_status=deleted`;
@@ -39,10 +40,11 @@ Status reports the active policy. Default mode still requires per-job approval.
 Policy applies only to jobs created while enabled, never old chats/jobs.
 
 Keep the owner running. Pairing reconnects after restarts without tokens/cookies
-or repeated setup. Restart invalidates pending cleanup; never replay it. The four
-tool names/arguments are unchanged. An older host may still cache schema text;
-read `cleanup_policy` from live status. Reload an old MCP host only at an idle
-point, never by restarting a busy session.
+or repeated setup. Restart invalidates pending cleanup; never replay it. The
+tools are `extension_status`, `extension_image`, `extension_wait`,
+`extension_confirm_delete`, and `extension_resolve`. An older host may still
+cache schema text; read `cleanup_policy` from live status. Reload an old MCP
+host only at an idle point, never by restarting a busy session.
 
 No manual tab preparation is needed. Attachments, verification, running work,
 changed prompts and unrelated drafts fail closed. Use browser control only for
@@ -50,6 +52,21 @@ initial setup/reload, a closed paired tab, login or necessary failure diagnosis,
 not ordinary submission, receipt or deletion. This route does not yet support
 reference edits/batches or guarantee Pro/High, highest quality, or original-download
 resolution. Missing MCP tools are not a reason to use old direct image commands.
+
+## Highest-quality image requests
+
+When the user prioritizes final-image quality, use `--level high` for prompt
+fidelity and set the native model/effort explicitly. These are separate controls.
+Read `worker doctor --live-models --json` once for the selected direct account
+(or `account-models --account <alias> --json`) to discover current presets.
+Default doctor model lists may be inferred from an older capture.
+
+The GPT-6 High preset verified on 2026-10-13 is
+`--model gpt-6-thinking --thinking-effort extended --level high`.
+Use it only when that account's live picker confirms support. Do not invent
+`highest`/`max` effort values, silently downgrade, or equate reasoning effort
+with image-rendering quality. Generation still requires the user's task scope.
+Correct forwarding is not a likeness guarantee; inspect the saved image.
 
 ## Preflight
 

@@ -461,6 +461,8 @@ class ChatGPTWebTransport:
         }
         if request.conversation_id:
             payload["conversation_id"] = request.conversation_id
+        if request.thinking_effort:
+            payload["thinking_effort"] = request.thinking_effort
         return payload
 
     def _upload_file(

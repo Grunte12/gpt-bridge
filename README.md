@@ -184,6 +184,10 @@ refresh ChatGPT credentials.
 
 ## Install agent integrations
 
+For agents on another machine, see [Private MCP over Tailscale](docs/PRIVATE_MCP.md).
+The optional adapter exposes three discovery/job tools, with detailed schemas
+loaded on demand. Local agents can continue using the CLI.
+
 The repository ships native adapters for Codex, Claude Code, and OpenCode.
 Python 3.11 or newer is required. From a checkout, preview the changes and then
 install the Python runtime plus every available host integration:
@@ -495,12 +499,33 @@ Model aliases reflect what the local account/router exposes. Inspect them
 instead of hard-coding assumptions:
 
 ```powershell
-gpt-bridge worker doctor --json
-gpt-bridge admin models --json --base-url http://127.0.0.1:8000/v1 --api-key YOUR_LOCAL_KEY
+gpt-bridge worker doctor --live-models --json
+gpt-bridge account-models --account personal-main --json
 ```
 
 > ภาษาไทย: ชื่อ account เช่น `personal-main` เป็น alias ในเครื่อง ไม่ใช่ plan
-> ของ ChatGPT และ model ที่ใช้ได้จริงควรดูจาก `worker doctor` หรือ `admin models`
+> ของ ChatGPT รายการ `/models` ปกติอาจอนุมานจาก capture เก่า ไม่ใช่รายการสด
+> ใช้ `worker doctor --live-models` (direct) หรือ `account-models` ดูโมเดลและ effort ปัจจุบัน
+
+Image `--level high` sets prompt fidelity, not reasoning effort. Discover the
+selected account's native presets before requesting the highest available tier.
+GPT-6 High observed on 2026-10-13 uses
+`--model gpt-6-thinking --thinking-effort extended --level high`.
+Do not invent a `highest` or `max` value when the live picker does not list it.
+Generate/edit and continuation requests forward the selected effort, but this
+does not guarantee that the upstream image renderer honors the preset or that
+likeness improves. Model discovery does not generate media.
+
+MCP `bridge.image` / `bridge.edit` accept `model`, `thinking_effort`, and
+`level`; OpenCode image tools use `model`, `thinkingEffort`, and `level`.
+All forward to the shared worker CLI. These optional fields preserve existing
+defaults when omitted.
+
+Local editable installations share the source checkout: each new CLI process
+reads its current code. Running MCP/API processes must restart to load changes;
+installed plugin snapshots and copied host adapters require an explicit upgrade.
+Updating GitHub alone does not update another machine's checkout. Do not install
+a separate runtime per agent or silently restart active jobs.
 
 ## Conservative stack controls
 

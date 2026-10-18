@@ -621,6 +621,7 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
 
     image = subparsers.add_parser("image", help="Generate or edit an image")
     image.add_argument("--model", default=None)
+    image.add_argument("--thinking-effort", default=None)
     image.add_argument("--prompt", "-p", required=True)
     image.add_argument("--input-image", type=Path, action="append", default=[])
     image.add_argument("--aspect-ratio", choices=["auto", "1:1", "3:4", "9:16", "4:3", "16:9"], default="auto")
@@ -753,6 +754,10 @@ def build_parser(*, prog: str = "gpt-bridge") -> argparse.ArgumentParser:
 
     worker_doctor = worker_subparsers.add_parser("doctor", help="Check the direct account/runtime or optional HTTP gateway")
     worker_doctor.add_argument("--json", action="store_true")
+    worker_doctor.add_argument(
+        "--live-models", action="store_true",
+        help="Read current model slugs and effort presets from the selected direct account",
+    )
     worker_doctor.set_defaults(func=cmd_worker_doctor)
 
     worker_tools = worker_subparsers.add_parser(
@@ -1236,6 +1241,8 @@ async def cmd_worker_status(args: argparse.Namespace) -> int:
 
 
 async def cmd_worker_doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "live_models", False) and args.transport != "direct":
+        raise ProviderError("--live-models requires the direct worker transport")
     if args.transport == "direct":
         checks: dict[str, dict[str, object]] = {}
         try:
@@ -1252,6 +1259,22 @@ async def cmd_worker_doctor(args: argparse.Namespace) -> int:
                     checks[name] = {"ok": True, "data": await client.request_json("GET", path)}
                 except ProviderError as exc:
                     checks[name] = {"ok": False, "detail": str(exc)}
+            if "models" in checks:
+                checks["models"]["source"] = "capture_inference"
+            if getattr(args, "live_models", False):
+                try:
+                    capture_path = resolve_account_capture_path(client.account, args.accounts_dir)
+                    capture = CapturedRequest.from_file(capture_path)
+                    picker = parse_model_picker(
+                        await asyncio.to_thread(_fetch_account_models, capture, "chrome")
+                    )
+                    checks["models"] = {
+                        "ok": True, "source": "live_account_picker", "data": picker.to_dict(),
+                    }
+                except (ProviderError, OSError, ValueError) as exc:
+                    checks["models"] = {
+                        "ok": False, "source": "live_account_picker", "detail": str(exc),
+                    }
         ok = all(item["ok"] for item in checks.values())
         result = {
             "object": "chatgpt.worker.doctor",
@@ -3387,6 +3410,11 @@ IMAGE_LEVELS = {
 
 def _add_image_count_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--thinking-effort",
+        default=None,
+        help="Native ChatGPT reasoning effort; inspect account-models for supported values",
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=1,
@@ -3401,7 +3429,7 @@ def _add_image_count_argument(parser: argparse.ArgumentParser) -> None:
         choices=tuple(IMAGE_LEVELS),
         default="medium",
         help=(
-            "Image effort: instant is a cheap draft (max 4); medium is the default; "
+            "Image prompt fidelity (not reasoning effort): instant is a draft (max 4); medium is the default; "
             "high asks for maximum fidelity. ChatGPT Web still returns one image per request."
         ),
     )
@@ -3683,6 +3711,7 @@ async def _execute_counted_image_request(
                     prompt, index, count, level, continue_session=continue_session
                 ),
                 **extra_body,
+                "thinking_effort": getattr(args, "thinking_effort", None),
                 "response_format": args.response_format,
                 "metadata": variant_metadata or None,
             }
@@ -3710,6 +3739,7 @@ async def _execute_counted_image_request(
                     "model": args.model,
                     "prompt": _variant_image_prompt(prompt, index, count, level),
                     **extra_body,
+                    "thinking_effort": getattr(args, "thinking_effort", None),
                     "response_format": args.response_format,
                     "metadata": retry_metadata or None,
                 }
@@ -4745,6 +4775,7 @@ async def cmd_image(args: argparse.Namespace) -> int:
         prompt=prompt,
         input_images=[ImageInput(path.read_bytes(), _guess_mime_type(path), path.name) for path in input_paths],
         model=args.model,
+        thinking_effort=args.thinking_effort,
         metadata={"aspect_ratio": args.aspect_ratio} if input_paths else {},
     )
     response = await provider.generate_image(request)
