@@ -837,44 +837,66 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
     return Handler
 
 
+def compact_status(raw: dict) -> dict:
+    """Short MCP receipt. Drops prompts, diagnostics, and job history."""
+    if not isinstance(raw, dict):
+        raise ValueError("invalid status")
+    if "job_id" in raw or "state" in raw:
+        output = raw.get("outputs")[0] if isinstance(raw.get("outputs"), list) and raw.get("outputs") else {}
+        receipt = {"job_id": raw.get("job_id"), "state": raw.get("state"),
+                   "image_path": raw.get("image_path"), "dimensions": raw.get("dimensions"),
+                   "sha256": raw.get("sha256"),
+                   "bytes": output.get("bytes") if isinstance(output, dict) else raw.get("bytes"),
+                   "cleanup_status": raw.get("cleanup_status"), "error": raw.get("error"),
+                   "wait_timed_out": raw.get("wait_timed_out", False)}
+        if raw.get("cleanup_confirmation"):
+            receipt["cleanup_confirmation"] = raw.get("cleanup_confirmation")
+        return receipt
+    return {"account": raw.get("account"), "paired": raw.get("paired"),
+            "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action")}
+
+
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
-    server = FastMCP("GPT Bridge Extension", instructions="Opt-in image generation via one owner-paired ChatGPT tab. No direct HTTP fallback. Check status first; never retry uncertain jobs.")
+    server = FastMCP("gpt-bridge", instructions="Generate or edit one ChatGPT image on this machine. Call status, then generate or edit once, then wait. Open image_path. Do not send the job again.")
 
     @server.tool()
-    def extension_status(job_id: str = "") -> dict:
-        """Check account, cleanup_policy, next_action and saved image receipt. A finished job's image_path, dimensions and sha256 are on that job. next_action is confirm_second_tab when ChatGPT tabs are open but none match the saved pairing. In automatic_saved_chats mode, wait for cleanup_status=deleted; do not ask per image or call confirm_delete. Otherwise confirmation_required needs exact-chat owner approval. Pending cleanup blocks new images. Failure never means regenerate or repeat deletion."""
-        return queue.status(job_id)
+    def status(job_id: str = "") -> dict:
+        """Paired tab, or one job. Returns account, paired, extension_online, next_action. With job_id, returns state and image_path."""
+        return compact_status(queue.status(job_id))
 
     @server.tool()
-    def extension_wait(job_id: str, timeout_seconds: int = 120) -> dict:
-        """Wait until this job is complete or failed, up to 120 seconds. Returns image_path, dimensions, sha256, bytes and cleanup_status. Does not resend or generate again. A timeout leaves the job running; call again."""
+    def wait(job_id: str, timeout_seconds: int = 120) -> dict:
+        """Wait until the job is complete or failed. Returns image_path, dimensions, sha256, bytes. Does not send again. If wait_timed_out is true, call wait again."""
         return queue.wait_for_job(job_id, timeout_seconds)
 
     @server.tool()
-    def extension_image(prompt: str, expected_model: str, mode: Literal["create", "edit"] = "create",
-                        images: list[LocalImageInput] | None = None, preflight_only: bool = False,
-                        clear_preflight_uploads: bool = False) -> dict:
-        """Create/edit ONE image on second, or preflight_only=true to verify actual uploads WITHOUT text insertion, Send or generation. Then call extension_wait(job_id) and open image_path. The tool does not paste the image into chat. Preflight normally preserves the unsent draft. With explicit owner approval, clear_preflight_uploads=true removes ONLY this job's verified uploads after readiness, requiring preflight_clear_uploads capability (protocol 3). create accepts ordered references; edit requires >=1 source. Local static PNG/JPEG/WebP, 8 MiB combined, <=40MP/8192px, no URLs/symlinks. Preserve order/roles. Check status/tab_idle. No retries or model/account parity promises."""
-        return queue.submit(prompt, expected_model, mode, images, preflight_only, clear_preflight_uploads)
+    def generate(prompt: str, images: list[LocalImageInput] | None = None) -> dict:
+        """Create one image. images are optional references. Then call wait with the returned job_id."""
+        return compact_status(queue.submit(prompt, "Create image", "create", images, False, False))
 
     @server.tool()
-    def extension_confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
-        """Legacy per-job confirmation only; not needed when cleanup_policy=automatic_saved_chats. Permanently delete only this saved-image chat after exact-chat owner approval. Pass owner_confirmed=true only after that approval. Single-use: poll status, never retry uncertain deletion."""
-        return queue.confirm_delete(job_id, owner_confirmed)
+    def edit(prompt: str, images: list[LocalImageInput]) -> dict:
+        """Edit one image. images must include one source. Then call wait with the returned job_id."""
+        return compact_status(queue.submit(prompt, "Create image", "edit", images, False, False))
 
     @server.tool()
-    def extension_resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False,
-                          clear_failed_uploads: StrictBool = False, native_upload_names: list[str] | None = None,
-                          recover_outputs: StrictBool = False, recovery_chat_path: str | None = None) -> dict:
-        """Release uncertain work ONLY after inspection. recover_outputs=true with exact recovery_chat_path re-collects the latest failed submitted multiple-image job once; verifies original full prompt/chat and saves every assistant output, preserving chat. Extension 0.1.21 also permits one explicit resume of the known 0.1.20 prompt-wrapper mismatch, with bounded native binding diagnostics. Never resends. Upload cleanup: clear_preflight_uploads removes a failed preflight's uploads; clear_failed_uploads requires all inspected native_upload_names for a normal BEFORE-Send upload failure (numeric duplicate suffixes allowed), keeping that request failed. Actions are mutually exclusive, original client/latest job only. No re-upload, text, Send, new generation or chat deletion. Refuses changed drafts."""
+    def confirm_delete(job_id: str, owner_confirmed: bool = False) -> dict:
+        """Delete one saved chat after the owner approved that exact chat. Not used when cleanup is automatic."""
+        return compact_status(queue.confirm_delete(job_id, owner_confirmed))
+
+    @server.tool()
+    def resolve(job_id: str, inspected_chatgpt: StrictBool = False, clear_preflight_uploads: StrictBool = False,
+                clear_failed_uploads: StrictBool = False, native_upload_names: list[str] | None = None,
+                recover_outputs: StrictBool = False, recovery_chat_path: str | None = None) -> dict:
+        """Stop a stuck job after the ChatGPT tab was inspected. Does not send again."""
         if inspected_chatgpt is not True:
             raise ValueError("inspect ChatGPT before resolving uncertain work")
         if recover_outputs or recovery_chat_path is not None:
-            return queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names, recover_outputs, recovery_chat_path)
+            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names, recover_outputs, recovery_chat_path))
         if clear_failed_uploads or native_upload_names is not None:
-            return queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names)
-        return queue.resolve(job_id, clear_preflight_uploads)
+            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names))
+        return compact_status(queue.resolve(job_id, clear_preflight_uploads))
 
     return server
 
