@@ -31,9 +31,24 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 MAX_IMAGE = 25 * 1024 * 1024
 MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT upload limit.
 TERMINAL = {"complete", "failed", "interrupted"}
+OPEN_CLEANUP = {"pending", "confirmation_required"}
+
+
+def job_occupies_tab(job: dict) -> bool:
+    return job.get("state") not in TERMINAL or job.get("cleanup_status") in OPEN_CLEANUP
+
+
+def short_outputs(raw: dict) -> list | None:
+    outputs = raw.get("outputs")
+    if not isinstance(outputs, list) or len(outputs) < 2:
+        return None
+    fields = ("order", "image_path", "dimensions", "sha256", "bytes")
+    if any(not isinstance(item, dict) for item in outputs):
+        return None
+    return [{key: item.get(key) for key in fields} for item in outputs]
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -139,7 +154,18 @@ class ExtensionClient:
             if not isinstance(result, dict):
                 raise ValueError("invalid worker response")
             return result
-        except (HTTPError, URLError, OSError, ValueError) as from_error:
+        except HTTPError as from_error:
+            detail = ""
+            try:
+                parsed = json.loads(from_error.read(4096))
+                if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                    detail = parsed["error"][:300]
+            except (OSError, ValueError, TypeError, AttributeError):
+                detail = ""
+            if detail:
+                raise ValueError(detail) from from_error
+            raise ValueError("Local extension worker unavailable or request rejected; inspect status before retrying. No automatic retry.") from from_error
+        except (URLError, OSError, ValueError) as from_error:
             raise ValueError("Local extension worker unavailable or request rejected; inspect status before retrying. No automatic retry.") from from_error
 
     def status(self, job_id: str = "") -> dict:
@@ -222,8 +248,8 @@ class ExtensionQueue:
         if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
             raise ValueError("invalid input protocol")
         with self.lock:
-            if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
-                raise ValueError("finish or resolve the current job before pairing again")
+            if any(job_occupies_tab(j) for j in self.jobs.values()):
+                raise ValueError("finish the current job before pairing again; call wait and do not send again")
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
                            "tab_ready": True, "input_protocol": input_protocol}
             return {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
@@ -302,6 +328,8 @@ class ExtensionQueue:
 
     def _next_action(self) -> str:
         """One machine-readable next step. Never includes page content or a tab URL."""
+        if any(job_occupies_tab(job) for job in self.jobs.values()):
+            return "wait"
         if not self.client or time.monotonic() - self.client.get("seen", 0) > 90:
             return "wait_for_extension"
         tabs = self.client.get("chatgpt_tabs", 0)
@@ -315,9 +343,9 @@ class ExtensionQueue:
             return "open_second_tab"
         if receiver == "unavailable" and self.client.get("receiver_error") == "no_receiver":
             return "refresh_paired_tab_once"
-        if self.client.get("tab_ready") is True:
+        if self.client.get("tab_ready") is True or self.client.get("content_receiver") == "available":
             return "submit_via_mcp"
-        return "inspect_tab"
+        return "wait_for_tab"
 
     def _client(self, client_id):
         if not isinstance(client_id, str) or not self.client or not hmac.compare_digest(self.client["client_id"], client_id):
@@ -337,8 +365,9 @@ class ExtensionQueue:
         with self.lock:
             if not self.client or time.monotonic() - self.client["seen"] > 90:
                 raise ValueError("pair a logged-in ChatGPT tab and wait for its heartbeat first")
-            if any(j["state"] not in TERMINAL or j.get("cleanup_status") in {"pending", "confirmation_required"} for j in self.jobs.values()):
-                raise ValueError("one image job at a time; inspect existing job before resubmitting")
+            blocker = next((job for job in self.jobs.values() if job_occupies_tab(job)), None)
+            if blocker:
+                raise ValueError(f"one image job at a time; call wait for {blocker['job_id']}. Do not resolve or send again.")
             inputs = validated_inputs(mode, images)
             if (inputs or mode == "edit") and self.client.get("input_protocol", 0) < 1:
                 raise ValueError("reload the updated extension and paired tab before using local image inputs")
@@ -566,15 +595,22 @@ class ExtensionQueue:
 
     def _receipt(self, job: dict, *, wait_timed_out: bool = False) -> dict:
         output = job.get("outputs")[0] if isinstance(job.get("outputs"), list) and job.get("outputs") else {}
-        return {"job_id": job["job_id"], "state": job["state"],
-                "image_path": job.get("image_path"), "dimensions": job.get("dimensions"),
-                "sha256": job.get("sha256"), "bytes": output.get("bytes"),
-                "cleanup_status": job.get("cleanup_status"), "error": job.get("error"),
-                "submitted": job.get("submitted"), "generated": job.get("generated"),
-                "wait_timed_out": wait_timed_out}
+        receipt = {"job_id": job["job_id"], "state": job["state"],
+                   "image_path": job.get("image_path"), "dimensions": job.get("dimensions"),
+                   "sha256": job.get("sha256"), "bytes": output.get("bytes"),
+                   "cleanup_status": job.get("cleanup_status"), "error": job.get("error"),
+                   "submitted": job.get("submitted"), "generated": job.get("generated"),
+                   "wait_timed_out": wait_timed_out}
+        copied = short_outputs(job)
+        if copied:
+            receipt["outputs"] = copied
+            receipt["output_count"] = len(copied)
+        if job.get("cleanup_confirmation"):
+            receipt["cleanup_confirmation"] = job.get("cleanup_confirmation")
+        return receipt
 
     def wait_for_job(self, job_id: str, timeout_seconds: int = 120) -> dict:
-        """Block until the job is saved or failed. A timeout leaves the job running."""
+        """Block until the image is saved and cleanup has finished, or the job has failed. A timeout leaves the job unchanged."""
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 120:
             raise ValueError("timeout_seconds must be 1..120")
         if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -585,7 +621,7 @@ class ExtensionQueue:
                 job = self.jobs.get(job_id)
                 if not job:
                     raise ValueError("unknown job")
-                if job["state"] in TERMINAL:
+                if job["state"] in TERMINAL and not job_occupies_tab(job):
                     return self._receipt(job)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -832,7 +868,12 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 else:
                     return self.reply(404, {"error": "unknown route"})
                 self.reply(200, result)
-            except (ValueError, KeyError, TypeError, OSError):
+            except ValueError as error:
+                message = str(error)
+                if not message or len(message) > 300:
+                    message = "invalid request or job state; inspect MCP status"
+                self.reply(400, {"error": message})
+            except (KeyError, TypeError, OSError):
                 self.reply(400, {"error": "invalid request or job state; inspect MCP status"})
     return Handler
 
@@ -849,11 +890,21 @@ def compact_status(raw: dict) -> dict:
                    "bytes": output.get("bytes") if isinstance(output, dict) else raw.get("bytes"),
                    "cleanup_status": raw.get("cleanup_status"), "error": raw.get("error"),
                    "wait_timed_out": raw.get("wait_timed_out", False)}
+        copied = short_outputs(raw)
+        if copied:
+            receipt["outputs"] = copied
+            receipt["output_count"] = len(copied)
         if raw.get("cleanup_confirmation"):
             receipt["cleanup_confirmation"] = raw.get("cleanup_confirmation")
         return receipt
-    return {"account": raw.get("account"), "paired": raw.get("paired"),
-            "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action")}
+    brief = {"account": raw.get("account"), "paired": raw.get("paired"),
+             "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action")}
+    jobs = raw.get("jobs") if isinstance(raw.get("jobs"), list) else []
+    open_job = next((job for job in jobs if isinstance(job, dict) and job_occupies_tab(job)), None)
+    if open_job:
+        brief.update(job_id=open_job.get("job_id"), state=open_job.get("state"),
+                     cleanup_status=open_job.get("cleanup_status"))
+    return brief
 
 
 def create_mcp(queue):
@@ -867,7 +918,7 @@ def create_mcp(queue):
 
     @server.tool()
     def wait(job_id: str, timeout_seconds: int = 120) -> dict:
-        """Wait until the job is complete or failed. Returns image_path, dimensions, sha256, bytes. Does not send again. If wait_timed_out is true, call wait again."""
+        """Wait until the image is saved and cleanup has finished, or the job has failed. Returns image_path and every output. If wait_timed_out is true, or cleanup_status is pending or confirmation_required, call wait again. Do not generate or resolve."""
         return queue.wait_for_job(job_id, timeout_seconds)
 
     @server.tool()

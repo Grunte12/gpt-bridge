@@ -751,9 +751,10 @@ test('delete refuses changed prompt, draft, running work, challenge, or unavaila
   }
 });
 
-test('a finished visible assistant image is saved without resending when the conversation region is hidden', async () => {
+test('a finished visible assistant image is saved without resending when its prompt matches', async () => {
   const h = contentHarness({visibleHeadingsOutsideRegion: true, newUi: true, user: true,
-    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: ['unrelated visible text'],
+    conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['Create one image. Return a generated image, not just a description.\n\ndraw a cat'],
     userImageSources: ['https://chatgpt.com/reference.png'],
     assistantImageSources: ['https://chatgpt.com/generated.png']});
   const accepted = await startCollect(h, 'Create image', 'draw a cat', {visible_output_only: true});
@@ -766,6 +767,22 @@ test('a finished visible assistant image is saved without resending when the con
   assert.equal(h.sendClicks, 0);
   assert.equal(h.insertTextCalls, 0);
   assert.equal(h.fetchCalls, 1);
+});
+
+test('a visible finished image from another prompt is not collected', async () => {
+  const h = contentHarness({visibleHeadingsOutsideRegion: true, newUi: true, user: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: ['unrelated visible text'],
+    userImageSources: ['https://chatgpt.com/reference.png'],
+    assistantImageSources: ['https://chatgpt.com/generated.png']});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {visible_output_only: true});
+  assert.equal(accepted?.accepted, true);
+  await waitForContentResult(h);
+
+  const saved = h.sent.find(message => message.type === 'image-result');
+  assert.match(saved?.error || '', /does not match this job's prompt/);
+  assert.equal(saved.imageBase64, undefined);
+  assert.equal(h.fetchCalls, 0);
+  assert.equal(h.sendClicks, 0);
 });
 
 test('visible turn headings outside a hidden conversation region still identify the assistant image', () => {

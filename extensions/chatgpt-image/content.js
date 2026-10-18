@@ -418,7 +418,13 @@
     // No final click without a trusted user click or one job-scoped MCP approval.
     const finalDelete = [...dialog.querySelectorAll("button")].find(button => normalizedText(button.textContent) === "Delete chat");
     let confirmed = false;
-    const confirmation = event => { if (event.isTrusted) confirmed = true; };
+    let clickedAt = 0;
+    const confirmation = event => {
+      if (event.isTrusted) {
+        confirmed = true;
+        clickedAt = clickedAt || Date.now();
+      }
+    };
     finalDelete.addEventListener("click", confirmation, {capture: true});
     try {
       const deadline = Date.now() + 15 * 60 * 1000;
@@ -429,6 +435,8 @@
           if (confirmed) return {deleted: true};
           throw new Error("Chat changed without deletion confirmation; inspect it before further cleanup");
         }
+        if (confirmed && clickedAt && Date.now() - clickedAt >= 20000)
+          throw new Error("Deletion did not leave this chat; saved image is safe, do not repeat automatically");
         if (!confirmed && !visible(dialog)) throw new Error("Deletion was not confirmed; inspect this chat before any further cleanup");
         if (!confirmed && Date.now() - checkedConfirmation >= 2500) {
           checkedConfirmation = Date.now();
@@ -439,6 +447,7 @@
               throw new Error("Approved deletion dialog changed; nothing was clicked");
             idleEditor();
             confirmed = true;
+            clickedAt = Date.now();
             finalDelete.click();
           }
         }
@@ -463,25 +472,21 @@
         throw new Error("Invalid inspected cleanup resume");
       const prompt = jobPrompt(job);
       if (collectOnly) {
-        if (job.visible_output_only === true) {
-          if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
-            throw new Error("Wrong site or model; existing image was not collected");
-          if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 ||
-              turnHeadings("ChatGPT said:").length !== 1 || !outputImages().length)
-            throw new Error("Finished assistant image is not visible; nothing was submitted");
-        } else {
-          if (job.output_binding_revision !== undefined && job.output_binding_revision !== 2)
-            throw new Error("Unsupported output prompt binding revision; image was not collected");
-          if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
-            throw new Error("Wrong site or model; existing image was not collected");
-          if (job.collect_only && location.pathname !== job.recovery_chat_path)
-            throw new Error("Existing result chat does not match this inspected job; nothing was submitted");
-          if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 || turnHeadings("ChatGPT said:").length !== 1)
-            throw new Error("Inspect the completed single-turn conversation before collecting; nothing was submitted");
-          promptBinding = originalPromptBinding(job);
-          if (typeof job.prompt !== "string" || (!promptBinding.root_match && !promptBinding.exact_matching_descendant_count))
-            throw new Error("Existing conversation does not match this job's prompt; image was not collected");
-        }
+        if (job.output_binding_revision !== undefined && job.output_binding_revision !== 2)
+          throw new Error("Unsupported output prompt binding revision; image was not collected");
+        if (location.origin !== "https://chatgpt.com" || job.expected_model !== "Create image")
+          throw new Error("Wrong site or model; existing image was not collected");
+        if (job.collect_only && location.pathname !== job.recovery_chat_path)
+          throw new Error("Existing result chat does not match this inspected job; nothing was submitted");
+        if (verificationRequired() || busy() || turnHeadings("You said:").length !== 1 ||
+            turnHeadings("ChatGPT said:").length !== 1 ||
+            (job.visible_output_only === true && !outputImages().length))
+          throw new Error(job.visible_output_only === true
+            ? "Finished assistant image is not visible; nothing was submitted"
+            : "Inspect the completed single-turn conversation before collecting; nothing was submitted");
+        promptBinding = originalPromptBinding(job);
+        if (typeof job.prompt !== "string" || (!promptBinding.root_match && !promptBinding.exact_matching_descendant_count))
+          throw new Error("Existing conversation does not match this job's prompt; image was not collected");
       } else {
         const inputJob = job.preflight_cleanup_only === true ? bindInspectedPreflight(job) : job;
         if (job.preflight_cleanup_only !== true)

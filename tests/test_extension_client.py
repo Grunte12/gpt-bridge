@@ -273,6 +273,20 @@ def test_extension_client_failure_is_single_attempt_and_never_retried(monkeypatc
     assert len(calls) == 1
 
 
+def test_client_reports_the_worker_error_for_an_unknown_job():
+    from urllib.error import HTTPError
+
+    client = ExtensionClient(TOKEN)
+
+    class FakeHTTP:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 400, "bad request", {}, io.BytesIO(b'{"error": "unknown job"}'))
+
+    client.http = FakeHTTP()
+    with pytest.raises(ValueError, match="^unknown job$"):
+        client.status("a" * 32)
+
+
 def test_client_opener_disables_redirects_and_environment_proxies(monkeypatch):
     captured = []
     monkeypatch.setattr("chatgpt_api.extension_bridge.build_opener", lambda *handlers: captured.extend(handlers))

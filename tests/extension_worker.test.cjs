@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.29 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.29');
+test('0.1.30 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.30');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -881,6 +881,26 @@ test('a claimed job saves a finished visible assistant image without sending aga
   assert.equal(collects[0].message.job.visible_output_only, true);
   assert.equal(h.tabMessages.some(call => call.message.type === 'image-job' || call.message.type === 'image-prepare'), false);
   assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+});
+
+test('a claimed preflight or recovery does not auto-collect a finished page', async () => {
+  for (const job of [
+    {job_id: 'job-1', prompt: 'draw', expected_model: 'Create image', mode: 'create', preflight_only: true},
+    {job_id: 'job-1', prompt: 'draw', expected_model: 'Create image', mode: 'create', collect_only: true}
+  ]) {
+    const h = harness({
+      inspection: {fresh: false, error: 'Existing conversation preserved; inspect its job result instead of submitting again',
+        input_protocol: 4, idle: false, result_dom: resultDom({assistant_images: 1, conversation_images: 2})},
+      active: {jobId: 'job-1', tabId: 7, job},
+      state: {state: 'claimed', job_id: 'job-1'}
+    });
+    Object.assign(h.storage, {config: {token: 'synthetic-token', clientId: 'saved-client', tabId: 7, account: 'second'}});
+    h.fireAlarm();
+    for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-collect'), false);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+  }
 });
 
 test('a URL-redacted paired tab is checked through its content script before claiming', async () => {

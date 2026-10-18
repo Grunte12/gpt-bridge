@@ -274,7 +274,8 @@ async function poll() {
       if (finishing) return;
       if (!["complete", "failed", "interrupted"].includes(state.state)) {
         const alreadyRunning = typeof ready.error === "string" && ready.error.startsWith("Content worker already running");
-        if (!alreadyRunning && available && pageHasFinishedOutput(ready) && active.visibleOutputSaved !== true) {
+        if (!alreadyRunning && available && pageHasFinishedOutput(ready) && active.visibleOutputSaved !== true &&
+            active.job?.preflight_only !== true && active.job?.collect_only !== true) {
           active.visibleOutputSaved = true;
           await chrome.storage.local.set({active});
           try {

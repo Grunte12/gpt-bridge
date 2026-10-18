@@ -11,7 +11,8 @@ Use the `gpt-bridge` MCP. Account is `second`.
 
 1. `status`. Need `paired=true` and `extension_online=true`.
 2. `generate(prompt, images)` or `edit(prompt, images)` once.
-3. `wait(job_id)`. Open `image_path`. If `wait_timed_out` is true, call `wait` again.
+3. `wait(job_id)`. Open `image_path`. If `wait_timed_out` is true, or `cleanup_status` is `pending` or `confirmation_required`, call `wait` again. Do not generate again until cleanup is `deleted`, `failed`, `preserved`, or `not_requested`.
+`next_action=wait` means call `wait` on the returned `job_id`. `next_action=submit_via_mcp` means call `generate` or `edit` once. `next_action=wait_for_tab` means the paired tab is not connected. Do not call `resolve` for `wait` or `wait_for_tab`.
 
 Do not send the job again. `edit` needs one source image. `generate` images are optional references.
 

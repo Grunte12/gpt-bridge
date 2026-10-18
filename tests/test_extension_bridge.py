@@ -11,7 +11,9 @@ import uuid
 import pytest
 from PIL import Image
 
-from chatgpt_api.extension_bridge import ExtensionQueue, MAX_IMAGE, create_mcp, main, make_handler
+from chatgpt_api.extension_bridge import (
+    ExtensionQueue, MAX_IMAGE, compact_status, create_mcp, main, make_handler,
+)
 
 
 ACCOUNT = "second"
@@ -423,6 +425,13 @@ def test_tab_recovery_reports_one_next_action_without_adopting_a_count_as_identi
     )
     assert rebound["next_action"] == "submit_via_mcp"
     assert rebound["extension_diagnostics"]["tab_recovery"] == "rebound"
+    existing = queue.heartbeat(
+        CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, input_protocol=4, worker_version="0.1.30",
+        content_receiver="available", tab_recovery="rebound", chatgpt_tabs=1,
+        tab_error="Existing conversation preserved; inspect its job result instead of submitting again",
+    )
+    assert existing["tab_ready"] is False
+    assert existing["next_action"] == "submit_via_mcp"
 
     for bad in ({"tab_recovery": "adopted"}, {"tab_recovery": "https://chatgpt.com/"}, {"chatgpt_tabs": -1},
                 {"chatgpt_tabs": 21}, {"chatgpt_tabs": True}):
@@ -598,6 +607,63 @@ def test_wait_returns_saved_image_receipt_and_timeout_leaves_the_job_running(tmp
     assert receipt["sha256"] == digest
     assert receipt["bytes"] > 0
     assert "prompt" not in receipt
+
+
+def test_wait_stays_open_until_cleanup_finishes(tmp_path):
+    import threading
+
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("Draw a green pear.", "Create image")["job_id"]
+    queue.claim(CLIENT_ID)
+    image, _raw = _png_base64()
+    queue.result(CLIENT_ID, job_id, image_base64=image, chat_path=RESULT_CHAT_PATH, cleanup_pending=True)
+
+    waiting = queue.wait_for_job(job_id, timeout_seconds=1)
+    assert waiting["state"] == "complete"
+    assert waiting["cleanup_status"] == "pending"
+    assert waiting["wait_timed_out"] is True
+    assert waiting["image_path"].endswith("/image.png")
+
+    box = {}
+
+    def wait():
+        box["receipt"] = queue.wait_for_job(job_id, timeout_seconds=2)
+
+    def finish():
+        queue.cleanup(CLIENT_ID, job_id, "confirmation_required")
+        queue.cleanup(CLIENT_ID, job_id, "deleted")
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    threading.Timer(0.05, finish).start()
+    thread.join(3)
+    assert thread.is_alive() is False
+    assert box["receipt"]["cleanup_status"] == "deleted"
+    assert box["receipt"]["wait_timed_out"] is False
+
+
+def test_open_job_status_says_wait_and_names_that_job(tmp_path):
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("Draw a green pear.", "Create image")["job_id"]
+
+    status = queue.status()
+    assert status["next_action"] == "wait"
+    brief = compact_status(status)
+    assert brief["next_action"] == "wait"
+    assert brief["job_id"] == job_id
+    assert brief["state"] == "queued"
+    assert "jobs" not in brief
+    assert "extension_diagnostics" not in brief
+    with pytest.raises(ValueError, match=f"call wait for {job_id}"):
+        queue.submit("Do not start another image.", "Create image")
+
+
+def test_unknown_job_error_is_the_worker_message(tmp_path):
+    queue = _paired_queue(tmp_path)
+    handler = make_handler(queue, TOKEN, 8767)
+    status, body = _call_post(handler, "/agent/status", {"job_id": "a" * 32}, origin="")
+    assert status == 400
+    assert body == {"error": "unknown job"}
 
 
 def test_claim_is_at_most_once_and_public_status_hides_private_fields(tmp_path):
@@ -1491,7 +1557,7 @@ def test_cleanup_blocks_new_submit_and_pair_until_resolved(tmp_path, blocked_sta
         queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
     with pytest.raises(ValueError, match="one image job at a time"):
         queue.submit("No concurrent job.", "Create image")
-    with pytest.raises(ValueError, match="finish or resolve"):
+    with pytest.raises(ValueError, match="finish the current job"):
         queue.pair(str(uuid.uuid4()), ACCOUNT)
 
 
