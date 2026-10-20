@@ -39,7 +39,20 @@
   const assistantBody = () => assistants().at(-1) || turnHeadings("ChatGPT said:").at(-1)?.nextElementSibling || null;
   const displayedImages = root => root ? [...root.querySelectorAll("img")].filter(img =>
     visible(img) && img.complete && img.naturalWidth >= 512 && img.naturalHeight >= 512) : [];
-  const outputImages = () => [...new Map(displayedImages(assistantBody()).map(img => [img.currentSrc || img.src, img])).values()];
+  // The image can render outside the heading's next sibling (seen live: image in the conversation, none in that sibling).
+  // Fall back to conversation images between the last "ChatGPT said:" heading and any later "You said:" heading,
+  // so uploads (earlier or newer user turn) and images of earlier turns stay excluded.
+  function imagesAfterAssistantHeading() {
+    const heading = turnHeadings("ChatGPT said:").at(-1);
+    if (!heading) return [];
+    const follows = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const nextUser = turnHeadings("You said:").find(user => follows(heading, user));
+    return displayedImages(conversation()).filter(img => follows(heading, img) && !(nextUser && follows(nextUser, img)));
+  }
+  const outputImages = () => {
+    const direct = displayedImages(assistantBody());
+    return [...new Map((direct.length ? direct : imagesAfterAssistantHeading()).map(img => [img.currentSrc || img.src, img])).values()];
+  };
   function resultDomDiagnostics() {
     return {assistant_role_nodes: assistants().length, user_headings: turnHeadings("You said:").length,
       assistant_headings: turnHeadings("ChatGPT said:").length, assistant_body_found: !!assistantBody(),

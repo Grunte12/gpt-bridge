@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -39,8 +39,15 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   let assistantImageQueries = 0;
   const fetchedUrls = [];
   const defaultImageSource = 'https://chatgpt.com/generated.png';
+  // Document order: heading i sits at i * 10; an image sits just after its turn's heading unless imagePositions says otherwise.
+  const headingPosition = text => {
+    const turns = currentConversationTurns();
+    return (text === 'You said:' ? turns.indexOf(text) : turns.lastIndexOf(text)) * 10;
+  };
+  const imagePosition = source => source in imagePositions ? imagePositions[source] :
+    headingPosition(userImageSources.includes(source) ? 'You said:' : 'ChatGPT said:') + 1;
   const toDisplayedImage = source => ({src: source, currentSrc: source, complete: true,
-    naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}]});
+    naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}], get documentPosition() { return imagePosition(source); }});
   const baseAssistantSources = assistantImageSources === null
     ? (imageReady ? [defaultImageSource] : []) : assistantImageSources;
   const userImages = userImageSources.map(toDisplayedImage);
@@ -84,7 +91,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       getClientRects: () => [{}]});
   }
   const allConversationImages = (conversationImageSources === null
-    ? [...userImageSources, ...baseAssistantSources] : conversationImageSources).map(toDisplayedImage);
+    ? [...userImageSources, ...baseAssistantSources, ...outsideAssistantSources] : conversationImageSources).map(toDisplayedImage);
   const currentAssistantImages = () => {
     if (assistantImageSequence) {
       const index = Math.min(assistantImageQueries, assistantImageSequence.length - 1);
@@ -305,6 +312,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
         },
         getClientRects: () => [{}]
       },
+      documentPosition: index * 10,
+      compareDocumentPosition: node => node.documentPosition > index * 10 ? 4 : 2, // 4 = FOLLOWING, 2 = PRECEDING
       getClientRects: () => visibleHeadingsOutsideRegion ? [] : [{}]
     }));
     return [];
@@ -392,7 +401,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     }
   }};
   const context = {
-    chrome, document, location,
+    chrome, document, location, Node: {DOCUMENT_POSITION_FOLLOWING: 4},
     sessionStorage: {store: {}, getItem(key) { return this.store[key] ?? null; }, setItem(key, value) { this.store[key] = String(value); }},
     HTMLTextAreaElement: Textarea, Event: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     InputEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
@@ -1058,6 +1067,62 @@ test('inspection separates two user-upload references from one adjacent assistan
     assistant_images: 1, conversation_images: 3, busy: false,
     chat_path: '/c/123e4567-e89b-12d3-a456-426614174000'
   });
+});
+
+test('an output image outside the heading sibling is found; user uploads are still excluded', () => {
+  const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['submitted prompt', 'assistant reply'], assistantImageSources: [],
+    userImageSources: ['https://chatgpt.com/reference-1.png'],
+    outsideAssistantSources: ['https://chatgpt.com/output-elsewhere.png']});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.assistant_images, 1);
+  assert.equal(result.result_dom.conversation_images, 2);
+});
+
+test('only uploads and no output image still reports zero assistant images', () => {
+  const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['submitted prompt', 'assistant reply'], assistantImageSources: [],
+    userImageSources: ['https://chatgpt.com/reference-1.png', 'https://chatgpt.com/reference-2.png']});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.assistant_images, 0);
+});
+
+test('the fallback skips uploads in a user turn rendered after the assistant heading', () => {
+  const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:', 'You said:'],
+    conversationBodies: ['first prompt', 'assistant reply', 'second prompt'], assistantImageSources: [],
+    userImageSources: ['https://chatgpt.com/later-reference.png'],
+    imagePositions: {'https://chatgpt.com/later-reference.png': 21}});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.assistant_images, 0);
+  assert.equal(result.result_dom.conversation_images, 1);
+});
+
+test('the fallback skips an earlier turn image when a later assistant heading has none', () => {
+  const old = 'https://chatgpt.com/earlier-output.png';
+  const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:', 'You said:', 'ChatGPT said:'],
+    conversationBodies: ['first prompt', 'first reply', 'second prompt', 'second reply'], assistantImageSources: [],
+    outsideAssistantSources: [old], imagePositions: {[old]: 11}});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.assistant_images, 0);
+  assert.equal(result.result_dom.conversation_images, 1);
+});
+
+test('generation captures an output rendered outside the assistant heading sibling, not the references', async () => {
+  const output = 'https://chatgpt.com/output-elsewhere.png';
+  const references = ['https://chatgpt.com/uploaded-reference-1.png'];
+  const h = contentHarness({conversationTurnsAfterSend: true, assistantImageSources: [],
+    outsideAssistantSources: [output], userImageSources: references});
+  await startContent(h, {job_id: 'job-outside-sibling', expected_model: 'Create image', mode: 'create',
+    prompt: 'use this reference', images: [imageInput(1)]});
+  await waitForContentResult(h);
+
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.deepEqual(h.fetchedUrls, [output]);
 });
 
 test('generation collects the last adjacent assistant body, not the two reference images in the user turn', async () => {
