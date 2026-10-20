@@ -261,7 +261,7 @@ async function poll() {
         }
       }
     }
-    await request(config, "/heartbeat", heartbeatFields(config, {
+    const beat = await request(config, "/heartbeat", heartbeatFields(config, {
       tab_ready: ready.fresh === true && ready.model === "Create image",
       input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0,
       tab_idle: typeof ready.idle === "boolean" ? ready.idle : null,
@@ -269,6 +269,8 @@ async function poll() {
       content_receiver: contentReceiver, receiver_error: receiverError, tab_recovery: tabRecovery, chatgpt_tabs: chatgptTabs,
       upload_dom: uploadDomDiagnostic(ready.upload_dom), result_dom: resultDomDiagnostic(ready.result_dom),
       prompt_dom: promptDomDiagnostic(ready.prompt_dom)}));
+    // The bridge only asks for this while no job holds the tab, so the owner never reloads by hand.
+    if (!active && beat?.next_action === "reload_extension" && chrome.runtime.reload) { chrome.runtime.reload(); return; }
     if (active) {
       const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
