@@ -2390,3 +2390,103 @@ def test_old_running_extension_is_told_to_reload(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_installed_version_by_default(monkeypatch):
     monkeypatch.setattr("chatgpt_api.extension_bridge.repo_extension_version", lambda: None)
+
+
+def test_reload_request_is_delivered_once_to_an_idle_worker(tmp_path):
+    queue = _paired_queue(tmp_path)
+    assert queue.request_reload()["next_action"] == "reload_extension"
+    assert queue.status()["reload_requested"] is True
+    first = queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, input_protocol=4, content_receiver="available")
+    assert first["next_action"] == "reload_extension"
+    second = queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, input_protocol=4, content_receiver="available")
+    assert second["next_action"] != "reload_extension"
+    assert second["reload_requested"] is False
+
+
+def test_reload_request_survives_a_heartbeat_sent_while_a_result_is_saved(tmp_path):
+    queue = _paired_queue(tmp_path)
+    queue.request_reload()
+    queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=False)  # Worker's finishing branch ignores the reply.
+    assert queue.reload_requested is True
+
+
+def test_reload_request_waits_while_a_job_holds_the_tab(tmp_path):
+    queue = _paired_queue(tmp_path)
+    queue.submit("Generate one image now: a plain wooden desk", "Create image")
+    queue.claim(CLIENT_ID)
+    queue.request_reload()
+    held = queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, input_protocol=4, content_receiver="available")
+    assert held["next_action"] == "wait"
+    assert queue.reload_requested is True
+
+
+def test_reload_request_is_refused_while_the_extension_is_offline(tmp_path):
+    queue = ExtensionQueue(tmp_path / "extension-data", ACCOUNT)
+    with pytest.raises(ValueError, match="wait_for_extension"):
+        queue.request_reload()
+    assert queue.reload_requested is False
+
+
+def test_reload_route_requires_the_token(tmp_path):
+    queue = _paired_queue(tmp_path)
+    handler = make_handler(queue, TOKEN, 8767)
+    assert _call_post(handler, "/agent/reload", {}, token="wrong", origin="")[0] == 401
+    assert queue.reload_requested is False
+    status, body = _call_post(handler, "/agent/reload", {}, origin="")
+    assert status == 200 and body["reload_requested"] is True
+
+
+def _reload_script():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "reload_extension", Path(__file__).resolve().parent.parent / "scripts" / "reload-extension.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeClient:
+    def __init__(self, statuses, reload_error=None):
+        self.statuses, self.reload_error, self.calls = list(statuses), reload_error, []
+
+    def call(self, action, data):
+        self.calls.append(action)
+        if action == "reload":
+            if self.reload_error:
+                raise ValueError(self.reload_error)
+            return {"reload_requested": True}
+        return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+
+
+def _script_status(version="1.0", pending=False, next_action="submit_via_mcp"):
+    return {"installed_extension_version": "1.0", "reload_requested": pending, "next_action": next_action,
+            "extension_diagnostics": {"worker_version": version}}
+
+
+def _run_script(client, wait=90):
+    clock = iter(range(0, 10000, 3))
+    return _reload_script().reload_and_wait(client, wait, poll=lambda _s: None, now=lambda: next(clock))
+
+
+def test_reload_script_reports_only_delivery_when_the_version_is_unchanged():
+    code, message = _run_script(_FakeClient([_script_status(), _script_status(pending=True), _script_status()]))
+    assert code == 0 and "took the reload order" in message and "not confirmed" in message
+
+
+def test_reload_script_confirms_a_reload_by_the_new_version():
+    code, message = _run_script(_FakeClient([_script_status("0.9"), _script_status("0.9"), _script_status("1.0")]))
+    assert code == 0 and message.startswith("reloaded: Chrome now runs 1.0")
+
+
+def test_reload_script_reports_a_pending_reload_behind_a_job():
+    code, message = _run_script(_FakeClient([_script_status(pending=True, next_action="wait")]), wait=9)
+    assert code == 1 and "still pending" in message and "job holds the tab" in message
+
+
+def test_reload_script_names_an_old_worker_and_offline_refusal():
+    old = _FakeClient([_script_status()], reload_error="unknown route")
+    assert _run_script(old) == (1, _reload_script().OLD_WORKER)
+    offline = _FakeClient([_script_status()], reload_error="reload not requested: next_action is wait_for_extension")
+    assert _run_script(offline) == (1, "reload not requested: next_action is wait_for_extension")
+    assert _run_script(_FakeClient([_script_status()]), wait=0)[0] == 0

@@ -245,6 +245,7 @@ class ExtensionQueue:
         self.lock = threading.RLock()
         self.finished = threading.Condition(self.lock)
         self.client = None
+        self.reload_requested = False  # One-shot: the next idle heartbeat tells the worker to reload itself.
         self.halted_job: str | None = None  # Line stops here until the owner inspects ChatGPT and calls resolve.
         self.jobs: dict[str, dict] = {}
         for path in self.root.glob("*/state.json"):
@@ -378,7 +379,20 @@ class ExtensionQueue:
                                upload_dom=dict(upload_dom) if upload_dom is not None else None,
                                result_dom=dict(result_dom) if result_dom is not None else None,
                                prompt_dom=json.loads(json.dumps(prompt_dom)) if prompt_dom is not None else None)
-            return self.status()
+            reply = self.status()
+            # Delivered once. A heartbeat sent while a result is being saved reports "unreported" and its reply is ignored.
+            if reply["next_action"] == "reload_extension" and content_receiver != "unreported":
+                self.reload_requested = False
+            return reply
+
+    def request_reload(self) -> dict:
+        """Ask the worker to reload the extension at its next idle heartbeat. Never touches jobs."""
+        with self.lock:
+            action = self._next_action()
+            if action in {"wait_for_extension", "inspect_halted_job"}:
+                raise ValueError(f"reload not requested: next_action is {action}")
+            self.reload_requested = True
+            return {"reload_requested": True, "next_action": self._next_action()}
 
     def _next_action(self) -> str:
         """One machine-readable next step. Never includes page content or a tab URL."""
@@ -389,8 +403,8 @@ class ExtensionQueue:
         if not self.client or time.monotonic() - self.client.get("seen", 0) > 90:
             return "wait_for_extension"
         running, installed = self.client.get("worker_version"), repo_extension_version()
-        if running and installed and running != installed:
-            return "reload_extension"  # Chrome still runs the old files: owner reloads it once.
+        if self.reload_requested or (running and installed and running != installed):
+            return "reload_extension"  # Chrome still runs the old files (or a reload was requested): the worker reloads when idle.
         tabs = self.client.get("chatgpt_tabs", 0)
         recovery = self.client.get("tab_recovery", "none")
         receiver = self.client.get("content_receiver", "unreported")
@@ -775,6 +789,7 @@ class ExtensionQueue:
                         "tab_idle": self.client.get("tab_idle") if self.client else None,
                         "tab_error": self.client.get("tab_error", "") if self.client else "",
                         "next_action": self._next_action(),
+                        "reload_requested": self.reload_requested,
                         "installed_extension_version": repo_extension_version(),
                         "line_halted": self.halted_job,
                         "queue_depth": sum(1 for j in self.jobs.values() if job_occupies_tab(j)),
@@ -998,6 +1013,8 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                     result = queue.submit(**data)
                 elif self.path == "/agent/confirm-delete":
                     result = queue.confirm_delete(**data)
+                elif self.path == "/agent/reload":
+                    result = queue.request_reload()
                 elif self.path == "/agent/resolve":
                     if data.get("inspected_chatgpt") is not True:
                         raise ValueError("inspect ChatGPT before resolving uncertain work")
