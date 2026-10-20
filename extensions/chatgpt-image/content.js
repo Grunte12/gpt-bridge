@@ -344,6 +344,11 @@
     }
     throw new Error(detail + ". Nothing was submitted.");
   }
+  async function reportPhase(job, phase, chatPath = "") {
+    const receipt = await chrome.runtime.sendMessage({type: "image-phase", jobId: job.job_id, phase,
+      ...(chatPath ? {chatPath} : {})});
+    if (receipt?.error) throw new Error("Durable lifecycle receipt failed; inspect ChatGPT and do not retry");
+  }
   async function prepare(job) {
     if (job?.expected_model !== "Create image") throw new Error("Native image mode is Create image");
     // React may briefly unmount the composer just after an image completes.
@@ -525,14 +530,21 @@
         // and every upload once more before the synchronous final click.
         inspect(job);
         if (!visible(send) || send.disabled) throw new Error("Native send control changed; not submitted");
-        submitted = true;  // From here an uncertain result MUST NOT be retried.
+        submitted = true;  // Persist uncertainty before the click. From here, never replay.
+        await reportPhase(job, "submit_attempted");
         send.click();
       }
       const deadline = Date.now() + 15 * 60 * 1000;
       let previous = "", stable = 0;
+      let remoteStarted = collectOnly;
       while (Date.now() < deadline) {
         await sleep(2500);
         if (verificationRequired()) throw new Error("Owner action required: complete verification and inspect ChatGPT before any new request.");
+        const livePath = /^\/c\/[a-f0-9-]{36}$/.test(location.pathname) ? location.pathname : "";
+        if (!remoteStarted && livePath && (busy() || hasTurns() || assistants().length || outputImages().length)) {
+          await reportPhase(job, "remote_started", livePath);
+          remoteStarted = true;
+        }
         const images = outputImages();
         if (!images.length || busy()) { stable = 0; continue; }
         if (images.length > 4) throw new Error("More than four assistant images; preserve chat and inspect outputs");
@@ -562,6 +574,13 @@
         }
         if (path !== location.pathname || busy() || JSON.stringify(outputImages().map(img => img.currentSrc || img.src)) !== signature)
           throw new Error("Existing result changed during collection; preserve chat and do not regenerate");
+        if (!collectOnly) {
+          if (!remoteStarted) {
+            await reportPhase(job, "remote_started", path);
+            remoteStarted = true;
+          }
+          await reportPhase(job, "result_captured", path);
+        }
         cleanupTarget = job.preserve_chat || outputs.length > 1 ? null : {jobId: job.job_id, path, prompt};
         const result = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
           ...(outputs.length === 1 ? {imageBase64: outputs[0]} : {imagesBase64: outputs}), chatPath: path,

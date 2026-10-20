@@ -438,6 +438,7 @@ def test_queue_snapshot_names_are_unique_per_job_and_preserve_digest_bytes(tmp_p
     assert base64.b64decode(first_claim["images"][0]["data_base64"]) == first_raw
     assert first_claim["images"][0]["sha256"] == first_image["sha256"]
     queue.result(CLIENT_ID, first["job_id"], error="finish the first snapshot test job")
+    queue.resolve(first["job_id"])
 
     second_raw = _write_image(source, color=(20, 160, 70))
     second = queue.submit("Use the second source snapshot.", "Create image", images=[

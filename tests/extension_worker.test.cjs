@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.30 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.30');
+test('0.1.31 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.31');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -187,7 +187,7 @@ test('pair binds only the confirmed second account to the actual ChatGPT tab', a
   const result = await send(h, pairing());
   assert.equal(result.ok, true);
   assert.ok(h.tabLookups.length >= 1 && h.tabLookups.every(id => id === 7));
-  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', account: 'second', visible_model: 'Create image', input_protocol: 2});
+  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', account: 'second', visible_model: 'Create image', input_protocol: 2, tab_id: 7});
   assert.equal(h.storage.config.account, 'second');
   assert.equal(h.storage.config.tabId, 7);
   assert.ok(h.alarms.some(args => args[0] === 'poll'));
@@ -2055,4 +2055,24 @@ test('collect-existing requires the paired current tab and a claimed job', async
     assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['state']);
     assert.equal(h.tabMessages.length, 0);
   });
+});
+
+test('lifecycle receipts are forwarded only from the exact paired active tab', async () => {
+  const active = {jobId: 'job-1', tabId: 7, phase: 'prepared'};
+  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+  const h = harness({active, responses: {phase: {phase: 'submit_attempted'}}});
+  Object.assign(h.storage, {active, config});
+
+  const rejected = await send(h, {type: 'image-phase', jobId: 'job-1', phase: 'submit_attempted'},
+    {tab: {id: 8}, url: 'https://chatgpt.com/'});
+  assert.match(rejected.error, /exact paired job\/tab/);
+  assert.equal(h.requests.length, 0);
+
+  const accepted = await send(h, {type: 'image-phase', jobId: 'job-1', phase: 'submit_attempted'},
+    {tab: {id: 7}, url: 'https://chatgpt.com/'});
+  assert.equal(accepted.ok, true);
+  assert.equal(h.requests[0].url.endsWith('/phase'), true);
+  assert.deepEqual(h.requests[0].body, {client_id: 'client', job_id: 'job-1',
+    phase: 'submit_attempted', tab_id: 7});
+  assert.equal(h.storage.active.phase, 'submit_attempted');
 });

@@ -71,7 +71,7 @@ function scheduleSoon() {
 function heartbeatFields(config, fields) {
   const recovery = ["none", "rebound", "unmatched"].includes(fields.tab_recovery) ? fields.tab_recovery : "none";
   const tabs = Number.isInteger(fields.chatgpt_tabs) && fields.chatgpt_tabs >= 0 ? Math.min(fields.chatgpt_tabs, 20) : 0;
-  return {client_id: config.clientId, account: config.account, visible_model: "Create image",
+  return {client_id: config.clientId, account: config.account, visible_model: "Create image", tab_id: config.tabId,
     worker_version: workerVersion, ...fields, tab_recovery: recovery, chatgpt_tabs: tabs};
 }
 async function findPairedTab(config) {
@@ -400,7 +400,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const config = {token, tabId: message.tabId,
         clientId: saved?.account === "second" && typeof saved.clientId === "string" ? saved.clientId : crypto.randomUUID(), account: "second"};
       await request(config, "/pair", {client_id: config.clientId, account: config.account, visible_model: ready.model,
-        input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0});
+        input_protocol: [1, 2, 3, 4].includes(ready.input_protocol) ? ready.input_protocol : 0, tab_id: config.tabId});
       await chrome.storage.local.set({config});
       try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
       resumePolling = true;
@@ -449,6 +449,17 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         ? "บันทึกและตรวจไฟล์แล้ว กำลังลบแชตของงานนี้ตามนโยบายอัตโนมัติ"
         : "บันทึกไฟล์ภาพแล้ว ให้เอเจนต์ขอยืนยันจากคุณก่อนลบแชทผ่าน MCP");
       return {ok: true};
+    }
+    if (message.type === "image-phase") {
+      const {config, active} = await chrome.storage.local.get(["config", "active"]);
+      if (!config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
+          new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId)
+        throw new Error("Lifecycle receipt is not from the exact paired job/tab");
+      const result = await request(config, "/phase", {client_id: config.clientId, job_id: active.jobId,
+        phase: message.phase, tab_id: config.tabId, ...(message.chatPath ? {chat_path: message.chatPath} : {})});
+      active.phase = result.phase;
+      await chrome.storage.local.set({active});
+      return {ok: true, phase: result.phase};
     }
     if (message.type === "image-result") {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);

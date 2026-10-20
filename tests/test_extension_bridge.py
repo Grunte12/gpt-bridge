@@ -654,8 +654,7 @@ def test_open_job_status_says_wait_and_names_that_job(tmp_path):
     assert brief["state"] == "queued"
     assert "jobs" not in brief
     assert "extension_diagnostics" not in brief
-    with pytest.raises(ValueError, match=f"call wait for {job_id}"):
-        queue.submit("Do not start another image.", "Create image")
+    assert queue.submit("Waits in line.", "Create image")["queue_position"] == 2
 
 
 def test_unknown_job_error_is_the_worker_message(tmp_path):
@@ -1044,6 +1043,7 @@ def test_output_recovery_requires_latest_failure_and_no_other_active_work(tmp_pa
     assert queue.status(other["job_id"])["state"] == "queued"
 
     queue, job_id, *_ = _failed_multiple_output_job(tmp_path / "older-failure")
+    queue.halted_job = None  # owner inspected the line; the failed job stays recoverable
     newer = queue.submit("Later independent job.", "Create image")
     queue.claim(CLIENT_ID)
     image_base64, _raw = _generated_png_base64((30, 50, 70))
@@ -1555,8 +1555,9 @@ def test_cleanup_blocks_new_submit_and_pair_until_resolved(tmp_path, blocked_sta
                  cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
     if blocked_state == "confirmation_required":
         queue.cleanup(CLIENT_ID, submitted["job_id"], "confirmation_required")
-    with pytest.raises(ValueError, match="one image job at a time"):
-        queue.submit("No concurrent job.", "Create image")
+    waiting = queue.submit("Waits behind the cleanup.", "Create image")
+    assert queue.claim(CLIENT_ID) == {}  # the tab is still busy cleaning up
+    assert queue.status(waiting["job_id"])["queue_position"] == 2
     with pytest.raises(ValueError, match="finish the current job"):
         queue.pair(str(uuid.uuid4()), ACCOUNT)
 
@@ -1687,8 +1688,31 @@ def test_submit_enforces_prompt_exact_native_model_and_single_active_job_limits(
 
     job = queue.submit("Draw one image.", "Create image")
     assert job["expected_model"] == "Create image"
-    with pytest.raises(ValueError, match="one image job at a time"):
-        queue.submit("A second image.", "Create image")
+    second = queue.submit("A second image.", "Create image")
+    assert second["queue_position"] == 2
+
+
+def test_jobs_run_first_in_first_out_one_at_a_time(tmp_path):
+    queue = _paired_queue(tmp_path)
+    first = queue.submit("First.", "Create image")
+    second = queue.submit("Second.", "Create image")
+    third = queue.submit("Third.", "Create image")
+    assert [queue.status(j["job_id"])["queue_position"] for j in (first, second, third)] == [1, 2, 3]
+    assert queue.claim(CLIENT_ID)["job_id"] == first["job_id"]
+    assert queue.claim(CLIENT_ID) == {}  # first is still running
+    assert queue.status(second["job_id"])["queue_position"] == 2
+    image_base64, _ = _png_base64()
+    queue.result(CLIENT_ID, first["job_id"], image_base64=image_base64)
+    assert queue.claim(CLIENT_ID)["job_id"] == second["job_id"]
+    assert queue.status(third["job_id"])["queue_position"] == 2
+
+
+def test_full_queue_refuses_new_jobs(tmp_path):
+    queue = _paired_queue(tmp_path)
+    for index in range(10):
+        queue.submit(f"Job {index}.", "Create image")
+    with pytest.raises(ValueError, match="queue is full"):
+        queue.submit("One too many.", "Create image")
 
 
 def test_stale_pairing_cannot_submit_when_extension_is_offline(tmp_path):
@@ -1706,8 +1730,11 @@ def test_terminal_history_does_not_block_explicit_new_job_or_replay_old_work(tmp
     queue.claim(CLIENT_ID)
     if terminal_state == "interrupted":
         queue.resolve(old["job_id"])
+        queue.halted_job = None  # resolve on a claimed job is an owner inspection
     else:
         queue.result(CLIENT_ID, old["job_id"], error="synthetic failure")
+        assert queue.halted_job == old["job_id"]  # a legacy worker cannot prove it was not sent
+        queue.resolve(old["job_id"])  # owner inspected ChatGPT
 
     new = queue.submit("Explicit new image.", "Create image")
 
@@ -2085,6 +2112,7 @@ def test_inspected_failed_generation_cleanup_requires_protocol_four_original_cli
 def test_inspected_failed_generation_cleanup_requires_latest_failure_and_exact_readiness_error(tmp_path):
     queue, job_id, images, _error = _failed_generation_upload(tmp_path)
     names = [image["name"] for image in images]
+    queue.halted_job = None  # owner inspected the line; the failed job stays recoverable
     newer = queue.submit("Later independent job.", "Create image")
     queue.claim(CLIENT_ID)
     queue.result(CLIENT_ID, newer["job_id"], error="Explicit later work failed.")
@@ -2244,6 +2272,7 @@ def test_failed_or_malformed_auto_job_cannot_authorize_cleanup(tmp_path):
         queue.claim_delete_confirmation(CLIENT_ID, failed["job_id"])
     with pytest.raises(ValueError, match="saved-image chat"):
         queue.confirm_delete(failed["job_id"], True)
+    queue.resolve(failed["job_id"])  # owner inspected ChatGPT; the line may continue
 
     malformed = queue.submit("Malformed image job.", "Create image")
     queue.claim(CLIENT_ID)
@@ -2290,3 +2319,74 @@ def test_restart_invalidates_auto_pending_cleanup_without_replay(tmp_path):
     restarted.pair(CLIENT_ID, ACCOUNT)
     with pytest.raises(ValueError, match="original saved-image dialog"):
         restarted.claim_delete_confirmation(CLIENT_ID, submitted["job_id"])
+
+
+def test_durable_browser_lifecycle_binds_exact_tab_and_chat_before_accepting_result(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4, tab_id=7)
+    submitted = queue.submit("One lifecycle image.", "Create image")
+    job_id = submitted["job_id"]
+    assert submitted["phase"] == "prepared"
+    queue.claim(CLIENT_ID)
+
+    with pytest.raises(ValueError, match="exact paired job tab"):
+        queue.phase(CLIENT_ID, job_id, "submit_attempted", 8)
+    attempted = queue.phase(CLIENT_ID, job_id, "submit_attempted", 7)
+    assert attempted["phase"] == "submit_attempted"
+    assert queue.phase(CLIENT_ID, job_id, "submit_attempted", 7)["phase"] == "submit_attempted"
+    with pytest.raises(ValueError, match="advance exactly once"):
+        queue.phase(CLIENT_ID, job_id, "result_captured", 7, RESULT_CHAT_PATH)
+
+    assert queue.phase(CLIENT_ID, job_id, "remote_started", 7, RESULT_CHAT_PATH)["phase"] == "remote_started"
+    with pytest.raises(ValueError, match="chat binding changed"):
+        queue.phase(CLIENT_ID, job_id, "result_captured", 7, OTHER_RESULT_CHAT_PATH)
+    assert queue.phase(CLIENT_ID, job_id, "result_captured", 7, RESULT_CHAT_PATH)["phase"] == "result_captured"
+
+    image_base64, _ = _png_base64()
+    with pytest.raises(ValueError, match="bound remote chat"):
+        queue.result(CLIENT_ID, job_id, image_base64=image_base64, chat_path=OTHER_RESULT_CHAT_PATH)
+    completed = queue.result(CLIENT_ID, job_id, image_base64=image_base64, chat_path=RESULT_CHAT_PATH)
+    assert completed["state"] == "complete"
+    assert completed["phase"] == "completed"
+
+
+def test_persistent_tab_owner_may_rebind_only_while_idle(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4, tab_id=7)
+    assert queue.status()["browser_binding"]["paired_tab"] is True
+    queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, input_protocol=4, tab_id=8)
+    submitted = queue.submit("Bind this job to the recovered tab.", "Create image")
+    assert "browser_tab_id" not in queue.status(submitted["job_id"])  # bound when the job starts
+    queue.claim(CLIENT_ID)
+    assert queue.status(submitted["job_id"])["browser_tab_id"] == 8
+    with pytest.raises(ValueError, match="tab identity changed during work"):
+        queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, input_protocol=4, tab_id=9)
+
+
+def test_mcp_preflight_and_job_are_readable_no_send_receipts(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, visible_model="Create image", input_protocol=4)
+    server = create_mcp(queue)
+    response = asyncio.run(server.call_tool("preflight", {
+        "prompt": "Verify this upload without sending.",
+        "images": _local_reference(tmp_path),
+        "clear_uploads": True,
+    }))
+    job_id = json.loads(response[0].text)["job_id"]
+    job_response = asyncio.run(server.call_tool("job", {"job_id": job_id}))
+    receipt = json.loads(job_response[0].text)
+    assert receipt["phase"] == "prepared"
+    assert receipt["state"] == "queued"
+
+
+def test_old_running_extension_is_told_to_reload(tmp_path, monkeypatch):
+    queue = _paired_queue(tmp_path)
+    queue.client["worker_version"] = "0.0.1"
+    monkeypatch.setattr("chatgpt_api.extension_bridge.repo_extension_version", lambda: "9.9.9")
+    assert queue.status()["next_action"] == "reload_extension"
+    assert queue.status()["installed_extension_version"] == "9.9.9"
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_version_by_default(monkeypatch):
+    monkeypatch.setattr("chatgpt_api.extension_bridge.repo_extension_version", lambda: None)

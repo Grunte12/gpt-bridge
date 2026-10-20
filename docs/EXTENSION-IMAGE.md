@@ -1090,3 +1090,22 @@ receipt, and rejected resolve without inspection confirmation. No new image was
 submitted. An isolated export of only the staged release files plus committed
 baseline passed Python 332 tests (3 skipped) and Node 63 tests. The full local
 working tree, including unrelated pending work, passed Python 400 (3 skipped).
+
+## Automation lifecycle contract (extension 0.1.31)
+
+GPT Bridge keeps the working extension transport and follows the shared browser-automation contract:
+
+- one persistent owner-confirmed `second` account and paired browser tab;
+- DOM interaction only for user-visible actions; bounded page evidence for readiness and results;
+- durable phases `prepared → submit_attempted → remote_started → result_captured → completed`;
+- `submit_attempted` is persisted before native Send, so any uncertain delivery is never replayed;
+- the result must come from the same client, tab, job and generated `/c/<uuid>` chat;
+- MCP exposes separate `status`, no-Send `preflight`, `job`, `wait`, `generate` and `edit` operations.
+
+`preflight` verifies ordered native uploads and can remove only those verified test uploads. `job` and
+`wait` are read-only receipts. A terminal failure retains its last durable phase so an agent can tell a
+pre-submit failure from uncertain remote work without inspecting prompts, cookies or page content.
+
+## Queue
+
+Image jobs line up first-in, first-out (up to 10). `generate`/`edit` always accept a job when the tab is paired; `status(job_id)` and `wait` report `queue_position` (1 = next). Only one job runs at a time, and the next starts after the previous image is saved and its chat cleanup is finished. A full line is refused, never dropped. Nothing is retried automatically.

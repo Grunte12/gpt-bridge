@@ -203,7 +203,7 @@ def test_confirm_delete_client_proxies_explicit_owner_approval_to_shared_worker(
         client.confirm_delete(submitted["job_id"], owner_confirmed=False)
 
 
-def test_worker_enforces_one_active_image_even_across_clients(tmp_path):
+def test_worker_queues_a_second_image_behind_the_active_one(tmp_path):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
     queue.pair(CLIENT_ID, ACCOUNT, "Create image")
     handler = make_handler(queue, TOKEN, 18767)
@@ -211,10 +211,12 @@ def test_worker_enforces_one_active_image_even_across_clients(tmp_path):
         "prompt": "First synthetic image", "expected_model": "Create image",
     }, origin="")[0] == 200
     status, _ = _request(handler, "/agent/image", {
-        "prompt": "Do not duplicate", "expected_model": "Create image",
+        "prompt": "Waits in line", "expected_model": "Create image",
     }, origin="")
-    assert status == 400
-    assert len(queue.jobs) == 1
+    assert status == 200
+    assert len(queue.jobs) == 2
+    assert queue.claim(CLIENT_ID)["prompt"] == "First synthetic image"
+    assert queue.claim(CLIENT_ID) == {}  # only one runs at a time
 
 
 def test_agent_routes_require_auth_valid_origin_and_operator_confirmation(tmp_path):
@@ -401,7 +403,7 @@ def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
     assert "queued" in result[0].text
 
 
-def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval(tmp_path):
+def test_mcp_exposes_uniform_status_preflight_job_wait_tools_and_requires_true_owner_approval(tmp_path):
     from chatgpt_api.extension_bridge import create_mcp
 
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
@@ -418,6 +420,7 @@ def test_mcp_exposes_fourth_confirm_delete_tool_and_requires_true_owner_approval
     tools = server._tool_manager.list_tools()
     assert {tool.name for tool in tools} == {
         "status", "generate", "edit", "wait", "confirm_delete", "resolve",
+        "preflight", "job",
     }
 
     with pytest.raises(Exception, match="actual owner confirmation"):

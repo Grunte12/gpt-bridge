@@ -102,6 +102,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     (conversationTurnsAfterSend && sendClicks > 0 ? ['You said:', 'ChatGPT said:'] : []);
   const hasConversation = () => user || currentConversationTurns().length > 0;
   const sent = [];
+  const phases = [];
   const chip = {innerText: 'Create image', getClientRects: () => [{}]};
   const composerText = () => `${imageMode ? 'Create image' : ''}${draft ? (imageMode ? ' ' : '') + draft : ''}`;
   const bodyImageChip = selector => {
@@ -380,7 +381,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   const chrome = {runtime: {
     onMessage: {addListener(fn) { listener = fn; contentListeners.push(fn); }, hasListener(fn) { return contentListeners.includes(fn); }},
     async sendMessage(message) {
-      sent.push(message);
+      if (message.type === 'image-phase') phases.push(message);
+      else sent.push(message);
       if (message.type === 'image-delete-prompt') return {ok: true};
       if (message.type === 'image-delete-confirmation') {
         onConfirmation?.(message);
@@ -419,7 +421,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   };
   if (staleListenerMarker) context.__gptBridgeImageWorkerListener = () => {};
   vm.runInNewContext(contentSource, context, {filename: 'content.js'});
-  return {receive: listener, sent, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
+  return {receive: listener, sent, phases, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
     get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, get sendClicks() { return sendClicks; },
     get sendQueries() { return sendQueries; }, get insertTextCalls() { return insertTextCalls; }, get composerEvents() { return composerEvents; },
     get fetchCalls() { return fetchCalls; }, get fetchedUrls() { return fetchedUrls; }, get fileReaderReads() { return fileReaderReads; },
@@ -1063,6 +1065,9 @@ test('generation collects the last adjacent assistant body, not the two referenc
   assert.equal(receipt.imagesBase64, undefined);
   assert.deepEqual(h.fetchedUrls, [output]);
   assert.equal(h.sendClicks, 1);
+  assert.deepEqual(h.phases.map(message => message.phase), ['submit_attempted', 'remote_started', 'result_captured']);
+  assert.equal(h.phases[1].chatPath, '/c/123e4567-e89b-12d3-a456-426614174000');
+  assert.equal(h.phases[2].chatPath, h.phases[1].chatPath);
   assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name));
 });
 

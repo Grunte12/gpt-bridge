@@ -32,10 +32,46 @@ MAX_IMAGE = 25 * 1024 * 1024
 MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT upload limit.
 TERMINAL = {"complete", "failed", "interrupted"}
 OPEN_CLEANUP = {"pending", "confirmation_required"}
+MAX_WAITING_JOBS = 10  # Jobs line up first-in, first-out; a full line is refused, never dropped.
+AUTOMATION_PHASES = ("prepared", "submit_attempted", "remote_started", "result_captured", "completed")
+AUTOMATION_PHASE_RANK = {phase: index for index, phase in enumerate(AUTOMATION_PHASES)}
+
+
+_MANIFEST = Path(__file__).resolve().parent.parent / "extensions" / "chatgpt-image" / "manifest.json"
+_manifest_cache: tuple[int, str | None] = (-1, None)
+
+
+def repo_extension_version() -> str | None:
+    """Version of the extension files on disk; Chrome keeps running the old one until it is reloaded.
+    Cached by file mtime so status polling does not re-read the file."""
+    global _manifest_cache
+    try:
+        stamp = _MANIFEST.stat().st_mtime_ns
+        if _manifest_cache[0] != stamp:
+            version = json.loads(_MANIFEST.read_text(encoding="utf-8")).get("version")
+            _manifest_cache = (stamp, version if isinstance(version, str) else None)
+        return _manifest_cache[1]
+    except (OSError, ValueError):
+        return None
 
 
 def job_occupies_tab(job: dict) -> bool:
     return job.get("state") not in TERMINAL or job.get("cleanup_status") in OPEN_CLEANUP
+
+
+def job_holds_tab(job: dict) -> bool:
+    """Running or cleaning up. A job still waiting in line has not touched the tab yet."""
+    return job_occupies_tab(job) and job.get("state") != "queued"
+
+
+def ended_uncertain(job: dict) -> bool:
+    """A failed or interrupted job that may already have reached ChatGPT: a human must inspect it before the line moves on.
+    Only jobs that were actually delivered count. A worker without phase receipts (old extension) can never prove 'not sent'."""
+    if job.get("state") not in {"failed", "interrupted"} or not job.get("delivered") or job.get("inspected"):
+        return False
+    if job.get("preflight_only") or job.get("preflight_cleanup_only") or job.get("collect_only"):
+        return False
+    return not job.get("phase_capable") or job.get("phase", "prepared") != "prepared"
 
 
 def short_outputs(raw: dict) -> list | None:
@@ -48,7 +84,7 @@ def short_outputs(raw: dict) -> list | None:
     return [{key: item.get(key) for key in fields} for item in outputs]
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -209,6 +245,7 @@ class ExtensionQueue:
         self.lock = threading.RLock()
         self.finished = threading.Condition(self.lock)
         self.client = None
+        self.halted_job: str | None = None  # Line stops here until the owner inspects ChatGPT and calls resolve.
         self.jobs: dict[str, dict] = {}
         for path in self.root.glob("*/state.json"):
             if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 256 * 1024:
@@ -223,7 +260,11 @@ class ExtensionQueue:
                 continue
             self.jobs[path.parent.name] = record
             if record.get("state") not in TERMINAL:
-                record.update(state="interrupted", error="Server restarted; inspect ChatGPT before resubmitting.")
+                never_sent = record.get("state") == "queued" or (
+                    record.get("delivered") and record.get("phase_capable") and record.get("phase", "prepared") == "prepared")
+                record.update(state="interrupted", error=(
+                    "Server restarted before this job was sent; nothing reached ChatGPT. Submit it again." if never_sent
+                    else "Server restarted; inspect ChatGPT before resubmitting."))
                 self._save(record)
             elif record.get("cleanup_status") in {"pending", "confirmation_required"}:
                 record.update(cleanup_status="failed", cleanup_confirmation="invalidated",
@@ -237,21 +278,26 @@ class ExtensionQueue:
         temporary.write_text(json.dumps(job))
         temporary.chmod(0o600)
         temporary.replace(directory / "state.json")
+        if ended_uncertain(job) and self.halted_job is None:
+            self.halted_job = job["job_id"]
         with self.finished:
             self.finished.notify_all()
 
-    def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0) -> dict:
+    def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0,
+             tab_id: int | None = None) -> dict:
         if account != self.account or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
             raise ValueError("account or client identity mismatch")
         if not isinstance(visible_model, str) or len(visible_model) > 100:
             raise ValueError("invalid visible model label")
         if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
             raise ValueError("invalid input protocol")
+        if tab_id is not None and (type(tab_id) is not int or tab_id < 0):
+            raise ValueError("invalid paired tab identity")
         with self.lock:
             if any(job_occupies_tab(j) for j in self.jobs.values()):
                 raise ValueError("finish the current job before pairing again; call wait and do not send again")
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
-                           "tab_ready": True, "input_protocol": input_protocol}
+                           "tab_ready": True, "input_protocol": input_protocol, "tab_id": tab_id}
             return {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
 
     def heartbeat(self, client_id: str, account: str, visible_model: str = "Create image",
@@ -259,7 +305,8 @@ class ExtensionQueue:
                   tab_idle: bool | None = None, tab_error: str = "",
                   worker_version: str = "", content_receiver: str = "unreported",
                   receiver_error: str = "", upload_dom: dict | None = None, result_dom: dict | None = None,
-                  prompt_dom: dict | None = None, tab_recovery: str = "none", chatgpt_tabs: int = 0) -> dict:
+                  prompt_dom: dict | None = None, tab_recovery: str = "none", chatgpt_tabs: int = 0,
+                  tab_id: int | None = None) -> dict:
         """Reconnect the already-authorized local extension, never replay old work."""
         if account != self.account or type(tab_ready) is not bool:
             raise ValueError("account or readiness mismatch")
@@ -282,6 +329,8 @@ class ExtensionQueue:
             raise ValueError("invalid tab recovery diagnostic")
         if type(chatgpt_tabs) is not int or not 0 <= chatgpt_tabs <= 20:
             raise ValueError("invalid ChatGPT tab count")
+        if tab_id is not None and (type(tab_id) is not int or tab_id < 0):
+            raise ValueError("invalid paired tab identity")
         upload_counts = {"file_inputs", "form_file_inputs", "image_inputs", "form_image_inputs",
                          "multiple_image_inputs", "unrestricted_inputs", "attachment_cards"}
         if upload_dom is not None and (not isinstance(upload_dom, dict) or
@@ -314,13 +363,18 @@ class ExtensionQueue:
                 raise ValueError("invalid bounded prompt DOM diagnostic")
         with self.lock:
             if self.client is None:
-                self.pair(client_id, account, visible_model, input_protocol)
+                self.pair(client_id, account, visible_model, input_protocol, tab_id)
             else:
                 self._client(client_id)
+                if self.client.get("tab_id") is not None and tab_id != self.client["tab_id"]:
+                    if any(job_holds_tab(job) for job in self.jobs.values()):
+                        raise ValueError("paired tab identity changed during work; inspect the original job, never replay")
+                    self.client["tab_id"] = tab_id  # Worker already proved the persistent client marker on this tab.
             self.client.update(visible_model=visible_model, tab_ready=tab_ready, input_protocol=input_protocol,
                                tab_idle=tab_idle, tab_error=tab_error, worker_version=worker_version,
                                content_receiver=content_receiver, receiver_error=receiver_error,
                                tab_recovery=tab_recovery, chatgpt_tabs=chatgpt_tabs,
+                               tab_id=tab_id,
                                upload_dom=dict(upload_dom) if upload_dom is not None else None,
                                result_dom=dict(result_dom) if result_dom is not None else None,
                                prompt_dom=json.loads(json.dumps(prompt_dom)) if prompt_dom is not None else None)
@@ -328,10 +382,15 @@ class ExtensionQueue:
 
     def _next_action(self) -> str:
         """One machine-readable next step. Never includes page content or a tab URL."""
-        if any(job_occupies_tab(job) for job in self.jobs.values()):
+        if any(job_holds_tab(job) for job in self.jobs.values()):
             return "wait"
+        if self.halted_job:
+            return "inspect_halted_job"  # Owner inspects ChatGPT, then resolve(job_id) lets the line continue.
         if not self.client or time.monotonic() - self.client.get("seen", 0) > 90:
             return "wait_for_extension"
+        running, installed = self.client.get("worker_version"), repo_extension_version()
+        if running and installed and running != installed:
+            return "reload_extension"  # Chrome still runs the old files: owner reloads it once.
         tabs = self.client.get("chatgpt_tabs", 0)
         recovery = self.client.get("tab_recovery", "none")
         receiver = self.client.get("content_receiver", "unreported")
@@ -343,6 +402,8 @@ class ExtensionQueue:
             return "open_second_tab"
         if receiver == "unavailable" and self.client.get("receiver_error") == "no_receiver":
             return "refresh_paired_tab_once"
+        if any(job_occupies_tab(job) for job in self.jobs.values()):
+            return "wait"  # Jobs are lined up; more can be added.
         if self.client.get("tab_ready") is True or self.client.get("content_receiver") == "available":
             return "submit_via_mcp"
         return "wait_for_tab"
@@ -365,9 +426,12 @@ class ExtensionQueue:
         with self.lock:
             if not self.client or time.monotonic() - self.client["seen"] > 90:
                 raise ValueError("pair a logged-in ChatGPT tab and wait for its heartbeat first")
-            blocker = next((job for job in self.jobs.values() if job_occupies_tab(job)), None)
-            if blocker:
-                raise ValueError(f"one image job at a time; call wait for {blocker['job_id']}. Do not resolve or send again.")
+            open_jobs = [job for job in self.jobs.values() if job_occupies_tab(job)]
+            if len(open_jobs) >= MAX_WAITING_JOBS:
+                raise ValueError(f"image queue is full ({MAX_WAITING_JOBS} jobs); call wait for {open_jobs[0]['job_id']}. Do not resolve or send again.")
+            running, installed = self.client.get("worker_version"), repo_extension_version()
+            if installed and running and running != installed:
+                raise ValueError(f"reload the extension (running {running}, installed {installed}) before sending; old workers cannot prove what was sent")
             inputs = validated_inputs(mode, images)
             if (inputs or mode == "edit") and self.client.get("input_protocol", 0) < 1:
                 raise ValueError("reload the updated extension and paired tab before using local image inputs")
@@ -375,7 +439,8 @@ class ExtensionQueue:
                 raise ValueError("reload extension and paired tab for no-Send preflight support")
             if clear_preflight_uploads and self.client.get("input_protocol", 0) < 3:
                 raise ValueError("protocol 3 is required to clear verified preflight uploads")
-            job = {"job_id": uuid.uuid4().hex, "state": "queued", "prompt": prompt, "account": self.account,
+            job = {"job_id": uuid.uuid4().hex, "state": "queued", "phase": "prepared",
+                   "prompt": prompt, "account": self.account,
                    "expected_model": expected_model.strip(), "client_id": self.client["client_id"], "mode": mode}
             if inputs:
                 directory = self.root / job["job_id"]
@@ -397,9 +462,47 @@ class ExtensionQueue:
             self._save(job)
             return self.status(job["job_id"])
 
+    def phase(self, client_id: str, job_id: str, phase: str, tab_id: int,
+              chat_path: str = "") -> dict:
+        """Persist browser evidence before the next irreversible lifecycle step."""
+        if phase not in {"submit_attempted", "remote_started", "result_captured"}:
+            raise ValueError("invalid automation phase")
+        if type(tab_id) is not int or tab_id < 0:
+            raise ValueError("invalid browser tab identity")
+        if not isinstance(chat_path, str) or (chat_path and not re.fullmatch(r"/c/[a-f0-9-]{36}", chat_path)):
+            raise ValueError("invalid bound chat path")
+        with self.lock:
+            self._client(client_id)
+            job = self.jobs.get(job_id)
+            if not job or job.get("client_id") != client_id or job.get("state") != "claimed":
+                raise ValueError("phase is not for this extension's claimed job")
+            if job.get("preflight_only") or job.get("collect_only"):
+                raise ValueError("this job does not submit a new remote request")
+            bound_tab = job.get("browser_tab_id")
+            if bound_tab is None or bound_tab != tab_id or self.client.get("tab_id") != tab_id:
+                raise ValueError("phase is not from the exact paired job tab")
+            current = job.get("phase", "prepared")
+            if AUTOMATION_PHASE_RANK[phase] <= AUTOMATION_PHASE_RANK.get(current, 0):
+                if chat_path and job.get("chat_path") not in {None, chat_path}:
+                    raise ValueError("phase chat binding changed")
+                return self.status(job_id)  # A repeated or late receipt changes nothing.
+            if AUTOMATION_PHASE_RANK[phase] != AUTOMATION_PHASE_RANK.get(current, 0) + 1:
+                raise ValueError("automation phase must advance exactly once")
+            if phase in {"remote_started", "result_captured"}:
+                if not chat_path:
+                    raise ValueError("remote evidence requires the exact chat path")
+                if job.get("chat_path") not in {None, chat_path}:
+                    raise ValueError("job chat binding changed")
+                job["chat_path"] = chat_path
+            job["phase"] = phase
+            self._save(job)
+            return self.status(job_id)
+
     def claim(self, client_id: str) -> dict:
         with self.lock:
             self._client(client_id)
+            if any(job_holds_tab(job) for job in self.jobs.values()) or self.halted_job:
+                return {}  # One tab, one job; a job that may have been sent stops the line until inspected.
             for job in self.jobs.values():
                 if job["state"] == "queued" and job["client_id"] == client_id:
                     minimum_protocol = 4 if job.get("preflight_cleanup_only") or job.get("collect_only") else 3 if job.get("clear_preflight_uploads") else 2 if job.get("preflight_only") else 1 if job.get("images") or job.get("mode") == "edit" else 0
@@ -410,6 +513,10 @@ class ExtensionQueue:
                         self._save(job)
                         raise ValueError(job["error"])
                     job["state"] = "claimed"
+                    job["delivered"] = True
+                    job["phase_capable"] = self.client.get("tab_id") is not None
+                    if job["phase_capable"]:
+                        job["browser_tab_id"] = self.client["tab_id"]  # Bind when the job actually starts, not when it queued.
                     self._save(job)  # Persist BEFORE delivery. Never repeat on uncertain response.
                     claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed", "collect_only", "preserve_chat", "recovery_chat_path") if k in job}
                     if job.get("collect_only"):
@@ -487,7 +594,7 @@ class ExtensionQueue:
                     raise ValueError("preflight accepts only a no-Send readiness receipt, never media or cleanup")
                 if job.get("clear_preflight_uploads") and not preflight_uploads_cleared:
                     raise ValueError("verified preflight upload clearing receipt is required")
-                job.update(state="complete", preflight_ready=True, submitted=False, generated=False,
+                job.update(state="complete", phase="completed", preflight_ready=True, submitted=False, generated=False,
                            cleanup_status="not_requested", draft_note="Owned upload-only draft remains unsent; inspect before further work.")
                 if preflight_uploads_cleared:
                     job.update(preflight_uploads_cleared=True,
@@ -495,6 +602,11 @@ class ExtensionQueue:
             else:
                 if preflight_ready:
                     raise ValueError("readiness receipt cannot complete a generation job")
+                if job.get("browser_tab_id") is not None and not job.get("collect_only"):
+                    if job.get("phase") != "result_captured":
+                        raise ValueError("result requires durable submit, remote-start and capture receipts")
+                    if chat_path != job.get("chat_path"):
+                        raise ValueError("result chat does not match the bound remote chat")
                 if images_base64 is not None and image_base64 is not None:
                     raise ValueError("choose one image result representation")
                 encoded = images_base64 if images_base64 is not None else [image_base64]
@@ -531,7 +643,7 @@ class ExtensionQueue:
                             output.write(raw)
                     outputs.append({"order": index, "image_path": str(path), "dimensions": dimensions,
                                     "sha256": digest, "bytes": len(raw)})
-                job.update(state="complete", outputs=outputs, output_count=len(outputs), source=source,
+                job.update(state="complete", phase="completed", outputs=outputs, output_count=len(outputs), source=source,
                            submitted=True, generated=True,
                            cleanup_status="preserved" if job.get("preserve_chat") or len(outputs) > 1 else "pending" if cleanup_pending else "not_requested",
                            quality_note="Rendered asset; original download resolution not verified.")
@@ -593,11 +705,21 @@ class ExtensionQueue:
             self._save(job)
             return self.status(job_id)
 
+    def _queue_position(self, job: dict) -> int | None:
+        """1 = next to run; counts the running job as a place ahead. None once the job has started."""
+        if job.get("state") != "queued":
+            return None
+        ahead = sum(1 for other in self.jobs.values() if other is not job and job_occupies_tab(other)
+                    and (other["state"] != "queued" or list(self.jobs).index(other["job_id"]) < list(self.jobs).index(job["job_id"])))
+        return ahead + 1
+
     def _receipt(self, job: dict, *, wait_timed_out: bool = False) -> dict:
         output = job.get("outputs")[0] if isinstance(job.get("outputs"), list) and job.get("outputs") else {}
         receipt = {"job_id": job["job_id"], "state": job["state"],
+                   "phase": job.get("phase", "completed" if job["state"] == "complete" else "prepared"),
                    "image_path": job.get("image_path"), "dimensions": job.get("dimensions"),
                    "sha256": job.get("sha256"), "bytes": output.get("bytes"),
+                   "chat_path": job.get("chat_path"), "preflight_ready": job.get("preflight_ready"),
                    "cleanup_status": job.get("cleanup_status"), "error": job.get("error"),
                    "submitted": job.get("submitted"), "generated": job.get("generated"),
                    "wait_timed_out": wait_timed_out}
@@ -607,6 +729,8 @@ class ExtensionQueue:
             receipt["output_count"] = len(copied)
         if job.get("cleanup_confirmation"):
             receipt["cleanup_confirmation"] = job.get("cleanup_confirmation")
+        if (position := self._queue_position(job)) is not None:
+            receipt["queue_position"] = position
         return receipt
 
     def wait_for_job(self, job_id: str, timeout_seconds: int = 120) -> dict:
@@ -634,6 +758,8 @@ class ExtensionQueue:
                 return {"account": self.account, "paired": bool(self.client),
                         "cleanup_policy": "automatic_saved_chats" if self.auto_delete_saved_chats else "per_job_confirmation",
                         "account_binding": "owner-confirmed, not independently verified",
+                        "browser_binding": {"paired_tab": bool(self.client and self.client.get("tab_id") is not None),
+                                            "exact_job_tab_required": True, "exact_result_chat_required": True},
                         "transport": "extension-native-ui",
                         "input_capabilities": {"modes": ["create", "edit"],
                                                "ordered_local_images": bool(self.client and self.client.get("input_protocol", 0) >= 1),
@@ -649,6 +775,9 @@ class ExtensionQueue:
                         "tab_idle": self.client.get("tab_idle") if self.client else None,
                         "tab_error": self.client.get("tab_error", "") if self.client else "",
                         "next_action": self._next_action(),
+                        "installed_extension_version": repo_extension_version(),
+                        "line_halted": self.halted_job,
+                        "queue_depth": sum(1 for j in self.jobs.values() if job_occupies_tab(j)),
                         "extension_diagnostics": {
                             "worker_version": (self.client.get("worker_version") or None) if self.client else None,
                             "content_receiver": self.client.get("content_receiver", "unreported") if self.client else "unreported",
@@ -660,11 +789,15 @@ class ExtensionQueue:
                             "result_dom": self.client.get("result_dom") if self.client else None,
                             "prompt_dom": self.client.get("prompt_dom") if self.client else None},
                         "extension_online": bool(self.client and time.monotonic() - self.client["seen"] <= 90),
-                        "jobs": [{k: j[k] for k in ("job_id", "state", "cleanup_status", "chat_path", "preflight_only", "clear_preflight_uploads") if k in j}
+                        "jobs": [{k: j[k] for k in ("job_id", "state", "phase", "cleanup_status", "chat_path", "preflight_only", "clear_preflight_uploads") if k in j}
                                  for j in list(self.jobs.values())[-10:]]}
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
-            return {k: v for k, v in self.jobs[job_id].items() if k not in {"prompt", "client_id"}}
+            job = self.jobs[job_id]
+            view = {k: v for k, v in job.items() if k not in {"prompt", "client_id"}}
+            if (position := self._queue_position(job)) is not None:
+                view["queue_position"] = position
+            return view
 
     def client_status(self, client_id: str, job_id: str) -> dict:
         """Let the original extension clear terminal work, including after restart."""
@@ -681,6 +814,9 @@ class ExtensionQueue:
         with self.lock:
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
+            if self.halted_job == job_id:
+                self.jobs[job_id]["inspected"] = True
+                self.halted_job = next((j["job_id"] for j in self.jobs.values() if ended_uncertain(j)), None)
             if type(recover_outputs) is not bool:
                 raise ValueError("recover_outputs must be a boolean")
             if recovery_chat_path is not None and not recover_outputs:
@@ -838,9 +974,12 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 if not isinstance(data, dict):
                     raise ValueError("request must be an object")
                 if self.path == "/pair":
-                    result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""), data.get("input_protocol", 0))
+                    result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""),
+                                        data.get("input_protocol", 0), data.get("tab_id"))
                 elif self.path == "/heartbeat":
                     result = queue.heartbeat(**data)
+                elif self.path == "/phase":
+                    result = queue.phase(**data)
                 elif self.path == "/next":
                     result = queue.claim(data["client_id"])
                 elif self.path == "/result":
@@ -885,11 +1024,16 @@ def compact_status(raw: dict) -> dict:
     if "job_id" in raw or "state" in raw:
         output = raw.get("outputs")[0] if isinstance(raw.get("outputs"), list) and raw.get("outputs") else {}
         receipt = {"job_id": raw.get("job_id"), "state": raw.get("state"),
+                   "phase": raw.get("phase"),
                    "image_path": raw.get("image_path"), "dimensions": raw.get("dimensions"),
                    "sha256": raw.get("sha256"),
                    "bytes": output.get("bytes") if isinstance(output, dict) else raw.get("bytes"),
+                   "chat_path": raw.get("chat_path"), "preflight_ready": raw.get("preflight_ready"),
+                   "submitted": raw.get("submitted"), "generated": raw.get("generated"),
                    "cleanup_status": raw.get("cleanup_status"), "error": raw.get("error"),
                    "wait_timed_out": raw.get("wait_timed_out", False)}
+        if raw.get("queue_position") is not None:
+            receipt["queue_position"] = raw["queue_position"]
         copied = short_outputs(raw)
         if copied:
             receipt["outputs"] = copied
@@ -898,18 +1042,21 @@ def compact_status(raw: dict) -> dict:
             receipt["cleanup_confirmation"] = raw.get("cleanup_confirmation")
         return receipt
     brief = {"account": raw.get("account"), "paired": raw.get("paired"),
-             "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action")}
+             "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action"),
+             "transport": raw.get("transport"), "browser_binding": raw.get("browser_binding"),
+             "preflight_available": (raw.get("input_capabilities") or {}).get("preflight_only"),
+             **{key: raw[key] for key in ("queue_depth", "line_halted", "installed_extension_version") if raw.get(key) is not None}}
     jobs = raw.get("jobs") if isinstance(raw.get("jobs"), list) else []
     open_job = next((job for job in jobs if isinstance(job, dict) and job_occupies_tab(job)), None)
     if open_job:
         brief.update(job_id=open_job.get("job_id"), state=open_job.get("state"),
-                     cleanup_status=open_job.get("cleanup_status"))
+                     phase=open_job.get("phase"), cleanup_status=open_job.get("cleanup_status"))
     return brief
 
 
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
-    server = FastMCP("gpt-bridge", instructions="Generate or edit one ChatGPT image on this machine. Call status, then generate or edit once, then wait. Open image_path. Do not send the job again.")
+    server = FastMCP("gpt-bridge", instructions="Use one persistent paired browser owner. Call status, optionally preflight uploads, then generate or edit exactly once. Use job or wait for durable phase receipts. Never replay a job after submit_attempted.")
 
     @server.tool()
     def status(job_id: str = "") -> dict:
@@ -920,6 +1067,17 @@ def create_mcp(queue):
     def wait(job_id: str, timeout_seconds: int = 120) -> dict:
         """Wait until the image is saved and cleanup has finished, or the job has failed. Returns image_path and every output. If wait_timed_out is true, or cleanup_status is pending or confirmation_required, call wait again. Do not generate or resolve."""
         return queue.wait_for_job(job_id, timeout_seconds)
+
+    @server.tool()
+    def job(job_id: str) -> dict:
+        """Read one durable job receipt: phase, state, exact result path and cleanup outcome. Never resubmits."""
+        return compact_status(queue.status(job_id))
+
+    @server.tool()
+    def preflight(prompt: str, images: list[LocalImageInput], mode: Literal["create", "edit"] = "create",
+                  clear_uploads: bool = True) -> dict:
+        """Verify ordered native uploads without Send or generation. By default removes only those verified test uploads."""
+        return compact_status(queue.submit(prompt, "Create image", mode, images, True, clear_uploads))
 
     @server.tool()
     def generate(prompt: str, images: list[LocalImageInput] | None = None) -> dict:
