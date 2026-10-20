@@ -39,19 +39,17 @@
   const assistantBody = () => assistants().at(-1) || turnHeadings("ChatGPT said:").at(-1)?.nextElementSibling || null;
   const displayedImages = root => root ? [...root.querySelectorAll("img")].filter(img =>
     visible(img) && img.complete && img.naturalWidth >= 512 && img.naturalHeight >= 512) : [];
-  // The image can render outside the heading's next sibling (seen live: image in the conversation, none in that sibling).
-  // Fall back to conversation images between the last "ChatGPT said:" heading and any later "You said:" heading,
-  // so uploads (earlier or newer user turn) and images of earlier turns stay excluded.
-  function imagesAfterAssistantHeading() {
-    const heading = turnHeadings("ChatGPT said:").at(-1);
-    if (!heading) return [];
-    const follows = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
-    const nextUser = turnHeadings("You said:").find(user => follows(heading, user));
-    return displayedImages(conversation()).filter(img => follows(heading, img) && !(nextUser && follows(nextUser, img)));
+  // The generated image can render in a gallery before the "ChatGPT said:" heading, outside its next sibling (seen live).
+  // Fall back to gallery images after the last "You said:" heading: uploads are not in a gallery, earlier turns come before.
+  function galleryImagesAfterUserHeading() {
+    if (!turnHeadings("ChatGPT said:").length) return [];
+    const user = turnHeadings("You said:").at(-1);
+    return displayedImages(conversation()).filter(img => img.closest('[data-testid="generated-image-gallery"]') &&
+      (!user || !!(user.compareDocumentPosition(img) & Node.DOCUMENT_POSITION_FOLLOWING)));
   }
   const outputImages = () => {
     const direct = displayedImages(assistantBody());
-    return [...new Map((direct.length ? direct : imagesAfterAssistantHeading()).map(img => [img.currentSrc || img.src, img])).values()];
+    return [...new Map((direct.length ? direct : galleryImagesAfterUserHeading()).map(img => [img.currentSrc || img.src, img])).values()];
   };
   function resultDomDiagnostics() {
     return {assistant_role_nodes: assistants().length, user_headings: turnHeadings("You said:").length,

@@ -45,9 +45,12 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     return (text === 'You said:' ? turns.indexOf(text) : turns.lastIndexOf(text)) * 10;
   };
   const imagePosition = source => source in imagePositions ? imagePositions[source] :
+    outsideAssistantSources.includes(source) ? headingPosition('ChatGPT said:') - 1 : // live: the gallery precedes the heading
     headingPosition(userImageSources.includes(source) ? 'You said:' : 'ChatGPT said:') + 1;
   const toDisplayedImage = source => ({src: source, currentSrc: source, complete: true,
-    naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}], get documentPosition() { return imagePosition(source); }});
+    naturalWidth: 512, naturalHeight: 512, getClientRects: () => [{}], get documentPosition() { return imagePosition(source); },
+    closest: selector => selector === '[data-testid="generated-image-gallery"]' &&
+      outsideAssistantSources.includes(source) ? {} : null}); // only generated images sit in a gallery
   const baseAssistantSources = assistantImageSources === null
     ? (imageReady ? [defaultImageSource] : []) : assistantImageSources;
   const userImages = userImageSources.map(toDisplayedImage);
@@ -1105,6 +1108,16 @@ test('the fallback skips an earlier turn image when a later assistant heading ha
   const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:', 'You said:', 'ChatGPT said:'],
     conversationBodies: ['first prompt', 'first reply', 'second prompt', 'second reply'], assistantImageSources: [],
     outsideAssistantSources: [old], imagePositions: {[old]: 11}});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.assistant_images, 0);
+  assert.equal(result.result_dom.conversation_images, 1);
+});
+
+test('the gallery fallback waits for an assistant heading', () => {
+  const output = 'https://chatgpt.com/gallery-before-heading.png';
+  const h = contentHarness({user: true, conversationTurns: ['You said:'], conversationBodies: ['submitted prompt'],
+    assistantImageSources: [], outsideAssistantSources: [output], imagePositions: {[output]: 5}});
   let result;
   h.receive({type: 'image-inspect'}, {}, value => { result = value; });
   assert.equal(result.result_dom.assistant_images, 0);
