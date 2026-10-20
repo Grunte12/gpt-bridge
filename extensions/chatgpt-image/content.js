@@ -588,7 +588,8 @@
         if (result?.error) throw new Error("Image result could not be saved. Inspect ChatGPT; do not regenerate.");
         return;
       }
-      throw new Error("Timed out; generation may still complete. Inspect ChatGPT before resubmitting.");
+      // Name what the page looked like, so a finished image the detector missed is distinguishable from a slow one.
+      throw new Error("Timed out; generation may still complete. Inspect ChatGPT before resubmitting. DOM: " + JSON.stringify(resultDomDiagnostics()));
     } catch (error) {
       await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
         ...(job.collect_only && promptBinding ? {promptBinding} : {}),

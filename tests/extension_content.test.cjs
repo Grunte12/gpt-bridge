@@ -1007,6 +1007,17 @@ test('matching fresh composer inserts once and clicks only native send once', as
   assert.match(h.sent[0].error, /Timed out/);
 });
 
+test('timeout error carries the bounded result DOM snapshot within the stored error limit', async () => {
+  const h = contentHarness();
+  await startContent(h);
+  const error = h.sent[0].error;
+  assert.match(error, /^Submission attempted\. Timed out; generation may still complete\. Inspect ChatGPT before resubmitting\. DOM: \{/);
+  const dom = JSON.parse(error.slice(error.indexOf('DOM: ') + 5));
+  assert.deepEqual(Object.keys(dom).sort(), ['assistant_body_found', 'assistant_headings', 'assistant_images', 'assistant_role_nodes',
+    'busy', 'chat_path', 'conversation_images', 'user_headings']);
+  assert.ok(error.length <= 500, `error is ${error.length} chars; the worker keeps only 500`);
+});
+
 test('zero-image generation keeps the ordinary prompt and sends without touching a file input', async () => {
   const h = contentHarness();
   await startContent(h, {job_id: 'job-no-images', expected_model: 'Create image', prompt: 'draw a cat', images: []});
