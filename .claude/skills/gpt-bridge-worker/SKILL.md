@@ -1,45 +1,53 @@
 ---
 name: "gpt-bridge"
-description: "Use the user's local GPT Bridge CLI for one-account chat, research, existing ChatGPT Web conversation discovery/continuation/export, ChatGPT Image generation or editing—including transparent frontend PNG assets and image-based slide decks—vision/OCR, persistent local threads, or standalone HTML reports. Trigger when a user wants to bring a ChatGPT Web brainstorm into Codex, Claude Code, or OpenCode without replaying its full transcript. Direct mode needs no Docker or daemon. Load task-specific references only on demand."
+description: "Use GPT Bridge for ChatGPT Web chat, research, conversation export, reports, vision, and native image generation or editing. For images, obey the project-selected route: Agent LinkHub/Extension when required, direct CLI only when explicitly selected. Never mix routes for one job. Load task-specific references only on demand."
 ---
 
 # GPT Bridge Worker
 
-## Image
+## Native image route
 
-Use the `gpt-bridge` MCP. Account is `second`.
+Choose one image route from the current project's instructions and keep it for
+the whole job. In Goofy & Memo, call the `gpt-bridge` provider only through
+Agent LinkHub with account `second`. Do not bypass LinkHub by calling the direct
+Extension MCP, direct HTTP, or the worker image/edit CLI, including for status
+checks or recovery. If LinkHub lacks a capability, repair or diagnose that route
+instead of silently switching routes. In another project that explicitly selects
+the direct CLI image route, skip this LinkHub procedure and use the labeled
+direct CLI guidance below.
 
-1. `status`. Need `paired=true` and `extension_online=true`.
-2. `generate(prompt, images)` or `edit(prompt, images)` once.
-3. `wait(job_id)`. Open `image_path`. If `wait_timed_out` is true, or `cleanup_status` is `pending` or `confirmation_required`, call `wait` again. Do not generate again until cleanup is `deleted`, `failed`, `preserved`, or `not_requested`.
-`next_action=wait` means call `wait` on the returned `job_id`. `next_action=submit_via_mcp` means call `generate` or `edit` once. `next_action=wait_for_tab` means the paired tab is not connected. Do not call `resolve` for `wait` or `wait_for_tab`.
+1. Inspect the live LinkHub schema once. Before submitting, require
+   `paired=true`, `extension_online=true`, queue depth `0`, and
+   `next_action=submit_via_mcp`.
+2. Call `generate(prompt, images)` or `edit(prompt, images)` once. `edit`
+   requires the source image; `generate` images are ordered references.
+3. Record the returned `job_id`. Follow `next_action` and recover that same job
+   until its saved path, dimensions, hash, and cleanup outcome are known.
+4. Inspect the saved artifact. A timeout, provider-discovery error, or uncertain
+   cleanup state is not permission to submit again.
 
-Do not send the job again. `edit` needs one source image. `generate` images are optional references.
+If `wait` returns `hub_unavailable` or `upstream_discovery_failed`, refresh the
+LinkHub provider index once, call `status(job_id)`, then wait on the same job if
+it is `claimed` or `remote_started`. `complete` plus a saved image path and hash
+means the image succeeded; `cleanup_status=failed` affects chat cleanup, not the
+saved artifact.
 
-One local worker owns the paired tab. With the owner's explicit standing
-authorization, start that owner command with
-`--account second --auto-delete-saved-chats`; do not enable it for another user
-without their authorization. Other hosts use `--account second --connect`,
-not another owning worker; the auto-delete flag belongs only on the owner.
-Status reports the active policy. Default mode still requires per-job approval.
-Policy applies only to jobs created while enabled, never old chats/jobs.
+One local worker owns the paired tab. Other clients connect to that owner; do
+not start a second owner. Use browser control only for initial setup/reload,
+login, a closed paired tab, or necessary failure diagnosis. For HTTP 400 after
+reload, a visibly empty composer reported as having attachments, upload/EXIF
+failures, or a stuck job, read
+[`references/extension-image-recovery.md`](references/extension-image-recovery.md)
+before changing code or resubmitting.
 
-Keep the owner running. Pairing reconnects after restarts without tokens/cookies
-or repeated setup. Restart invalidates pending cleanup; never replay it. The
-tools are `status`, `generate`, `edit`, `wait`, `confirm_delete`, and `resolve`. An older host may still
-cache schema text; read `cleanup_policy` from live status. Reload an old MCP
-host only at an idle point, never by restarting a busy session.
+Missing MCP tools are not a reason to use old direct image commands. Keep the
+owner running, and reload MCP hosts only at an idle point.
 
-No manual tab preparation is needed. Attachments, verification, running work,
-changed prompts and unrelated drafts fail closed. Use browser control only for
-initial setup/reload, a closed paired tab, login or necessary failure diagnosis,
-not ordinary submission, receipt or deletion. This route does not yet support
-reference edits/batches or guarantee Pro/High, highest quality, or original-download
-resolution. Missing MCP tools are not a reason to use old direct image commands.
+## Direct CLI image quality — only when the project selects CLI
 
-## Highest-quality image requests
-
-When the user prioritizes final-image quality, use `--level high` for prompt
+These controls do not apply to the LinkHub/Extension route. When the project
+explicitly selects direct CLI and the user prioritizes final-image quality, use
+`--level high` for prompt
 fidelity and set the native model/effort explicitly. These are separate controls.
 Read `worker doctor --live-models --json` once for the selected direct account
 (or `account-models --account <alias> --json`) to discover current presets.
@@ -52,7 +60,7 @@ Use it only when that account's live picker confirms support. Do not invent
 with image-rendering quality. Generation still requires the user's task scope.
 Correct forwarding is not a likeness guarantee; inspect the saved image.
 
-## Preflight
+## CLI preflight — non-LinkHub commands
 
 1. Run `command -v gpt-bridge` (or `Get-Command gpt-bridge` in PowerShell).
 2. If missing, stop and tell the user to run
@@ -100,7 +108,7 @@ gpt-bridge worker web delete --conversation <id-or-url> --yes --json
 # Standalone model-authored HTML
 gpt-bridge worker report --prompt "..." --out report.html --json
 
-# New image, targeted edit/composite, or transparent frontend PNG
+# Direct CLI images — only when project instructions explicitly select this route
 gpt-bridge worker image --prompt "..." --output-path <path> --brief
 gpt-bridge worker image --prompt "..." --output-path <path> --count 4 --level instant --brief
 gpt-bridge worker edit --prompt "..." --input-image <path> --output-path <path> --brief
@@ -119,7 +127,8 @@ request for the exact artifact needed; this lets ChatGPT use its server-side
 context while returning only the useful result. Use `web show --output` when
 the coding agent needs source conversation material locally.
 
-Keep image iteration compact: use `--brief`, reuse one draft path, inspect only
+For the explicitly selected direct CLI image route, keep iteration compact: use
+`--brief`, reuse one draft path, inspect only
 the latest output, prefer `worker edit` for targeted changes, and never use
 legacy `--enhance`. For multiple variants, pass `--count N` (2-10) with one
 `--output-path` stem. Use `--level instant` for cheap drafts (max 4), omit it
