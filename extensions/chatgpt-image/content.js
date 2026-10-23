@@ -161,7 +161,7 @@
   }
   const attachmentsPresent = () => [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length) ||
     document.querySelector('[data-testid="file-upload-progress"], ' + attachmentSelector) ||
-    [...(editorElement()?.closest("form")?.querySelectorAll(removeAttachmentSelector + ', img, [role="progressbar"], [aria-busy="true"]') || [])].some(visible);
+    [...(editorElement()?.closest("form")?.querySelectorAll(removeAttachmentSelector + ', [role="progressbar"], [aria-busy="true"]') || [])].some(visible);
   function ownedUploads(job) {
     return uploadBinding && uploadBinding.jobId === job?.job_id && uploadBinding.path === location.pathname &&
       uploadBinding.editor === editorElement() && uploadBinding.names.join("\n") === (job.images || []).map(image => image.name).join("\n");
