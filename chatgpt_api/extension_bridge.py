@@ -31,8 +31,13 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 MAX_IMAGE = 25 * 1024 * 1024
 MAX_INPUT_BYTES = 8 * 1024 * 1024  # Local transport budget, NOT a ChatGPT upload limit.
 TERMINAL = {"complete", "failed", "interrupted"}
-OPEN_CLEANUP = {"pending", "confirmation_required"}
+OPEN_CLEANUP = {"pending", "confirmation_required", "timeout_delete_pending", "timeout_delete_failed"}
 MAX_WAITING_JOBS = 10  # Jobs line up first-in, first-out; a full line is refused, never dropped.
+GENERATION_TIMEOUT_MIN = 300
+GENERATION_TIMEOUT_MAX = 900
+GENERATION_TIMEOUT_MULTIPLIER = 2.5
+GENERATION_TIMEOUT_SAMPLES = 5
+MAX_TIMEOUT_REPLACEMENTS = 1
 AUTOMATION_PHASES = ("prepared", "submit_attempted", "remote_started", "result_captured", "completed")
 AUTOMATION_PHASE_RANK = {phase: index for index, phase in enumerate(AUTOMATION_PHASES)}
 
@@ -84,7 +89,7 @@ def short_outputs(raw: dict) -> list | None:
     return [{key: item.get(key) for key in fields} for item in outputs]
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2, "0.1.32": 2, "0.1.33": 2, "0.1.34": 2, "0.1.35": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -234,7 +239,7 @@ class ExtensionClient:
 class ExtensionQueue:
     def __init__(self, root: Path, account: str, *, auto_delete_saved_chats: bool = False):
         if type(auto_delete_saved_chats) is not bool:
-            raise ValueError("invalid automatic cleanup policy")
+            raise ValueError("invalid chat cleanup policy")
         if root.is_symlink():
             raise ValueError("data directory must not be a symlink")
         self.root = root.resolve()
@@ -261,12 +266,33 @@ class ExtensionQueue:
                 continue
             self.jobs[path.parent.name] = record
             if record.get("state") not in TERMINAL:
-                never_sent = record.get("state") == "queued" or (
-                    record.get("delivered") and record.get("phase_capable") and record.get("phase", "prepared") == "prepared")
-                record.update(state="interrupted", error=(
-                    "Server restarted before this job was sent; nothing reached ChatGPT. Submit it again." if never_sent
-                    else "Server restarted; inspect ChatGPT before resubmitting."))
-                self._save(record)
+                stalled_age = time.time() - path.stat().st_mtime
+                legacy_stalled = (record.get("state") == "claimed" and record.get("phase") == "remote_started" and
+                                  re.fullmatch(r"/c/[a-f0-9-]{36}", record.get("chat_path", "")) and
+                                  stalled_age >= GENERATION_TIMEOUT_MAX and not record.get("images") and
+                                  record.get("mode", "create") == "create" and record.get("retry_count", 0) < MAX_TIMEOUT_REPLACEMENTS)
+                if legacy_stalled:
+                    replacement = {"job_id": uuid.uuid4().hex, "state": "queued", "phase": "prepared",
+                                   "prompt": record["prompt"], "account": self.account, "created_at": time.time(),
+                                   "expected_model": record["expected_model"], "client_id": record["client_id"], "mode": "create",
+                                   "retry_count": record.get("retry_count", 0) + 1,
+                                   "replaces_job_id": record["job_id"], "generation_baseline_seconds": 120.0,
+                                   "generation_timeout_seconds": GENERATION_TIMEOUT_MIN, "generation_timing_samples": 0,
+                                   **({"auto_delete_saved_chat": True} if self.auto_delete_saved_chats else {})}
+                    record.update(state="failed", timed_out=True, inspected=True, submitted=True, generated=False,
+                                  completed_at=time.time(), cleanup_status="timeout_delete_pending",
+                                  replacement_job_id=replacement["job_id"],
+                                  error="Legacy generation exceeded 900s; deleting the exact stalled chat before replacement.")
+                    self._save(record)
+                    self.jobs[replacement["job_id"]] = replacement
+                    self._save(replacement)
+                else:
+                    never_sent = record.get("state") == "queued" or (
+                        record.get("delivered") and record.get("phase_capable") and record.get("phase", "prepared") == "prepared")
+                    record.update(state="interrupted", error=(
+                        "Server restarted before this job was sent; nothing reached ChatGPT. Submit it again." if never_sent
+                        else "Server restarted; inspect ChatGPT before resubmitting."))
+                    self._save(record)
             elif record.get("cleanup_status") in {"pending", "confirmation_required"}:
                 record.update(cleanup_status="failed", cleanup_confirmation="invalidated",
                               cleanup_error="Server restarted before cleanup was verified; inspect the chat, do not repeat deletion automatically.")
@@ -285,7 +311,7 @@ class ExtensionQueue:
             self.finished.notify_all()
 
     def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0,
-             tab_id: int | None = None) -> dict:
+             tab_id: int | None = None, retry_timeout_cleanup: bool = False) -> dict:
         if account != self.account or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
             raise ValueError("account or client identity mismatch")
         if not isinstance(visible_model, str) or len(visible_model) > 100:
@@ -294,12 +320,72 @@ class ExtensionQueue:
             raise ValueError("invalid input protocol")
         if tab_id is not None and (type(tab_id) is not int or tab_id < 0):
             raise ValueError("invalid paired tab identity")
+        if type(retry_timeout_cleanup) is not bool:
+            raise ValueError("retry_timeout_cleanup must be a boolean")
         with self.lock:
-            if any(job_occupies_tab(j) for j in self.jobs.values()):
+            open_jobs = [job for job in self.jobs.values() if job_occupies_tab(job)]
+            # A queued replacement could run after cleanup; keep it outside recovery.
+            if len(open_jobs) > 1:
                 raise ValueError("finish the current job before pairing again; call wait and do not send again")
+            if retry_timeout_cleanup:
+                cleanup_job = next((job for job in open_jobs if job.get("cleanup_status") == "timeout_delete_failed"), None)
+                if cleanup_job is None:
+                    raise ValueError("no failed timeout cleanup is available for explicit retry")
+            else:
+                cleanup_job = next((job for job in open_jobs if job.get("cleanup_status") == "timeout_delete_pending"), None)
+                if cleanup_job is None and any(job.get("cleanup_status") == "timeout_delete_failed" for job in open_jobs):
+                    raise ValueError("timeout cleanup failed; explicitly retry that cleanup before pairing")
+            if open_jobs and cleanup_job is None:
+                raise ValueError("finish the current job before pairing again; call wait and do not send again")
+            if cleanup_job is not None:
+                replacements = [job for job in open_jobs if job is not cleanup_job]
+                replacement_id = cleanup_job.get("replacement_job_id")
+                valid_replacement = (len(replacements) == 1 and replacements[0].get("job_id") == replacement_id and
+                                     replacements[0].get("replaces_job_id") == cleanup_job.get("job_id") and
+                                     replacements[0].get("state") == "queued" and
+                                     replacements[0].get("phase") == "prepared" and
+                                     replacements[0].get("delivered") is not True and
+                                     replacements[0].get("account") == self.account and
+                                     replacements[0].get("mode") == "create" and
+                                     replacements[0].get("prompt") == cleanup_job.get("prompt") and
+                                     replacements[0].get("expected_model") == cleanup_job.get("expected_model"))
+                failed_cleanup = cleanup_job.get("cleanup_status") == "timeout_delete_failed"
+                if (len(replacements) > 1 or (replacements and not valid_replacement) or
+                        cleanup_job.get("state") != "failed" or
+                        cleanup_job.get("timed_out") is not True or cleanup_job.get("phase") != "remote_started" or
+                        cleanup_job.get("submitted") is not True or cleanup_job.get("generated") is not False or
+                        not re.fullmatch(r"/c/[a-f0-9-]{36}", cleanup_job.get("chat_path", ""))):
+                    raise ValueError("timeout cleanup is not safe to resume; inspect MCP status")
+                if failed_cleanup:
+                    retry_count = cleanup_job.get("cleanup_retry_count", 0)
+                    error_history = cleanup_job.get("cleanup_error_history", [])
+                    previous_error = cleanup_job.get("cleanup_error")
+                    if (type(retry_count) is not int or retry_count < 0 or not isinstance(error_history, list) or
+                            any(not isinstance(item, str) for item in error_history) or
+                            (previous_error is not None and not isinstance(previous_error, str))):
+                        raise ValueError("timeout cleanup retry history is invalid; inspect MCP status")
+                if (self.client and time.monotonic() - self.client.get("seen", 0) <= 90 and
+                        self.client.get("client_id") != client_id):
+                    raise ValueError("original extension must be offline before cleanup recovery")
+                if failed_cleanup:
+                    previous_error = cleanup_job.get("cleanup_error")
+                    if previous_error:
+                        cleanup_job.setdefault("cleanup_error_history", []).append(previous_error[:500])
+                    cleanup_job["cleanup_retry_count"] = cleanup_job.get("cleanup_retry_count", 0) + 1
+                    cleanup_job["cleanup_status"] = "timeout_delete_pending"
+                    cleanup_job.pop("cleanup_error", None)
+                cleanup_job["client_id"] = client_id
+                self._save(cleanup_job)
+                if replacements:
+                    replacements[0]["client_id"] = client_id
+                    self._save(replacements[0])
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
                            "tab_ready": True, "input_protocol": input_protocol, "tab_id": tab_id}
-            return {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
+            result = {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
+            if cleanup_job is not None:
+                result.update(cleanup_pending=True, timeout_cleanup_job={key: cleanup_job[key] for key in
+                    ("job_id", "prompt", "expected_model", "mode", "chat_path") if key in cleanup_job})
+            return result
 
     def heartbeat(self, client_id: str, account: str, visible_model: str = "Create image",
                   tab_ready: bool = False, input_protocol: int = 0,
@@ -396,6 +482,11 @@ class ExtensionQueue:
 
     def _next_action(self) -> str:
         """One machine-readable next step. Never includes page content or a tab URL."""
+        running = self.client.get("worker_version") if self.client else None
+        installed = repo_extension_version()
+        if (running and installed and running != installed and
+                any(job.get("cleanup_status") == "timeout_delete_pending" for job in self.jobs.values())):
+            return "reload_extension"
         if any(job_holds_tab(job) for job in self.jobs.values()):
             return "wait"
         if self.halted_job:
@@ -427,6 +518,31 @@ class ExtensionQueue:
             raise ValueError("extension is not paired")
         self.client["seen"] = time.monotonic()
 
+    def _generation_timing(self) -> dict:
+        durations = []
+        for job_id, job in reversed(list(self.jobs.items())):
+            if job.get("state") != "complete" or job.get("generated") is not True:
+                continue
+            started, completed = job.get("remote_started_at"), job.get("completed_at")
+            duration = completed - started if isinstance(started, (int, float)) and isinstance(completed, (int, float)) else None
+            if duration is None:
+                try:
+                    directory = self.root / job_id
+                    state_path = directory / "state.json"
+                    created = getattr(directory.stat(), "st_birthtime", directory.stat().st_ctime)
+                    duration = state_path.stat().st_mtime - created
+                except OSError:
+                    continue
+            if 30 <= duration <= GENERATION_TIMEOUT_MAX:
+                durations.append(float(duration))
+            if len(durations) == GENERATION_TIMEOUT_SAMPLES:
+                break
+        average = sum(durations) / len(durations) if durations else GENERATION_TIMEOUT_MIN / GENERATION_TIMEOUT_MULTIPLIER
+        timeout = max(GENERATION_TIMEOUT_MIN, min(GENERATION_TIMEOUT_MAX, int((average * GENERATION_TIMEOUT_MULTIPLIER + 14) // 15 * 15)))
+        return {"generation_baseline_seconds": round(average, 1),
+                "generation_timeout_seconds": timeout,
+                "generation_timing_samples": len(durations)}
+
     def submit(self, prompt: str, expected_model: str, mode: str = "create", images=None,
                preflight_only: bool = False, clear_preflight_uploads: bool = False) -> dict:
         if type(preflight_only) is not bool:
@@ -440,6 +556,9 @@ class ExtensionQueue:
         with self.lock:
             if not self.client or time.monotonic() - self.client["seen"] > 90:
                 raise ValueError("pair a logged-in ChatGPT tab and wait for its heartbeat first")
+            if any(job.get("timed_out") is True and job.get("cleanup_status") in
+                   {"timeout_delete_pending", "timeout_delete_failed"} for job in self.jobs.values()):
+                raise ValueError("finish timeout cleanup for the exact stalled chat before creating another image")
             open_jobs = [job for job in self.jobs.values() if job_occupies_tab(job)]
             if len(open_jobs) >= MAX_WAITING_JOBS:
                 raise ValueError(f"image queue is full ({MAX_WAITING_JOBS} jobs); call wait for {open_jobs[0]['job_id']}. Do not resolve or send again.")
@@ -454,8 +573,9 @@ class ExtensionQueue:
             if clear_preflight_uploads and self.client.get("input_protocol", 0) < 3:
                 raise ValueError("protocol 3 is required to clear verified preflight uploads")
             job = {"job_id": uuid.uuid4().hex, "state": "queued", "phase": "prepared",
-                   "prompt": prompt, "account": self.account,
-                   "expected_model": expected_model.strip(), "client_id": self.client["client_id"], "mode": mode}
+                   "prompt": prompt, "account": self.account, "created_at": time.time(),
+                   "expected_model": expected_model.strip(), "client_id": self.client["client_id"], "mode": mode,
+                   "retry_count": 0, **self._generation_timing()}
             if inputs:
                 directory = self.root / job["job_id"]
                 directory.mkdir(mode=0o700)
@@ -509,6 +629,7 @@ class ExtensionQueue:
                     raise ValueError("job chat binding changed")
                 job["chat_path"] = chat_path
             job["phase"] = phase
+            job[f"{phase}_at"] = time.time()
             self._save(job)
             return self.status(job_id)
 
@@ -527,12 +648,13 @@ class ExtensionQueue:
                         self._save(job)
                         raise ValueError(job["error"])
                     job["state"] = "claimed"
+                    job["claimed_at"] = time.time()
                     job["delivered"] = True
                     job["phase_capable"] = self.client.get("tab_id") is not None
                     if job["phase_capable"]:
                         job["browser_tab_id"] = self.client["tab_id"]  # Bind when the job actually starts, not when it queued.
                     self._save(job)  # Persist BEFORE delivery. Never repeat on uncertain response.
-                    claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed", "collect_only", "preserve_chat", "recovery_chat_path") if k in job}
+                    claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed", "collect_only", "preserve_chat", "recovery_chat_path", "generation_timeout_seconds", "generation_baseline_seconds", "generation_timing_samples", "retry_count", "replaces_job_id") if k in job}
                     if job.get("collect_only"):
                         if job.get("output_binding_revision") == 2:
                             claimed["output_binding_revision"] = 2
@@ -596,7 +718,7 @@ class ExtensionQueue:
             if preflight_uploads_cleared and not (job.get("clear_preflight_uploads") or job.get("failed_upload_cleanup")):
                 raise ValueError("preflight upload clearing was not requested")
             if error is not None:
-                job.update(state="failed", error=str(error)[:500])
+                job.update(state="failed", error=str(error)[:500], completed_at=time.time())
             elif job.get("failed_upload_cleanup"):
                 if not preflight_ready or not preflight_uploads_cleared or image_base64 or images_base64 is not None or cleanup_pending or chat_path:
                     raise ValueError("failed-upload cleanup requires only an empty-composer no-Send receipt")
@@ -657,7 +779,7 @@ class ExtensionQueue:
                             output.write(raw)
                     outputs.append({"order": index, "image_path": str(path), "dimensions": dimensions,
                                     "sha256": digest, "bytes": len(raw)})
-                job.update(state="complete", phase="completed", outputs=outputs, output_count=len(outputs), source=source,
+                job.update(state="complete", phase="completed", completed_at=time.time(), outputs=outputs, output_count=len(outputs), source=source,
                            submitted=True, generated=True,
                            cleanup_status="preserved" if job.get("preserve_chat") or len(outputs) > 1 else "pending" if cleanup_pending else "not_requested",
                            quality_note="Rendered asset; original download resolution not verified.")
@@ -667,6 +789,55 @@ class ExtensionQueue:
                     job["chat_path"] = chat_path
             if prompt_binding is not None:
                 job["prompt_binding"] = dict(prompt_binding)
+            self._save(job)
+            return self.status(job_id)
+
+    def timeout(self, client_id: str, job_id: str, chat_path: str) -> dict:
+        """End one proven-stalled generation and queue at most one replacement after exact-chat cleanup."""
+        with self.lock:
+            self._client(client_id)
+            job = self.jobs.get(job_id)
+            if (not job or job.get("client_id") != client_id or job.get("state") != "claimed" or
+                    job.get("phase") != "remote_started" or job.get("chat_path") != chat_path):
+                raise ValueError("adaptive timeout is not bound to this running job and exact chat")
+            started = job.get("remote_started_at")
+            timeout = job.get("generation_timeout_seconds")
+            if not isinstance(started, (int, float)) or type(timeout) is not int or time.time() - started < timeout:
+                raise ValueError("adaptive generation timeout has not elapsed")
+            retry_count = job.get("retry_count", 0)
+            can_replace = (type(retry_count) is int and retry_count < MAX_TIMEOUT_REPLACEMENTS and
+                           job.get("mode", "create") == "create" and not job.get("images"))
+            replacement = None
+            if can_replace:
+                replacement = {"job_id": uuid.uuid4().hex, "state": "queued", "phase": "prepared",
+                               "prompt": job["prompt"], "account": self.account, "created_at": time.time(),
+                               "expected_model": job["expected_model"], "client_id": client_id, "mode": "create",
+                               "retry_count": retry_count + 1, "replaces_job_id": job_id,
+                               **self._generation_timing(),
+                               **({"auto_delete_saved_chat": True} if self.auto_delete_saved_chats else {})}
+            job.update(state="failed", timed_out=True, inspected=True, submitted=True, generated=False,
+                       completed_at=time.time(), cleanup_status="timeout_delete_pending",
+                       error=f"Adaptive timeout after {timeout}s; deleting the exact stalled chat before replacement.")
+            if replacement:
+                job["replacement_job_id"] = replacement["job_id"]
+            self._save(job)
+            if replacement:
+                self.jobs[replacement["job_id"]] = replacement
+                self._save(replacement)
+            return self.status(job_id)
+
+    def timeout_cleanup(self, client_id: str, job_id: str, deleted: bool, error: str = "") -> dict:
+        if type(deleted) is not bool or not isinstance(error, str):
+            raise ValueError("invalid timeout cleanup receipt")
+        with self.lock:
+            self._client(client_id)
+            job = self.jobs.get(job_id)
+            if (not job or job.get("client_id") != client_id or job.get("state") != "failed" or
+                    job.get("timed_out") is not True or job.get("cleanup_status") != "timeout_delete_pending"):
+                raise ValueError("timeout cleanup is not pending for this job")
+            job["cleanup_status"] = "deleted" if deleted else "timeout_delete_failed"
+            if not deleted:
+                job["cleanup_error"] = error[:500] or "Timed-out chat deletion was not confirmed"
             self._save(job)
             return self.status(job_id)
 
@@ -737,6 +908,10 @@ class ExtensionQueue:
                    "cleanup_status": job.get("cleanup_status"), "error": job.get("error"),
                    "submitted": job.get("submitted"), "generated": job.get("generated"),
                    "wait_timed_out": wait_timed_out}
+        for key in ("generation_baseline_seconds", "generation_timeout_seconds", "generation_timing_samples",
+                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count"):
+            if key in job:
+                receipt[key] = job[key]
         copied = short_outputs(job)
         if copied:
             receipt["outputs"] = copied
@@ -820,7 +995,11 @@ class ExtensionQueue:
             job = self.jobs.get(job_id)
             if not job or not isinstance(client_id, str) or not hmac.compare_digest(job["client_id"], client_id):
                 raise ValueError("job does not belong to this extension")
-            return self.status(job_id)
+            result = self.status(job_id)
+            if job.get("cleanup_status") == "timeout_delete_pending":
+                result["timeout_cleanup_job"] = {key: job[key] for key in
+                    ("job_id", "prompt", "expected_model", "mode", "chat_path") if key in job}
+            return result
 
     def resolve(self, job_id: str, clear_preflight_uploads: bool = False,
                 clear_failed_uploads: bool = False, native_upload_names: list[str] | None = None,
@@ -990,7 +1169,8 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                     raise ValueError("request must be an object")
                 if self.path == "/pair":
                     result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""),
-                                        data.get("input_protocol", 0), data.get("tab_id"))
+                                        data.get("input_protocol", 0), data.get("tab_id"),
+                                        data.get("retry_timeout_cleanup", False))
                 elif self.path == "/heartbeat":
                     result = queue.heartbeat(**data)
                 elif self.path == "/phase":
@@ -999,6 +1179,10 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                     result = queue.claim(data["client_id"])
                 elif self.path == "/result":
                     result = queue.result(**data)
+                elif self.path == "/timeout":
+                    result = queue.timeout(**data)
+                elif self.path == "/timeout-cleanup":
+                    result = queue.timeout_cleanup(**data)
                 elif self.path == "/cleanup":
                     result = queue.cleanup(**data)
                 elif self.path == "/cleanup-confirmation":
@@ -1051,6 +1235,10 @@ def compact_status(raw: dict) -> dict:
                    "wait_timed_out": raw.get("wait_timed_out", False)}
         if raw.get("queue_position") is not None:
             receipt["queue_position"] = raw["queue_position"]
+        for key in ("generation_baseline_seconds", "generation_timeout_seconds", "generation_timing_samples",
+                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count"):
+            if key in raw:
+                receipt[key] = raw[key]
         copied = short_outputs(raw)
         if copied:
             receipt["outputs"] = copied
@@ -1073,7 +1261,7 @@ def compact_status(raw: dict) -> dict:
 
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
-    server = FastMCP("gpt-bridge", instructions="Use one persistent paired browser owner. Call status, optionally preflight uploads, then generate or edit exactly once. Use job or wait for durable phase receipts. Never replay a job after submit_attempted.")
+    server = FastMCP("gpt-bridge", instructions="Use one persistent paired browser owner. Call status, optionally preflight uploads, then generate or edit exactly once. Use job or wait for durable phase receipts. A proven adaptive timeout may create one replacement only after the exact stalled chat is deleted.")
 
     @server.tool()
     def status(job_id: str = "") -> dict:

@@ -8,7 +8,7 @@ const labels = {
 };
 const nextActions = {
   checking: "รอผลการตรวจสักครู่",
-  unpaired: "เปิดแชตปกติ เลือก Create image แล้วเชื่อมครั้งแรก",
+  unpaired: "เปิด ChatGPT บัญชี second แล้วยืนยันก่อนเชื่อม ส่วนขยายจะเตรียมแชต Create image ให้เอง",
   ready: "สั่งภาพผ่าน MCP ได้เลย",
   busy: "รอให้งานนี้จบ อย่าส่งซ้ำ",
   complete: "สั่งภาพถัดไปผ่าน MCP ได้",
@@ -62,7 +62,7 @@ function render(status) {
   const job = status.lastJob;
   $("#collect").hidden = !status.active || (job?.job_id === status.active.jobId && job.state === "complete");
   $("#disconnect").disabled = !!status.active || busy;
-  $("#reload").disabled = !!status.active || busy;
+  $("#reload").disabled = busy || state === "confirmation_required";
   $("#latest-job").hidden = !job;
   $("#last-job").textContent = !job ? "" : job.uploads_cleared
     ? "นำไฟล์แนบของงานที่หยุดก่อนส่งออกแล้ว · ไม่ได้เจนภาพ"
@@ -113,7 +113,7 @@ $("#pair-form").onsubmit = event => {
 $("#refresh").onclick = () => void action(() => refresh());
 $("#reload").onclick = () => void action(async () => {
   const status = await chrome.runtime.sendMessage({type: "get-status", refresh: false});
-  if (status?.error || status?.active) throw new Error("รอให้งานภาพที่กำลังทำอยู่จบก่อนโหลดส่วนขยายใหม่");
+  if (status?.error) throw new Error("ยังอ่านสถานะส่วนขยายไม่ได้");
   chrome.runtime.reload();
 });
 $("#relink").onclick = () => {

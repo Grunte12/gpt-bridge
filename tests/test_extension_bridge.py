@@ -6,13 +6,16 @@ import hashlib
 import io
 import json
 import stat
+import time
+import os
 import uuid
 
 import pytest
 from PIL import Image
 
 from chatgpt_api.extension_bridge import (
-    ExtensionQueue, MAX_IMAGE, compact_status, create_mcp, main, make_handler,
+    ExtensionQueue, GENERATION_TIMEOUT_MAX, MAX_IMAGE, OUTPUT_BINDING_REVISIONS,
+    compact_status, create_mcp, main, make_handler,
 )
 
 
@@ -197,6 +200,30 @@ def _call_post(handler_type, path, payload, *, token=TOKEN, origin=EXTENSION_ORI
     handler.end_headers = lambda: None
     handler.do_POST()
     return statuses[-1], json.loads(handler.wfile.getvalue())
+
+
+def _call_options(handler_type, *, origin=EXTENSION_ORIGIN, host="127.0.0.1:8767"):
+    handler = object.__new__(handler_type)
+    handler.headers = {"Host": host, "Origin": origin}
+    statuses = []
+    response_headers = {}
+    handler.send_response = statuses.append
+    handler.send_header = response_headers.__setitem__
+    handler.end_headers = lambda: None
+    handler.do_OPTIONS()
+    return statuses[-1], response_headers
+
+
+def test_options_allows_ordinary_extension_cors_preflight_without_legacy_pna_headers(tmp_path):
+    handler_type = make_handler(ExtensionQueue(tmp_path / "queue", ACCOUNT), TOKEN, 8767)
+
+    status, headers = _call_options(handler_type)
+
+    assert status == 204
+    assert headers["Access-Control-Allow-Origin"] == EXTENSION_ORIGIN
+    assert "Access-Control-Allow-Private-Network" not in headers
+    assert "Private-Network-Access-Name" not in headers
+    assert "Private-Network-Access-ID" not in headers
 
 
 def test_pairing_checks_account_and_client_identity(tmp_path):
@@ -676,6 +703,10 @@ def test_claim_is_at_most_once_and_public_status_hides_private_fields(tmp_path):
         "prompt": "Draw a green pear.",
         "expected_model": "Create image",
         "mode": "create",
+        "generation_baseline_seconds": 120.0,
+        "generation_timeout_seconds": 300,
+        "generation_timing_samples": 0,
+        "retry_count": 0,
     }
     assert queue.claim(CLIENT_ID) == {}
     assert "prompt" not in job
@@ -2490,3 +2521,319 @@ def test_reload_script_names_an_old_worker_and_offline_refusal():
     offline = _FakeClient([_script_status()], reload_error="reload not requested: next_action is wait_for_extension")
     assert _run_script(offline) == (1, "reload not requested: next_action is wait_for_extension")
     assert _run_script(_FakeClient([_script_status()]), wait=0)[0] == 0
+
+
+def test_adaptive_timeout_uses_recent_successes_and_auto_deletes_success_chats(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT, auto_delete_saved_chats=True)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    now = 1_000_000.0
+    for index, duration in enumerate((88.0, 121.0, 148.0, 102.0, 210.0)):
+        job_id = f"{index + 1:032x}"
+        job = {"job_id": job_id, "state": "complete", "phase": "completed", "account": ACCOUNT,
+               "client_id": CLIENT_ID, "generated": True, "remote_started_at": now,
+               "completed_at": now + duration, "cleanup_status": "preserved"}
+        queue.jobs[job_id] = job
+        queue._save(job)
+        now += duration
+    submitted = queue.submit("A future AI device.", "Create image")
+    assert submitted["generation_baseline_seconds"] == 133.8
+    assert submitted["generation_timeout_seconds"] == 345
+    assert queue.jobs[submitted["job_id"]]["auto_delete_saved_chat"] is True
+    assert "preserve_chat" not in queue.jobs[submitted["job_id"]]
+
+
+def test_adaptive_timeout_deletes_exact_chat_before_one_new_chat_replacement(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT, auto_delete_saved_chats=True)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("A future AI device.", "Create image")
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    timed_out = queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    replacement_id = timed_out["replacement_job_id"]
+    assert timed_out["timed_out"] is True
+    assert timed_out["cleanup_status"] == "timeout_delete_pending"
+    assert queue.claim(CLIENT_ID) == {}
+    cleaned = queue.timeout_cleanup(CLIENT_ID, job_id, True)
+    assert cleaned["cleanup_status"] == "deleted"
+    replacement = queue.claim(CLIENT_ID)
+    assert replacement["job_id"] == replacement_id
+    assert replacement["replaces_job_id"] == job_id
+    assert replacement["retry_count"] == 1
+    assert queue.jobs[replacement_id]["auto_delete_saved_chat"] is True
+    assert "preserve_chat" not in queue.jobs[replacement_id]
+
+
+def test_adaptive_timeout_never_loops_after_replacement(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("A future AI device.", "Create image")
+    first_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, first_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, first_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[first_id]["remote_started_at"] -= queue.jobs[first_id]["generation_timeout_seconds"] + 1
+    replacement_id = queue.timeout(CLIENT_ID, first_id, RESULT_CHAT_PATH)["replacement_job_id"]
+    queue.timeout_cleanup(CLIENT_ID, first_id, True)
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, replacement_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, replacement_id, "remote_started", 17, OTHER_RESULT_CHAT_PATH)
+    queue.jobs[replacement_id]["remote_started_at"] -= queue.jobs[replacement_id]["generation_timeout_seconds"] + 1
+    final = queue.timeout(CLIENT_ID, replacement_id, OTHER_RESULT_CHAT_PATH)
+    assert final["timed_out"] is True
+    assert "replacement_job_id" not in final
+
+
+def test_restart_migrates_only_a_legacy_remote_job_older_than_fifteen_minutes(tmp_path):
+    root = tmp_path / "queue"
+    queue = ExtensionQueue(root, ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("A stalled future AI device.", "Create image")
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    state_path = queue.root / job_id / "state.json"
+    old = time.time() - GENERATION_TIMEOUT_MAX - 1
+    os.utime(state_path, (old, old))
+
+    restarted = ExtensionQueue(root, ACCOUNT, auto_delete_saved_chats=True)
+    migrated = restarted.status(job_id)
+    assert migrated["timed_out"] is True
+    assert migrated["cleanup_status"] == "timeout_delete_pending"
+    replacement = restarted.status(migrated["replacement_job_id"])
+    assert replacement["state"] == "queued"
+    assert replacement["replaces_job_id"] == job_id
+    assert replacement["auto_delete_saved_chat"] is True
+    assert "preserve_chat" not in replacement
+
+
+def test_timeout_cleanup_handoff_is_visible_only_to_the_bound_extension(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("A stalled AI device.", "Create image")
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    private = queue.client_status(CLIENT_ID, job_id)
+    assert private["timeout_cleanup_job"]["prompt"] == "A stalled AI device."
+    assert "timeout_cleanup_job" not in queue.status(job_id)
+
+
+def _timeout_cleanup_waiting_queue(tmp_path, *, keep_replacement_queued=False):
+    queue = ExtensionQueue(tmp_path / "extension-data", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("A stalled AI device.", "Create image")
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    timed_out = queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    replacement_id = timed_out.get("replacement_job_id")
+    if replacement_id and not keep_replacement_queued:
+        replacement = queue.jobs[replacement_id]
+        replacement.update(state="interrupted", error="Server restarted before this job was sent; nothing reached ChatGPT.")
+        queue._save(replacement)
+    return queue, job_id, replacement_id
+
+
+def test_terminal_timeout_cleanup_rebinds_exact_chat_and_keeps_generation_blocked(tmp_path):
+    queue, job_id, replacement_id = _timeout_cleanup_waiting_queue(tmp_path)
+    new_client_id = str(uuid.uuid4())
+    original = queue.jobs[job_id]
+    saved_fields = {key: original[key] for key in ("state", "phase", "cleanup_status", "chat_path", "timed_out", "submitted", "generated")}
+    queue.client = None
+    handler = make_handler(queue, TOKEN, 8767)
+
+    status, paired = _call_post(handler, "/pair", {
+        "client_id": new_client_id, "account": ACCOUNT, "visible_model": "Create image",
+        "input_protocol": 4, "tab_id": 21,
+    })
+
+    assert status == 200
+    assert paired["paired"] is True and paired["cleanup_pending"] is True
+    assert paired["timeout_cleanup_job"] == {
+        "job_id": job_id, "prompt": "A stalled AI device.", "expected_model": "Create image",
+        "mode": "create", "chat_path": RESULT_CHAT_PATH,
+    }
+    assert {key: queue.jobs[job_id][key] for key in saved_fields} == saved_fields
+    assert queue.jobs[job_id]["client_id"] == new_client_id
+    assert queue.status()["next_action"] == "wait"
+    assert queue.claim(new_client_id) == {}
+    with pytest.raises(ValueError, match="finish timeout cleanup"):
+        queue.submit("A new image.", "Create image")
+
+    cleaned = queue.timeout_cleanup(new_client_id, job_id, True)
+    assert cleaned["cleanup_status"] == "deleted"
+    assert queue.claim(new_client_id) == {}
+    if replacement_id:
+        assert queue.jobs[replacement_id]["state"] == "interrupted"
+
+
+def test_timeout_cleanup_rebind_rejects_invalid_identity_and_overlapping_jobs(tmp_path):
+    queue, job_id, _ = _timeout_cleanup_waiting_queue(tmp_path)
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        queue.pair(new_client_id, "primary", "Create image", 4, 21)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        queue.pair("not-a-uuid", ACCOUNT, "Create image", 4, 21)
+    assert queue.client is None
+    assert queue.jobs[job_id]["client_id"] == CLIENT_ID
+
+    overlap_id = uuid.uuid4().hex
+    overlap = {"job_id": overlap_id, "state": "claimed", "phase": "prepared", "account": ACCOUNT,
+               "client_id": CLIENT_ID, "prompt": "Overlapping work.", "expected_model": "Create image", "mode": "create"}
+    queue.jobs[overlap_id] = overlap
+    queue._save(overlap)
+    with pytest.raises(ValueError, match="finish the current job"):
+        queue.pair(new_client_id, ACCOUNT, "Create image", 4, 21)
+    assert queue.jobs[job_id]["client_id"] == CLIENT_ID
+
+
+def test_timeout_cleanup_rebind_rejects_a_linked_queued_replacement(tmp_path):
+    queue, job_id, replacement_id = _timeout_cleanup_waiting_queue(tmp_path, keep_replacement_queued=True)
+    assert replacement_id
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+
+    with pytest.raises(ValueError, match="finish the current job"):
+        queue.pair(new_client_id, ACCOUNT, "Create image", 4, 21)
+
+    assert queue.client is None
+    assert queue.jobs[job_id]["client_id"] == CLIENT_ID
+    assert queue.jobs[replacement_id]["client_id"] == CLIENT_ID
+    assert queue.jobs[replacement_id]["state"] == "queued"
+
+
+def test_pair_still_rejects_nonterminal_jobs_and_extension_035_keeps_binding_revision_two(tmp_path):
+    queue = _paired_queue(tmp_path)
+    submitted = queue.submit("One active image.", "Create image")
+    queue.claim(CLIENT_ID)
+    queue.client = None
+
+    with pytest.raises(ValueError, match="finish the current job"):
+        queue.pair(str(uuid.uuid4()), ACCOUNT, "Create image", 4, 21)
+    assert queue.jobs[submitted["job_id"]]["state"] == "claimed"
+    assert OUTPUT_BINDING_REVISIONS["0.1.35"] == 2
+
+
+def _timeout_cleanup_failed_queue(tmp_path, *, keep_replacement_queued=False):
+    queue, job_id, replacement_id = _timeout_cleanup_waiting_queue(
+        tmp_path, keep_replacement_queued=keep_replacement_queued)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False, "exact_chat_guard")
+    return queue, job_id, replacement_id
+
+
+def test_failed_timeout_cleanup_requires_an_explicit_pair_retry_without_mutation(tmp_path):
+    queue, job_id, _ = _timeout_cleanup_failed_queue(tmp_path)
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+    before = dict(queue.jobs[job_id])
+    handler = make_handler(queue, TOKEN, 8767)
+
+    status, body = _call_post(handler, "/pair", {
+        "client_id": new_client_id, "account": ACCOUNT, "visible_model": "Create image",
+        "input_protocol": 4, "tab_id": 21,
+    })
+
+    assert status == 400
+    assert "explicitly retry" in body["error"]
+    assert queue.client is None
+    assert queue.jobs[job_id] == before
+
+
+@pytest.mark.parametrize("retry_value", ["true", 1, None])
+def test_pair_rejects_non_boolean_timeout_cleanup_retry(tmp_path, retry_value):
+    queue, job_id, _ = _timeout_cleanup_failed_queue(tmp_path)
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+    before = dict(queue.jobs[job_id])
+    handler = make_handler(queue, TOKEN, 8767)
+
+    status, body = _call_post(handler, "/pair", {
+        "client_id": new_client_id, "account": ACCOUNT, "visible_model": "Create image",
+        "input_protocol": 4, "tab_id": 21, "retry_timeout_cleanup": retry_value,
+    })
+
+    assert status == 400
+    assert "must be a boolean" in body["error"]
+    assert queue.client is None
+    assert queue.jobs[job_id] == before
+
+
+def test_explicit_failed_timeout_cleanup_retry_returns_saved_handoff_and_never_replays(tmp_path):
+    queue, job_id, replacement_id = _timeout_cleanup_failed_queue(tmp_path)
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+    original = queue.jobs[job_id]
+    saved_fields = {key: original[key] for key in
+                    ("state", "phase", "chat_path", "timed_out", "submitted", "generated")}
+    existing_job_ids = set(queue.jobs)
+    handler = make_handler(queue, TOKEN, 8767)
+
+    status, paired = _call_post(handler, "/pair", {
+        "client_id": new_client_id, "account": ACCOUNT, "visible_model": "Create image",
+        "input_protocol": 4, "tab_id": 21, "retry_timeout_cleanup": True,
+    })
+
+    assert status == 200
+    assert paired["paired"] is True and paired["cleanup_pending"] is True
+    assert paired["timeout_cleanup_job"] == {
+        "job_id": job_id, "prompt": "A stalled AI device.", "expected_model": "Create image",
+        "mode": "create", "chat_path": RESULT_CHAT_PATH,
+    }
+    assert {key: queue.jobs[job_id][key] for key in saved_fields} == saved_fields
+    assert queue.jobs[job_id]["client_id"] == new_client_id
+    assert queue.jobs[job_id]["cleanup_status"] == "timeout_delete_pending"
+    assert queue.jobs[job_id]["cleanup_retry_count"] == 1
+    assert queue.jobs[job_id]["cleanup_error_history"] == ["exact_chat_guard"]
+    assert "cleanup_error" not in queue.jobs[job_id]
+    assert queue.claim(new_client_id) == {}
+    with pytest.raises(ValueError, match="finish timeout cleanup"):
+        queue.submit("A new image.", "Create image")
+
+    cleaned = queue.timeout_cleanup(new_client_id, job_id, True)
+
+    assert cleaned["cleanup_status"] == "deleted"
+    assert set(queue.jobs) == existing_job_ids
+    assert queue.claim(new_client_id) == {}
+    if replacement_id:
+        assert queue.jobs[replacement_id]["state"] == "interrupted"
+
+
+def test_explicit_timeout_cleanup_retry_still_rejects_queued_replacement_and_bad_owner(tmp_path):
+    queue, job_id, replacement_id = _timeout_cleanup_failed_queue(tmp_path, keep_replacement_queued=True)
+    assert replacement_id
+    queue.client = None
+    new_client_id = str(uuid.uuid4())
+    before = dict(queue.jobs[job_id])
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        queue.pair(new_client_id, "primary", "Create image", 4, 21, retry_timeout_cleanup=True)
+    with pytest.raises(ValueError, match="finish the current job"):
+        queue.pair(new_client_id, ACCOUNT, "Create image", 4, 21, retry_timeout_cleanup=True)
+
+    assert queue.client is None
+    assert queue.jobs[job_id] == before
+    assert queue.jobs[replacement_id]["state"] == "queued"
+    assert queue.jobs[replacement_id]["client_id"] == CLIENT_ID
+
+
+def test_timeout_cleanup_retry_flag_only_accepts_a_failed_cleanup(tmp_path):
+    queue, job_id, _ = _timeout_cleanup_waiting_queue(tmp_path)
+    queue.client = None
+    before = dict(queue.jobs[job_id])
+
+    with pytest.raises(ValueError, match="no failed timeout cleanup"):
+        queue.pair(str(uuid.uuid4()), ACCOUNT, "Create image", 4, 21, retry_timeout_cleanup=True)
+
+    assert queue.client is None
+    assert queue.jobs[job_id] == before

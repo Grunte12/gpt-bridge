@@ -471,6 +471,37 @@
       throw new Error("Deletion confirmation timed out; saved image is safe, do not repeat automatically");
     } finally { finalDelete.removeEventListener("click", confirmation, {capture: true}); }
   }
+  async function deleteTimedOutChat(message) {
+    if (!message?.job || message.jobId !== message.job.job_id || message.chatPath !== location.pathname ||
+        !/^\/c\/[a-f0-9-]{36}$/.test(message.chatPath))
+      throw new Error("Only the exact timed-out job chat can be deleted");
+    if (verificationRequired())
+      throw new Error("Owner action required: complete verification in ChatGPT and inspect the timed-out chat. Nothing was deleted.");
+    const users = turnHeadings("You said:");
+    if (users.length !== 1 || !users[0].nextElementSibling ||
+        originalPromptBinding(message.job).root_match !== true)
+      throw new Error("Timed-out chat no longer matches its original prompt");
+    const stop = [...document.querySelectorAll('[data-testid="stop-button"], button[aria-label="Stop"]')].find(visible);
+    if (stop) {
+      stop.click();
+      await waitFor(() => !busy(), "Timed-out generation did not stop");
+    }
+    const more = [...document.querySelectorAll('button[aria-label="More"]')].find(visible);
+    if (!more) throw new Error("Native chat menu unavailable for timed-out cleanup");
+    more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
+    const remove = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
+      visible(el) && normalizedText(el.textContent) === "Delete"), "Native Delete control unavailable");
+    if (location.pathname !== message.chatPath) throw new Error("Timed-out chat changed before cleanup");
+    remove.click();
+    const dialog = await waitFor(() => [...document.querySelectorAll('[role="dialog"]')].find(el =>
+      visible(el) && [...el.querySelectorAll("button")].some(button => normalizedText(button.textContent) === "Delete chat")),
+      "Native deletion confirmation unavailable");
+    const finalDelete = [...dialog.querySelectorAll("button")].find(button => normalizedText(button.textContent) === "Delete chat");
+    if (!visible(finalDelete) || finalDelete.disabled) throw new Error("Timed-out Delete chat control unavailable");
+    finalDelete.click();
+    await waitFor(() => location.pathname !== message.chatPath, "Timed-out chat deletion was not confirmed");
+    return {deleted: true};
+  }
   async function run(job, collectOnly = false) {
     let submitted = collectOnly;
     let promptBinding = null;
@@ -545,7 +576,10 @@
         await reportPhase(job, "submit_attempted");
         send.click();
       }
-      const deadline = Date.now() + 15 * 60 * 1000;
+      const timeoutSeconds = Number.isInteger(job.generation_timeout_seconds) &&
+        job.generation_timeout_seconds >= 300 && job.generation_timeout_seconds <= 900
+        ? job.generation_timeout_seconds : 15 * 60;
+      const deadline = Date.now() + timeoutSeconds * 1000;
       let previous = "", stable = 0;
       let remoteStarted = collectOnly;
       while (Date.now() < deadline) {
@@ -599,8 +633,13 @@
         if (result?.error) throw new Error("Image result could not be saved. Inspect ChatGPT; do not regenerate.");
         return;
       }
-      // Name what the page looked like, so a finished image the detector missed is distinguishable from a slow one.
-      throw new Error("Timed out; generation may still complete. Inspect ChatGPT before resubmitting. DOM: " + JSON.stringify(resultDomDiagnostics()));
+      const livePath = /^\/c\/[a-f0-9-]{36}$/.test(location.pathname) ? location.pathname : "";
+      if (remoteStarted && livePath) {
+        const timedOut = await chrome.runtime.sendMessage({type: "image-timeout", jobId: job.job_id, chatPath: livePath});
+        if (timedOut?.ok === true) return;
+        throw new Error(timedOut?.error || "Adaptive timeout cleanup failed; inspect ChatGPT before any new request");
+      }
+      throw new Error("Timed out before a remote chat was bound. Inspect ChatGPT before resubmitting. DOM: " + JSON.stringify(resultDomDiagnostics()));
     } catch (error) {
       await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
         ...(job.collect_only && promptBinding ? {promptBinding} : {}),
@@ -608,6 +647,10 @@
     } finally { running = false; uploadBinding = null; }
   }
   const listener = (message, _sender, reply) => {
+    if (message.type === "image-delete-timeout") {
+      void deleteTimedOutChat(message).then(reply, error => reply({error: error.message}));
+      return true;
+    }
     if (message.type === "image-delete") {
       void deleteSavedChat(message).then(reply, error => reply({error: error.message}));
       return true;

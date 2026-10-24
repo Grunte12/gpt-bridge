@@ -5,6 +5,60 @@ the ordinary ChatGPT composer in **one owner-paired tab**, not CDP, screenshots,
 Playwright, browser-control MCP, captured requests or ChatGPT verification tokens.
 The tab still has to remain open and logged in; this is not a browser-free API.
 
+## Dedicated browser (recommended)
+
+Keep the owner tab out of personal Chrome. GPT Bridge runs a separate Chrome
+process with its own persistent profile and this unpacked extension. Chrome 137+
+branded builds ignore `--load-extension`; the launcher prefers Chrome for Testing
+or Chromium and refuses a branded build that cannot load the extension. On macOS,
+it also finds an extracted Chrome for Testing build under
+`~/.local/share/gpt-bridge/browser/second/chrome-for-testing/`.
+
+The unattended process uses ordinary Chrome with its dedicated window positioned
+off-screen. ChatGPT does not mount its composer in headless mode on this account.
+The launcher does not enable CDP, inspect personal tabs, clone cookies, or reuse the
+normal Chrome profile. A given user-data directory can belong to one Chrome process
+at a time. Stop the dedicated setup window before starting background mode, and keep
+personal Chrome on its own profile.
+
+Do the login and pairing once in the visible setup process:
+
+```sh
+# Refuses to open while the hidden process owns the profile.
+.venv/bin/python -m chatgpt_api.dedicated_browser setup --account second
+```
+
+In that window, sign in to the `second` ChatGPT account, open ChatGPT, and select
+its tab in the GPT Bridge popup. Enter the local key and confirm `second` to pair.
+The extension inspects the selected tab without navigating, then prepares a fresh
+normal chat with native Create image. Drafts, running work, and pending cleanup
+stop preparation without clearing or submitting anything. Close that dedicated
+setup window when pairing is complete, then start the hidden process:
+
+```sh
+scripts/ensure-chatgpt-tab.sh
+.venv/bin/python -m chatgpt_api.dedicated_browser status --account second --json
+.venv/bin/python -m chatgpt_api.dedicated_browser stop --account second
+```
+
+`stop` checks both the recorded supervisor command and the exact dedicated
+`--user-data-dir` before it sends a signal, so it cannot close personal Chrome.
+The profile lock also prevents setup and background modes from running together.
+If ChatGPT needs login or verification, stop background mode and use `setup` as the
+visible dedicated owner. Never copy cookies from another profile.
+
+For login-time startup on macOS, write the separate browser LaunchAgent, then
+load it with `launchctl` when ready. Installation only writes the plist; it does
+not launch Chrome:
+
+```sh
+.venv/bin/python -m chatgpt_api.dedicated_browser install-launch-agent --account second
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.grunte.gpt-bridge-browser-second.plist
+```
+
+This LaunchAgent is separate from the Bridge listener service. It starts once at
+login and does not restart Chrome after an intentional exit.
+
 **One live image passed (2026-10-16, extension 0.1.5):** the owner-confirmed
 `second` Plus tab completed job `f6c9497ce09c46afb48a427b201a90c9` through real
 stdio MCP → extension → native Create image → MCP file receipt. The saved PNG is
@@ -103,7 +157,8 @@ image. Submit only when `account=second`, `paired=true`, `extension_online=true`
 and no nonterminal job exists. Preparation refuses a draft, attachments, running
 work, temporary chat, verification screen, missing controls or a closed paired
 tab. It does not clear input, interrupt work, switch accounts, or solve challenges.
-Login/verification and initial pairing remain manual.
+Sign-in, verification, account confirmation, and first-time key entry remain
+manual. The extension prepares the composer after successful pairing.
 
 The Web app can retain an old hidden composer before the current visible one
 after New chat. Composer lookup must inspect all matching editors and select a

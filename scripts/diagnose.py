@@ -17,9 +17,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from chatgpt_api.dedicated_browser import BrowserConfig, default_state_dir, find_chrome, owned_status  # noqa: E402
 from chatgpt_api.extension_bridge import ExtensionClient, read_token  # noqa: E402
 
 DATA_DIR = Path.home() / ".local/share/gpt-bridge/extension/second"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_DOM = " DOM: "  # content.js appends the page report to its timeout error after this marker.
 
 
@@ -51,7 +53,7 @@ def verdict(snapshot: dict, job: dict | None) -> list[str]:
     diag = snapshot.get("extension_diagnostics") or {}
     dom = diag.get("result_dom") or {}
     if not snapshot.get("extension_online"):
-        notes.append("extension offline: no heartbeat in 90 s (reload the extension or open a chatgpt.com tab)")
+        notes.append("extension offline: no heartbeat in 90 s (check the dedicated browser, then reload the extension)")
     if snapshot.get("line_halted"):
         notes.append(f"queue halted by job {snapshot['line_halted']}: inspect ChatGPT, then resolve(job_id, inspected_chatgpt=true)")
     # The worker counts chatgpt.com tabs only while searching for a lost paired tab, so 0 alone means nothing.
@@ -76,14 +78,22 @@ def snapshot_once(client: ExtensionClient, job_id: str | None) -> dict:
     # Without --job, watch the newest claimed job from the status list (state and phase only).
     job = client.call("status", {"job_id": job_id}) if job_id else next(
         (item for item in reversed(status.get("jobs") or []) if item.get("state") == "claimed"), None)
-    return {"at": time.strftime("%H:%M:%S"), "status": status, "job": job, "findings": verdict(status, job)}
+    try:
+        dedicated = owned_status(BrowserConfig("second", find_chrome(), REPO_ROOT / "extensions/chatgpt-image",
+                                               default_state_dir()))
+    except FileNotFoundError:
+        dedicated = {"running": False, "error": "Chrome not found"}
+    return {"at": time.strftime("%H:%M:%S"), "status": status, "job": job, "dedicated_browser": dedicated,
+            "findings": verdict(status, job)}
 
 
 def render(snap: dict) -> str:
     status, job = snap["status"], snap["job"]
     diag = status.get("extension_diagnostics") or {}
+    dedicated = snap.get("dedicated_browser") or {}
     lines = [f"[{snap['at']}] online={status.get('extension_online')} next_action={status.get('next_action')} "
              f"queue_depth={status.get('queue_depth')} halted={status.get('line_halted')}",
+             f"  dedicated browser: running={dedicated.get('running')} mode={dedicated.get('mode') or '-'}",
              f"  extension: repo {status.get('installed_extension_version')} / Chrome {diag.get('worker_version')}, "
              f"receiver={diag.get('content_receiver')}, tab_error={status.get('tab_error') or '-'}",
              f"  page now: {json.dumps(diag.get('result_dom'))}"]

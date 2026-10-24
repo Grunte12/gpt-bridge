@@ -523,6 +523,16 @@ test('image preparation leaves an already-fresh native image chat unchanged', as
   assert.equal(h.editor.value, 'Create image');
 });
 
+test('image preparation turns an ordinary blank composer into native Create image without sending', async () => {
+  const h = contentHarness({imageMode: false});
+  const result = await startPrepare(h);
+  assert.deepEqual({...result}, {fresh: true, model: 'Create image', input_protocol: 4, idle: true});
+  assert.equal(h.clicks, 2);
+  assert.equal(h.editor.value, 'Create image');
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.sendClicks, 0);
+});
+
 test('inspection selects the visible composer when a hidden retained composer comes first', () => {
   const h = contentHarness({newUi: true, hiddenRetainedEditor: true});
   let result;
@@ -597,6 +607,57 @@ test('image preparation fails closed when visible new-chat or image-mode control
     assert.equal(h.clicks, 0);
     assert.equal(h.editor.value, originalText);
   }
+});
+
+test('adaptive timeout deletes only its exact prompt-bound chat', async () => {
+  const prompt = 'draw a cat';
+  const rendered = `Create image Create one image. Return a generated image, not just a description. ${prompt}`;
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:'], conversationBodies: [rendered]});
+  const job = {job_id: 'job-timeout', expected_model: 'Create image', prompt};
+  let result;
+  h.receive({type: 'image-delete-timeout', job, jobId: job.job_id, chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({...result}, {deleted: true});
+  assert.equal(h.finalDeleteClicks, 1);
+  assert.equal(h.location.pathname, '/');
+});
+
+test('timed-out cleanup accepts only the strict original prompt binding with its native leading image chip', async t => {
+  const job = {job_id: 'job-timeout', expected_model: 'Create image', prompt: 'draw a cat'};
+  const expected = 'Create one image. Return a generated image, not just a description. draw a cat';
+  const nativeChip = [{innerText: 'Create image', inlinePill: true, systemHint: true}];
+  const cases = [
+    ['native leading Create image chip', `Create image ${expected}`, nativeChip, true],
+    ['different chip label', `Search ${expected}`, [{innerText: 'Search', inlinePill: true}], false],
+    ['extra wrapper text', `Create image extra wrapper ${expected}`, nativeChip, false],
+    ['prompt mismatch', 'Create image Create one image. Return a generated image, not just a description. draw elsewhere', nativeChip, false]
+  ];
+  for (const [name, body, chips, accepted] of cases) await t.test(name, async () => {
+    const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:'],
+      conversationBodies: [body], userPromptDescendants: chips});
+    let result;
+    h.receive({type: 'image-delete-timeout', job, jobId: job.job_id, chatPath: h.location.pathname}, {}, value => { result = value; });
+    for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+    if (accepted) assert.equal(result.deleted, true);
+    else assert.match(result.error, /Timed-out chat no longer matches its original prompt/);
+    assert.equal(h.finalDeleteClicks, accepted ? 1 : 0);
+    if (!accepted) assert.match(h.location.pathname, /^\/c\//);
+  });
+});
+
+test('adaptive timeout cleanup stops at a verification challenge before clicking native controls', async () => {
+  const prompt = 'draw a cat';
+  const rendered = `Create image Create one image. Return a generated image, not just a description. ${prompt}`;
+  const h = contentHarness({newUi: true, user: true, challenge: true,
+    conversationTurns: ['You said:'], conversationBodies: [rendered]});
+  const job = {job_id: 'job-timeout', expected_model: 'Create image', prompt};
+  let result;
+  h.receive({type: 'image-delete-timeout', job, jobId: job.job_id, chatPath: h.location.pathname}, {}, value => { result = value; });
+  for (let i = 0; i < 20 && result === undefined; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(result.error, /Owner action required: complete verification/);
+  assert.equal(h.finalDeleteClicks, 0);
+  assert.equal(h.clicks, 0);
+  assert.match(h.location.pathname, /^\/c\//);
 });
 
 test('delete requires a saved image receipt from this worker before it can target a chat', async () => {
@@ -1023,7 +1084,7 @@ test('timeout error carries the bounded result DOM snapshot within the stored er
   const h = contentHarness();
   await startContent(h);
   const error = h.sent[0].error;
-  assert.match(error, /^Submission attempted\. Timed out; generation may still complete\. Inspect ChatGPT before resubmitting\. DOM: \{/);
+  assert.match(error, /^Submission attempted\. Timed out before a remote chat was bound\. Inspect ChatGPT before resubmitting\. DOM: \{/);
   const dom = JSON.parse(error.slice(error.indexOf('DOM: ') + 5));
   assert.deepEqual(Object.keys(dom).sort(), ['assistant_body_found', 'assistant_headings', 'assistant_images', 'assistant_role_nodes',
     'busy', 'chat_path', 'conversation_images', 'user_headings']);

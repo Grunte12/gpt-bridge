@@ -99,6 +99,13 @@ test('installed extension version remains visible while offline or when status l
   });
 });
 
+test('popup asks only the worker to refresh localhost status', async () => {
+  const h = harness({configured: true, account: 'second', connection: {state: 'offline'}, active: null, lastJob: null});
+  await settle();
+
+  assert.equal(h.messages[0].type, 'get-status');
+});
+
 test('connection status and a failed latest job are shown separately with a useful input hint', async () => {
   const diagnostic = 'Not submitted. Native image file input missing, ambiguous or incompatible; nothing uploaded.';
   const h = harness({configured: true, account: 'second', connection: {state: 'ready', checkedAt: 1792100000000},
@@ -243,7 +250,7 @@ test('popup initialization error never displays a ready state', async () => {
   assert.notEqual(h.elements.notice.textContent, '');
 });
 
-test('reload requires cached idle status and reloads the extension once', async t => {
+test('reload uses cached status and reloads the extension once', async t => {
   await t.test('idle status reloads once without a fresh poll', async () => {
     const h = harness({configured: true, account: 'second', tabId: 7,
       connection: {state: 'ready'}, active: null, lastJob: null});
@@ -257,16 +264,16 @@ test('reload requires cached idle status and reloads the extension once', async 
     assert.ok(h.messages.some(message => message.type === 'get-status' && message.refresh === false));
   });
 
-  await t.test('active job disables reload and cached status refuses it', async () => {
+  await t.test('active durable job can reload and resume without a replay', async () => {
     const h = harness({configured: true, account: 'second', tabId: 7,
       connection: {state: 'busy'}, active: {jobId: 'job-1'}, lastJob: null});
     await settle();
 
-    assert.equal(h.elements.reload.disabled, true);
+    assert.equal(h.elements.reload.disabled, false);
     h.elements.reload.onclick();
     await settle();
 
-    assert.equal(h.reloads, 0);
+    assert.equal(h.reloads, 1);
     assert.ok(h.messages.some(message => message.type === 'get-status' && message.refresh === false));
   });
 
