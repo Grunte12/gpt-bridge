@@ -1177,3 +1177,7 @@ as `deleted`, and the paired browser showed a new empty Create image composer.
 That receipt did not report a visible variant count, so it does not establish
 whether other variants existed. The observed old GUGU job was recovered and
 preserved; two-client FIFO separation was verified in automated tests only.
+A subsequent live job `f8399206fe264966b6a52a67cbad71c0` reported two
+visible variants and one locally saved image, preserved that chat, and opened
+a fresh empty Create image composer. This verifies the visible-multiple-output
+branch; an absent variant count still does not prove there are no other outputs.
