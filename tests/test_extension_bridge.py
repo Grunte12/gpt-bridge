@@ -1056,6 +1056,61 @@ def test_inspected_http_400_result_can_be_recovered_without_resending(tmp_path):
     assert result["sha256"] == hashlib.sha256(raw).hexdigest()
 
 
+def test_inspected_completed_timeout_recovers_without_deleting_chat_or_resubmitting(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("Generate from the supplied reference.", "Create image",
+                             images=_local_reference(tmp_path))
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.37", content_receiver="available", result_dom=_result_dom(), tab_id=17)
+
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["collect_only"] is True and queued["preserve_chat"] is True
+    assert queued["cleanup_status"] == "preserved"
+    assert queued["previous_cleanup_status"] == "timeout_delete_failed"
+    claim = queue.claim(CLIENT_ID)
+    assert claim["job_id"] == job_id and claim["collect_only"] is True
+    first, first_raw = _generated_png_base64((210, 30, 60))
+    second, second_raw = _generated_png_base64((10, 170, 80))
+    binding = {"root_match": True, "exact_matching_descendant_count": 1,
+               "expected_chars": 35, "observed_chars": 35, "matcher_revision": 2}
+    complete = queue.result(CLIENT_ID, job_id, images_base64=[first, second],
+                            chat_path=RESULT_CHAT_PATH, cleanup_pending=False, prompt_binding=binding)
+    assert complete["state"] == "complete" and complete["cleanup_status"] == "preserved"
+    assert [item["sha256"] for item in complete["outputs"]] == [
+        hashlib.sha256(first_raw).hexdigest(), hashlib.sha256(second_raw).hexdigest()]
+
+
+@pytest.mark.parametrize("wrong_chat,busy", [(True, False), (False, True)])
+def test_completed_timeout_recovery_requires_exact_finished_chat(tmp_path, wrong_chat, busy):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("Generate from the supplied reference.", "Create image",
+                             images=_local_reference(tmp_path))
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.37", content_receiver="available", tab_id=17,
+                    result_dom=_result_dom(busy=busy))
+    with pytest.raises(ValueError):
+        queue.resolve(job_id, recover_outputs=True,
+                      recovery_chat_path=OTHER_RESULT_CHAT_PATH if wrong_chat else RESULT_CHAT_PATH)
+    assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
+
+
 def test_output_recovery_requires_the_exact_after_send_multiple_image_failure(tmp_path):
     queue, job_id, _images, _claim, _error = _failed_multiple_output_job(
         tmp_path, error="Not submitted. Multiple images returned; this cannot be recovered."

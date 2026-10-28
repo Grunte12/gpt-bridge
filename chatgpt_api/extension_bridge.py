@@ -1028,9 +1028,15 @@ class ExtensionQueue:
                 resume = (job.get("collect_only") is True and
                           job.get("error") == "Existing submitted-job recovery failed. Existing conversation does not match this job's prompt; image was not collected" and
                           recoverable_error(job.get("recovered_from_error")))
+                completed_timeout = (job.get("timed_out") is True and
+                                     job.get("phase") == "remote_started" and
+                                     job.get("submitted") is True and
+                                     job.get("cleanup_status") == "timeout_delete_failed" and
+                                     job.get("chat_path") == recovery_chat_path and
+                                     not job.get("replacement_job_id"))
                 if (job["state"] != "failed" or job.get("preflight_only") or
                         (job.get("collect_only") and not resume) or
-                        (not resume and not recoverable_error(job.get("error")))):
+                        (not resume and not completed_timeout and not recoverable_error(job.get("error")))):
                     raise ValueError("only the inspected submitted multiple-image failure or HTTP 400 failure can be recovered once")
                 if (not self.client or time.monotonic() - self.client["seen"] > 90 or
                         self.client["client_id"] != job["client_id"] or self.client.get("worker_version") not in OUTPUT_BINDING_REVISIONS):
@@ -1052,6 +1058,9 @@ class ExtensionQueue:
                         not 1 <= inspected.get("assistant_images", 0) <= 4 or
                         inspected.get("user_headings") != 1 or inspected.get("assistant_headings") != 1):
                     raise ValueError("inspect the completed single-turn assistant outputs before recovery")
+                if completed_timeout:
+                    job["previous_cleanup_status"] = job["cleanup_status"]
+                    job["cleanup_status"] = "preserved"
                 previous_error = job.pop("error")
                 job.update(state="queued", collect_only=True, preserve_chat=True, recovery_chat_path=recovery_chat_path,
                            recovery_dom=dict(inspected), output_binding_revision=revision)
