@@ -1248,6 +1248,24 @@ test('generation collects the last adjacent assistant body, not the two referenc
   assert.deepEqual(h.uploadedFiles.map(file => file.name), images.map(image => image.name));
 });
 
+test('generation captures a displayed base64 image from the assistant', async () => {
+  const output = 'data:image/png;base64,cG5n';
+  const h = contentHarness({assistantRoleNodes: true, assistantImageSources: [output]});
+  await startContent(h, {job_id: 'job-data-image', expected_model: 'Create image', prompt: 'draw a cat', images: []});
+  await waitForContentResult(h);
+  assert.equal(h.sent.find(message => message.type === 'image-result' && message.imageBase64)?.imageBase64, 'cG5n');
+  assert.deepEqual(h.fetchedUrls, [output]);
+  assert.equal(h.sendClicks, 1);
+});
+
+test('generation rejects non-image data URLs without fetching them', async () => {
+  const h = contentHarness({assistantRoleNodes: true, assistantImageSources: ['data:text/html;base64,PGh0bWw+']});
+  await startContent(h, {job_id: 'job-unsafe-data', expected_model: 'Create image', prompt: 'draw a cat', images: []});
+  await waitForContentResult(h);
+  assert.match(h.sent.at(-1).error, /Unsupported displayed image source/);
+  assert.equal(h.fetchCalls, 0);
+});
+
 test('generation collects every stable assistant output image', async () => {
   const outputs = ['https://chatgpt.com/generated-output-1.png', 'https://chatgpt.com/generated-output-2.png'];
   const h = contentHarness({assistantRoleNodes: true, assistantImageSources: outputs});

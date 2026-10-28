@@ -703,8 +703,8 @@ def test_claim_is_at_most_once_and_public_status_hides_private_fields(tmp_path):
         "prompt": "Draw a green pear.",
         "expected_model": "Create image",
         "mode": "create",
-        "generation_baseline_seconds": 120.0,
-        "generation_timeout_seconds": 300,
+        "generation_baseline_seconds": 240.0,
+        "generation_timeout_seconds": 600,
         "generation_timing_samples": 0,
         "retry_count": 0,
     }
@@ -2639,7 +2639,7 @@ def test_adaptive_timeout_uses_recent_successes_and_auto_deletes_success_chats(t
         now += duration
     submitted = queue.submit("A future AI device.", "Create image")
     assert submitted["generation_baseline_seconds"] == 133.8
-    assert submitted["generation_timeout_seconds"] == 345
+    assert submitted["generation_timeout_seconds"] == 600
     assert queue.jobs[submitted["job_id"]]["auto_delete_saved_chat"] is True
     assert "preserve_chat" not in queue.jobs[submitted["job_id"]]
 

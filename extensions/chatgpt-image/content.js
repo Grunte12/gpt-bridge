@@ -605,7 +605,9 @@
         for (const source of sources) {
           // Read only assets displayed in this assistant response, never auth/API data.
           const url = new URL(source, location.href);
-          if (!["https:", "blob:"].includes(url.protocol)) throw new Error("Unsupported displayed image source");
+          const embeddedImage = url.protocol === "data:" && source.length <= Math.ceil(25 * 1024 * 1024 * 4 / 3) + 100 &&
+            /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/i.test(source);
+          if (!["https:", "blob:"].includes(url.protocol) && !embeddedImage) throw new Error("Unsupported displayed image source");
           const response = await fetch(url.href, {signal: AbortSignal.timeout(30000)});
           if (!response.ok) throw new Error("Displayed image could not be read; preserve the existing chat");
           const blob = await response.blob();
