@@ -1170,3 +1170,10 @@ Image jobs line up first-in, first-out (up to 10). `generate`/`edit` always acce
 The owner permits restarting GPT Bridge when it blocks work. Inspect the shared queue first; preserve an in-flight or uncertain request and track its existing job ID rather than submitting a duplicate. One owner worker serializes all agents' requests; result receipts are bound to their job ID.
 
 The worker now waits at least 600 seconds before its adaptive timeout (the actual generation can take longer). It refuses timed-out chat deletion when an assistant image is visible, and can collect supported displayed `data:image/...;base64` outputs. After a validated save and exact-job cleanup, or after preserving a recovered/multiple-output chat, it prepares a fresh Create image composer while protecting changed chats, drafts and uploads. Recovered chats and chats with visible unsaved variants are preserved, not deleted. Receipts report visible_variant_count when available. Local automated tests cover these paths; live acceptance must be recorded separately.
+
+Live acceptance (2026-10-28): after reloading 0.1.39, storyboard job
+`6b1be34273cf4f42bef6c934e09a2e15` saved one image, reported its exact chat
+as `deleted`, and the paired browser showed a new empty Create image composer.
+That receipt did not report a visible variant count, so it does not establish
+whether other variants existed. The observed old GUGU job was recovered and
+preserved; two-client FIFO separation was verified in automated tests only.
