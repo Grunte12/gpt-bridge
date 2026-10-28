@@ -1,5 +1,11 @@
 # GPT Bridge Image Worker changes
 
+## 0.1.37 — 2026-10-28
+
+- Detect conversation headings when ChatGPT adds hidden print-only labels.
+- Start the generation timeout at the same remote-start receipt used by the owner service.
+- Permit prompt-bound collection of an inspected submitted job after a local HTTP 400 without sending again.
+
 ## 0.1.36 — 2026-10-23
 
 - Dedicated-profile single-tab recovery authenticates silently, then reports the final rebound state. It no longer exposes a temporary `confirm_second_tab` action while recovering.

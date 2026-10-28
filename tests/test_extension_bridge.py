@@ -1036,6 +1036,26 @@ def test_output_recovery_claim_rechecks_protocol_and_exact_worker_version(tmp_pa
     assert queue.status(job_id)["state"] == "failed"
 
 
+def test_inspected_http_400_result_can_be_recovered_without_resending(tmp_path):
+    error = "Submission attempted. Local bridge request failed: 400"
+    queue, job_id, submitted_images, _, _ = _failed_multiple_output_job(
+        tmp_path, error=error, worker_version="0.1.36", result_dom=_result_dom(assistant_images=1)
+    )
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["recovered_from_error"] == error
+    assert queued["output_binding_revision"] == 2
+    claim = queue.claim(CLIENT_ID)
+    assert claim["collect_only"] is True and claim["preserve_chat"] is True
+    assert claim["images"] == submitted_images and "data_base64" not in json.dumps(claim)
+    encoded, raw = _generated_png_base64((20, 100, 160))
+    binding = {"root_match": True, "exact_matching_descendant_count": 1,
+               "expected_chars": 35, "observed_chars": 35, "matcher_revision": 2}
+    result = queue.result(CLIENT_ID, job_id, image_base64=encoded,
+                          chat_path=RESULT_CHAT_PATH, prompt_binding=binding)
+    assert result["state"] == "complete" and result["cleanup_status"] == "preserved"
+    assert result["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
 def test_output_recovery_requires_the_exact_after_send_multiple_image_failure(tmp_path):
     queue, job_id, _images, _claim, _error = _failed_multiple_output_job(
         tmp_path, error="Not submitted. Multiple images returned; this cannot be recovered."

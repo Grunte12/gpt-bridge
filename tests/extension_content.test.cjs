@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, decoratedHeadingText = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -302,7 +302,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   const conversation = {getClientRects: () => visibleHeadingsOutsideRegion ? [] : [{}], querySelectorAll(selector) {
     if (selector === 'img') return allConversationImages;
     if (selector === 'h4') return currentConversationTurns().map((textContent, index) => ({
-      textContent, nextElementSibling: {
+      textContent: decoratedHeadingText ? textContent + (textContent === 'You said:' ? 'You' : 'ChatGPT') : textContent,
+      innerText: textContent, nextElementSibling: {
         innerText: conversationBodies[index] || '',
         querySelector(selector) { return bodyImageChip(selector); },
         querySelectorAll(selector) {
@@ -390,11 +391,13 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   };
   const NativeDate = Date;
   class SimDate extends NativeDate { static now() { return now; } }
+  const phaseTimes = [];
+  let timeoutAt = null;
   const chrome = {runtime: {
     onMessage: {addListener(fn) { listener = fn; contentListeners.push(fn); }, hasListener(fn) { return contentListeners.includes(fn); }},
     async sendMessage(message) {
-      if (message.type === 'image-phase') phases.push(message);
-      else sent.push(message);
+      if (message.type === 'image-phase') { phases.push(message); phaseTimes.push({phase: message.phase, at: now}); }
+      else { sent.push(message); if (message.type === 'image-timeout') timeoutAt = now; }
       if (message.type === 'image-delete-prompt') return {ok: true};
       if (message.type === 'image-delete-confirmation') {
         onConfirmation?.(message);
@@ -433,7 +436,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   };
   if (staleListenerMarker) context.__gptBridgeImageWorkerListener = () => {};
   vm.runInNewContext(contentSource, context, {filename: 'content.js'});
-  return {receive: listener, sent, phases, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
+  return {receive: listener, sent, phases, phaseTimes, get timeoutAt() { return timeoutAt; }, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
     get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, get sendClicks() { return sendClicks; },
     get sendQueries() { return sendQueries; }, get insertTextCalls() { return insertTextCalls; }, get composerEvents() { return composerEvents; },
     get fetchCalls() { return fetchCalls; }, get fetchedUrls() { return fetchedUrls; }, get fileReaderReads() { return fileReaderReads; },
@@ -1091,6 +1094,17 @@ test('timeout error carries the bounded result DOM snapshot within the stored er
   assert.ok(error.length <= 500, `error is ${error.length} chars; the worker keeps only 500`);
 });
 
+test('timeout uses the same remote-start boundary as the server', async () => {
+  const h = contentHarness({conversationTurnsAfterSend: true, assistantImageSources: []});
+  await startContent(h, {job_id: 'job-time-boundary', expected_model: 'Create image',
+    prompt: 'draw a cat', generation_timeout_seconds: 300});
+  await waitForContentResult(h);
+  const remote = h.phaseTimes.find(item => item.phase === 'remote_started');
+  assert.ok(remote && h.timeoutAt !== null);
+  assert.ok(h.timeoutAt - remote.at >= 300000,
+    `timeout fired ${h.timeoutAt - remote.at}ms after remote start`);
+});
+
 test('zero-image generation keeps the ordinary prompt and sends without touching a file input', async () => {
   const h = contentHarness();
   await startContent(h, {job_id: 'job-no-images', expected_model: 'Create image', prompt: 'draw a cat', images: []});
@@ -1131,6 +1145,19 @@ test('inspection separates two user-upload references from one adjacent assistan
     assistant_images: 1, conversation_images: 3, busy: false,
     chat_path: '/c/123e4567-e89b-12d3-a456-426614174000'
   });
+});
+
+test('headings ignore hidden print-only role labels when locating a generated gallery', () => {
+  const h = contentHarness({user: true, decoratedHeadingText: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: ['submitted prompt', 'assistant reply'],
+    assistantImageSources: [], userImageSources: ['https://chatgpt.com/reference.png'],
+    outsideAssistantSources: ['https://chatgpt.com/generated.png']});
+  let result;
+  h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+  assert.equal(result.result_dom.user_headings, 1);
+  assert.equal(result.result_dom.assistant_headings, 1);
+  assert.equal(result.result_dom.assistant_images, 1);
+  assert.equal(result.result_dom.conversation_images, 2);
 });
 
 test('an output image outside the heading sibling is found; user uploads are still excluded', () => {

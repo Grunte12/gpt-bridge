@@ -29,7 +29,7 @@
   const assistants = () => [...document.querySelectorAll('[data-message-author-role="assistant"]')];
   const conversation = () => document.querySelector('[role="region"][aria-label="Conversation"]');
   const turnHeadings = text => {
-    const matches = root => [...(root?.querySelectorAll("h4") || [])].filter(el => visible(el) && el.textContent.trim() === text);
+    const matches = root => [...(root?.querySelectorAll("h4") || [])].filter(el => visible(el) && (el.innerText || el.textContent).trim() === text);
     // The labeled conversation region can stay mounted but hidden while the
     // visible "You said:" / "ChatGPT said:" turns render elsewhere.
     const scoped = matches(conversation());
@@ -579,7 +579,7 @@
       const timeoutSeconds = Number.isInteger(job.generation_timeout_seconds) &&
         job.generation_timeout_seconds >= 300 && job.generation_timeout_seconds <= 900
         ? job.generation_timeout_seconds : 15 * 60;
-      const deadline = Date.now() + timeoutSeconds * 1000;
+      let deadline = Date.now() + timeoutSeconds * 1000;
       let previous = "", stable = 0;
       let remoteStarted = collectOnly;
       while (Date.now() < deadline) {
@@ -589,6 +589,7 @@
         if (!remoteStarted && livePath && (busy() || hasTurns() || assistants().length || outputImages().length)) {
           await reportPhase(job, "remote_started", livePath);
           remoteStarted = true;
+          deadline = Date.now() + timeoutSeconds * 1000; // Server measures from the remote-start receipt.
         }
         const images = outputImages();
         if (!images.length || busy()) { stable = 0; continue; }

@@ -89,7 +89,7 @@ def short_outputs(raw: dict) -> list | None:
     return [{key: item.get(key) for key in fields} for item in outputs]
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2, "0.1.32": 2, "0.1.33": 2, "0.1.34": 2, "0.1.35": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2, "0.1.32": 2, "0.1.33": 2, "0.1.34": 2, "0.1.35": 2, "0.1.36": 2, "0.1.37": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -1021,13 +1021,17 @@ class ExtensionQueue:
                     raise ValueError("output recovery cannot be combined with draft cleanup")
                 if not isinstance(recovery_chat_path, str) or not re.fullmatch(r"/c/[a-f0-9-]{36}", recovery_chat_path):
                     raise ValueError("exact inspected result chat path is required")
+                def recoverable_error(error):
+                    return (isinstance(error, str) and
+                            (error.startswith("Submission attempted. Multiple images returned;") or
+                             error == "Submission attempted. Local bridge request failed: 400"))
                 resume = (job.get("collect_only") is True and
                           job.get("error") == "Existing submitted-job recovery failed. Existing conversation does not match this job's prompt; image was not collected" and
-                          job.get("recovered_from_error", "").startswith("Submission attempted. Multiple images returned;"))
+                          recoverable_error(job.get("recovered_from_error")))
                 if (job["state"] != "failed" or job.get("preflight_only") or
                         (job.get("collect_only") and not resume) or
-                        (not resume and not job.get("error", "").startswith("Submission attempted. Multiple images returned;"))):
-                    raise ValueError("only the inspected submitted multiple-image failure can be recovered once")
+                        (not resume and not recoverable_error(job.get("error")))):
+                    raise ValueError("only the inspected submitted multiple-image failure or HTTP 400 failure can be recovered once")
                 if (not self.client or time.monotonic() - self.client["seen"] > 90 or
                         self.client["client_id"] != job["client_id"] or self.client.get("worker_version") not in OUTPUT_BINDING_REVISIONS):
                     raise ValueError("original online extension 0.1.20 or a supported newer matcher is required")
