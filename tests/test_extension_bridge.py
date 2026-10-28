@@ -1068,8 +1068,11 @@ def test_inspected_completed_timeout_recovers_without_deleting_chat_or_resubmitt
     queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
     queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
     queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    queue = ExtensionQueue(queue.root, ACCOUNT)  # The loaded service must survive its restart.
+    assert queue.client is None
     queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
                     worker_version="0.1.37", content_receiver="available", result_dom=_result_dom(), tab_id=17)
+    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
 
     queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
     assert queued["collect_only"] is True and queued["preserve_chat"] is True
@@ -1108,6 +1111,30 @@ def test_completed_timeout_recovery_requires_exact_finished_chat(tmp_path, wrong
         queue.resolve(job_id, recover_outputs=True,
                       recovery_chat_path=OTHER_RESULT_CHAT_PATH if wrong_chat else RESULT_CHAT_PATH)
     assert queue.status(job_id)["state"] == "failed"
+    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
+
+
+@pytest.mark.parametrize("bad_case", ["client", "tab", "chat", "busy"])
+def test_timeout_inspection_rebind_requires_original_finished_chat(tmp_path, bad_case):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    job_id = queue.submit("Generate from the supplied reference.", "Create image",
+                          images=_local_reference(tmp_path))["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    queue = ExtensionQueue(queue.root, ACCOUNT)
+    client = str(uuid.uuid4()) if bad_case == "client" else CLIENT_ID
+    tab = 18 if bad_case == "tab" else 17
+    chat = OTHER_RESULT_CHAT_PATH if bad_case == "chat" else RESULT_CHAT_PATH
+    with pytest.raises(ValueError, match="timeout cleanup failed"):
+        queue.heartbeat(client, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                        worker_version="0.1.37", content_receiver="available", tab_id=tab,
+                        result_dom=_result_dom(chat, busy=bad_case == "busy"))
+    assert queue.client is None
     assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
 
 

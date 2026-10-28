@@ -450,7 +450,26 @@ class ExtensionQueue:
                 raise ValueError("invalid bounded prompt DOM diagnostic")
         with self.lock:
             if self.client is None:
-                self.pair(client_id, account, visible_model, input_protocol, tab_id)
+                # Rebind the original worker only to inspect a completed timed-out chat;
+                # the queue remains blocked until explicit collect-only recovery.
+                open_jobs = [j for j in self.jobs.values() if job_occupies_tab(j)]
+                stale = open_jobs[0] if len(open_jobs) == 1 else None
+                safe_inspection = (stale and stale.get("state") == "failed" and
+                    stale.get("timed_out") is True and stale.get("cleanup_status") == "timeout_delete_failed" and
+                    stale.get("phase") == "remote_started" and stale.get("submitted") is True and
+                    not stale.get("replacement_job_id") and stale.get("client_id") == client_id and
+                    stale.get("browser_tab_id") == tab_id and tab_id is not None and
+                    worker_version in OUTPUT_BINDING_REVISIONS and isinstance(result_dom, dict) and
+                    result_dom.get("chat_path") == stale.get("chat_path") and
+                    result_dom.get("assistant_body_found") and not result_dom.get("busy") and
+                    1 <= result_dom.get("assistant_images", 0) <= 4 and
+                    result_dom.get("user_headings") == 1 and result_dom.get("assistant_headings") == 1)
+                if safe_inspection:
+                    self.client = {"client_id": client_id, "seen": time.monotonic(),
+                                   "visible_model": visible_model, "tab_ready": tab_ready,
+                                   "input_protocol": input_protocol, "tab_id": tab_id}
+                else:
+                    self.pair(client_id, account, visible_model, input_protocol, tab_id)
             else:
                 self._client(client_id)
                 if self.client.get("tab_id") is not None and tab_id != self.client["tab_id"]:
