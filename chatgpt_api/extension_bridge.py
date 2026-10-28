@@ -89,7 +89,7 @@ def short_outputs(raw: dict) -> list | None:
     return [{key: item.get(key) for key in fields} for item in outputs]
 PORT = 18767
 # A diagnostic-only reload must not unlock another collection attempt.
-OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2, "0.1.32": 2, "0.1.33": 2, "0.1.34": 2, "0.1.35": 2, "0.1.36": 2, "0.1.37": 2}
+OUTPUT_BINDING_REVISIONS = {"0.1.20": 0, "0.1.21": 1, "0.1.22": 1, "0.1.23": 2, "0.1.24": 2, "0.1.25": 2, "0.1.26": 2, "0.1.27": 2, "0.1.28": 2, "0.1.29": 2, "0.1.30": 2, "0.1.31": 2, "0.1.32": 2, "0.1.33": 2, "0.1.34": 2, "0.1.35": 2, "0.1.36": 2, "0.1.37": 2, "0.1.38": 2, "0.1.39": 2}
 TAB_RECOVERY = {"none", "rebound", "unmatched"}
 
 
@@ -705,9 +705,13 @@ class ExtensionQueue:
                error: str | None = None, source: str = "rendered-image", cleanup_pending: bool = False,
                chat_path: str | None = None, preflight_ready: bool = False,
                preflight_uploads_cleared: bool = False, images_base64: list[str] | None = None,
-               prompt_binding: dict | None = None) -> dict:
+               prompt_binding: dict | None = None, visible_variant_count: int | None = None) -> dict:
         if type(cleanup_pending) is not bool or type(preflight_ready) is not bool or type(preflight_uploads_cleared) is not bool:
             raise ValueError("invalid cleanup flag")
+        if visible_variant_count is not None and (type(visible_variant_count) is not int or not 1 <= visible_variant_count <= 100):
+            raise ValueError("invalid visible variant count")
+        if visible_variant_count is not None and (error is not None or preflight_ready):
+            raise ValueError("variant count requires generated output")
         if chat_path is not None and (not isinstance(chat_path, str) or not re.fullmatch(r"/c/[a-f0-9-]{36}", chat_path)):
             raise ValueError("invalid generated chat path")
         with self.lock:
@@ -767,8 +771,11 @@ class ExtensionQueue:
                 encoded = images_base64 if images_base64 is not None else [image_base64]
                 if not isinstance(encoded, list) or not 1 <= len(encoded) <= 4:
                     raise ValueError("one to four ordered assistant outputs required")
+                incomplete_variants = visible_variant_count is not None and visible_variant_count > len(encoded)
                 if (job.get("preserve_chat") or len(encoded) > 1) and cleanup_pending:
                     raise ValueError("recovered or multiple outputs must preserve their chat")
+                if incomplete_variants and cleanup_pending:
+                    raise ValueError("unsaved visible outputs must preserve their chat")
                 validated, total = [], 0
                 for value in encoded:
                     if not isinstance(value, str) or not value or len(value) > (MAX_IMAGE * 4 // 3 + 8):
@@ -800,8 +807,10 @@ class ExtensionQueue:
                                     "sha256": digest, "bytes": len(raw)})
                 job.update(state="complete", phase="completed", completed_at=time.time(), outputs=outputs, output_count=len(outputs), source=source,
                            submitted=True, generated=True,
-                           cleanup_status="preserved" if job.get("preserve_chat") or len(outputs) > 1 else "pending" if cleanup_pending else "not_requested",
+                           cleanup_status="preserved" if job.get("preserve_chat") or len(outputs) > 1 or incomplete_variants else "pending" if cleanup_pending else "not_requested",
                            quality_note="Rendered asset; original download resolution not verified.")
+                if visible_variant_count is not None:
+                    job["visible_variant_count"] = visible_variant_count
                 if len(outputs) == 1:
                     job.update({key: outputs[0][key] for key in ("image_path", "dimensions", "sha256")})
                 if chat_path is not None:
@@ -928,7 +937,7 @@ class ExtensionQueue:
                    "submitted": job.get("submitted"), "generated": job.get("generated"),
                    "wait_timed_out": wait_timed_out}
         for key in ("generation_baseline_seconds", "generation_timeout_seconds", "generation_timing_samples",
-                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count"):
+                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count", "visible_variant_count", "cleanup_error"):
             if key in job:
                 receipt[key] = job[key]
         copied = short_outputs(job)
@@ -1047,6 +1056,15 @@ class ExtensionQueue:
                 resume = (job.get("collect_only") is True and
                           job.get("error") == "Existing submitted-job recovery failed. Existing conversation does not match this job's prompt; image was not collected" and
                           recoverable_error(job.get("recovered_from_error")))
+                # A failed collect-only attempt can be repeated once after the
+                # data-image reader fix, still bound to the original saved chat.
+                data_source_resume = (job.get("collect_only") is True and
+                                      job.get("timed_out") is True and
+                                      job.get("previous_cleanup_status") == "timeout_delete_failed" and
+                                      job.get("error") == "Existing submitted-job recovery failed. Unsupported displayed image source" and
+                                      job.get("recovery_chat_path") == recovery_chat_path and
+                                      not job.get("data_source_recovery_resumed") and
+                                      not job.get("replacement_job_id"))
                 completed_timeout = (job.get("timed_out") is True and
                                      job.get("phase") == "remote_started" and
                                      job.get("submitted") is True and
@@ -1054,13 +1072,15 @@ class ExtensionQueue:
                                      job.get("chat_path") == recovery_chat_path and
                                      not job.get("replacement_job_id"))
                 if (job["state"] != "failed" or job.get("preflight_only") or
-                        (job.get("collect_only") and not resume) or
-                        (not resume and not completed_timeout and not recoverable_error(job.get("error")))):
+                        (job.get("collect_only") and not resume and not data_source_resume) or
+                        (not resume and not data_source_resume and not completed_timeout and not recoverable_error(job.get("error")))):
                     raise ValueError("only the inspected submitted multiple-image failure or HTTP 400 failure can be recovered once")
                 if (not self.client or time.monotonic() - self.client["seen"] > 90 or
                         self.client["client_id"] != job["client_id"] or self.client.get("worker_version") not in OUTPUT_BINDING_REVISIONS):
                     raise ValueError("original online extension 0.1.20 or a supported newer matcher is required")
                 revision = OUTPUT_BINDING_REVISIONS[self.client["worker_version"]]
+                if data_source_resume and self.client["worker_version"] not in {"0.1.38", "0.1.39"}:
+                    raise ValueError("data-image recovery requires the reloaded 0.1.38 or 0.1.39 extension")
                 previous_revision = job.get("output_binding_revision", 1 if job.get("prompt_binding") or job.get("output_recovery_resumed") else 0)
                 if resume and revision <= previous_revision:
                     raise ValueError("prompt-binding resume needs 0.1.21 or newer with an untried matcher revision; unchanged retry refused")
@@ -1083,8 +1103,10 @@ class ExtensionQueue:
                 previous_error = job.pop("error")
                 job.update(state="queued", collect_only=True, preserve_chat=True, recovery_chat_path=recovery_chat_path,
                            recovery_dom=dict(inspected), output_binding_revision=revision)
-                if resume:
+                if resume or data_source_resume:
                     job.update(output_recovery_resumed=True, previous_recovery_error=previous_error)
+                    if data_source_resume:
+                        job["data_source_recovery_resumed"] = True
                     if job.get("prompt_binding") is not None:
                         job["previous_prompt_binding"] = job.pop("prompt_binding")
                 else:
@@ -1268,7 +1290,7 @@ def compact_status(raw: dict) -> dict:
         if raw.get("queue_position") is not None:
             receipt["queue_position"] = raw["queue_position"]
         for key in ("generation_baseline_seconds", "generation_timeout_seconds", "generation_timing_samples",
-                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count"):
+                    "timed_out", "replacement_job_id", "replaces_job_id", "retry_count", "visible_variant_count", "cleanup_error"):
             if key in raw:
                 receipt[key] = raw[key]
         copied = short_outputs(raw)

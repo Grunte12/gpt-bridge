@@ -1164,3 +1164,9 @@ pre-submit failure from uncertain remote work without inspecting prompts, cookie
 ## Queue
 
 Image jobs line up first-in, first-out (up to 10). `generate`/`edit` always accept a job when the tab is paired; `status(job_id)` and `wait` report `queue_position` (1 = next). Only one job runs at a time, and the next starts after the previous image is saved and its chat cleanup is finished. A full line is refused, never dropped. Nothing is retried automatically.
+
+### Shared-session recovery and ready chat (0.1.39)
+
+The owner permits restarting GPT Bridge when it blocks work. Inspect the shared queue first; preserve an in-flight or uncertain request and track its existing job ID rather than submitting a duplicate. One owner worker serializes all agents' requests; result receipts are bound to their job ID.
+
+The worker now waits at least 600 seconds before its adaptive timeout (the actual generation can take longer). It refuses timed-out chat deletion when an assistant image is visible, and can collect supported displayed `data:image/...;base64` outputs. After a validated save and exact-job cleanup, or after preserving a recovered/multiple-output chat, it prepares a fresh Create image composer while protecting changed chats, drafts and uploads. Recovered chats and chats with visible unsaved variants are preserved, not deleted. Receipts report visible_variant_count when available. Local automated tests cover these paths; live acceptance must be recorded separately.

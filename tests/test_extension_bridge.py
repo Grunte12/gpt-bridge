@@ -1091,6 +1091,44 @@ def test_inspected_completed_timeout_recovers_without_deleting_chat_or_resubmitt
         hashlib.sha256(first_raw).hexdigest(), hashlib.sha256(second_raw).hexdigest()]
 
 
+@pytest.mark.parametrize("updated_version", ["0.1.38", "0.1.39"])
+def test_completed_timeout_data_image_failure_can_be_recovered_once_after_reader_update(tmp_path, updated_version):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    job_id = queue.submit("Generate from the supplied reference.", "Create image",
+                          images=_local_reference(tmp_path))["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.37", content_receiver="available", result_dom=_result_dom(), tab_id=17)
+    queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.claim(CLIENT_ID)
+    queue.result(CLIENT_ID, job_id, error="Existing submitted-job recovery failed. Unsupported displayed image source")
+    with pytest.raises(ValueError, match="reloaded 0.1.38"):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version=updated_version, content_receiver="available", result_dom=_result_dom(), tab_id=17)
+    with pytest.raises(ValueError):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=OTHER_RESULT_CHAT_PATH)
+    queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+    assert queued["data_source_recovery_resumed"] is True
+    claim = queue.claim(CLIENT_ID)
+    assert claim["collect_only"] is True and claim["preserve_chat"] is True
+    encoded, raw = _generated_png_base64((20, 100, 160))
+    binding = {"root_match": True, "exact_matching_descendant_count": 1,
+               "expected_chars": 35, "observed_chars": 35, "matcher_revision": 2}
+    complete = queue.result(CLIENT_ID, job_id, image_base64=encoded, chat_path=RESULT_CHAT_PATH,
+                            cleanup_pending=False, prompt_binding=binding)
+    assert complete["state"] == "complete" and complete["cleanup_status"] == "preserved"
+    assert complete["sha256"] == hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError):
+        queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
+
+
 @pytest.mark.parametrize("wrong_chat,busy", [(True, False), (False, True)])
 def test_completed_timeout_recovery_requires_exact_finished_chat(tmp_path, wrong_chat, busy):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
@@ -1838,6 +1876,73 @@ def test_jobs_run_first_in_first_out_one_at_a_time(tmp_path):
     queue.result(CLIENT_ID, first["job_id"], image_base64=image_base64)
     assert queue.claim(CLIENT_ID)["job_id"] == second["job_id"]
     assert queue.status(third["job_id"])["queue_position"] == 2
+
+
+def test_visible_unsaved_variants_keep_chat_and_report_count(tmp_path):
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("One image, extra variants visible.", "Create image")["job_id"]
+    queue.claim(CLIENT_ID)
+    image, _ = _generated_png_base64((11, 45, 80))
+    with pytest.raises(ValueError, match="unsaved visible outputs"):
+        queue.result(CLIENT_ID, job_id, image_base64=image, cleanup_pending=True,
+                     chat_path=RESULT_CHAT_PATH, visible_variant_count=2)
+    saved = queue.result(CLIENT_ID, job_id, image_base64=image, cleanup_pending=False,
+                         chat_path=RESULT_CHAT_PATH, visible_variant_count=2)
+    assert saved["state"] == "complete" and saved["cleanup_status"] == "preserved"
+    assert saved["visible_variant_count"] == 2 and len(saved["outputs"]) == 1
+    assert compact_status(saved)["visible_variant_count"] == 2
+    assert queue.wait_for_job(job_id, 1)["visible_variant_count"] == 2
+
+
+@pytest.mark.parametrize("count", [0, -1, 101, True, "2"])
+def test_invalid_visible_variant_count_is_rejected(tmp_path, count):
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("Invalid count.", "Create image")["job_id"]
+    queue.claim(CLIENT_ID)
+    image, _ = _generated_png_base64((11, 45, 80))
+    with pytest.raises(ValueError, match="invalid visible variant count"):
+        queue.result(CLIENT_ID, job_id, image_base64=image, visible_variant_count=count)
+    assert queue.status(job_id)["state"] == "claimed"
+
+
+def test_cleanup_failure_is_visible_in_compact_receipt(tmp_path):
+    queue = _paired_queue(tmp_path)
+    job_id = queue.submit("Save and clean.", "Create image")["job_id"]
+    queue.claim(CLIENT_ID)
+    image, _ = _generated_png_base64((11, 45, 80))
+    queue.result(CLIENT_ID, job_id, image_base64=image, cleanup_pending=True, chat_path=RESULT_CHAT_PATH)
+    queue.cleanup(CLIENT_ID, job_id, "failed", "Native chat menu unavailable; saved image is safe")
+    expected = "Native chat menu unavailable; saved image is safe"
+    assert compact_status(queue.status(job_id))["cleanup_error"] == expected
+    assert queue.wait_for_job(job_id, 1)["cleanup_error"] == expected
+
+
+def test_shared_queue_never_swaps_results_and_waits_for_saved_chat_cleanup(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT, auto_delete_saved_chats=True)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    first = queue.submit("First session image.", "Create image")
+    second = queue.submit("Second session image.", "Create image")
+    first_id, second_id = first["job_id"], second["job_id"]
+    first_image, first_raw = _generated_png_base64((1, 20, 30))
+    second_image, second_raw = _generated_png_base64((90, 80, 70))
+    assert queue.claim(CLIENT_ID)["job_id"] == first_id
+    with pytest.raises(ValueError):
+        queue.result(CLIENT_ID, second_id, image_base64=second_image)
+    queue.phase(CLIENT_ID, first_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, first_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.phase(CLIENT_ID, first_id, "result_captured", 17, RESULT_CHAT_PATH)
+    queue.result(CLIENT_ID, first_id, image_base64=first_image, cleanup_pending=True, chat_path=RESULT_CHAT_PATH)
+    assert queue.claim(CLIENT_ID) == {}
+    queue.cleanup(CLIENT_ID, first_id, "confirmation_required")
+    queue.cleanup(CLIENT_ID, first_id, "deleted")
+    assert queue.claim(CLIENT_ID)["job_id"] == second_id
+    queue.phase(CLIENT_ID, second_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, second_id, "remote_started", 17, OTHER_RESULT_CHAT_PATH)
+    queue.phase(CLIENT_ID, second_id, "result_captured", 17, OTHER_RESULT_CHAT_PATH)
+    queue.result(CLIENT_ID, second_id, image_base64=second_image, chat_path=OTHER_RESULT_CHAT_PATH)
+    assert queue.status(first_id)["sha256"] == hashlib.sha256(first_raw).hexdigest()
+    assert queue.status(second_id)["sha256"] == hashlib.sha256(second_raw).hexdigest()
+    assert queue.status(first_id)["image_path"] != queue.status(second_id)["image_path"]
 
 
 def test_full_queue_refuses_new_jobs(tmp_path):

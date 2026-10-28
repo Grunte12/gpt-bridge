@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, decoratedHeadingText = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, variantGalleries = [], outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, resultResponse = null, moreButtonCount = 1, chatActionSizes = [], sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, decoratedHeadingText = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -344,6 +344,16 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       return null;
     },
     querySelectorAll(selector) {
+      if (selector.startsWith('[data-testid="generated-image-gallery"]')) return variantGalleries.map(spec => ({
+        getClientRects: () => spec.hidden ? [] : [{}],
+        querySelectorAll(selector) {
+          if (!selector.includes('button[aria-label^="Show generated image "]')) return [];
+          return Array.from({length: spec.count}, (_, index) => ({
+            getClientRects: () => spec.hidden ? [] : [{}], closest() { return null; },
+            documentPosition: headingPosition('You said:') + (spec.beforeUser ? -1 : 1) + index / 100
+          }));
+        }
+      }));
       if (selector === '[data-message-author-role="assistant"]')
         return assistantRoleNodes === 'always' || (assistantRoleNodes && sendClicks > 0) ? [assistantMessage] : [];
       if (selector === 'input[type="file"]') return [...fileInputs, ...(outsideFileInput ? [outsideFileInput] : [])];
@@ -369,6 +379,9 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
         return hiddenRetainedEditor ? [hiddenOldEditor, editor] : [editor];
       if (selector === '[role="menuitem"]') return [deleteItem];
       if (selector === '[role="dialog"]') return dialogOpen ? [deleteDialog] : [];
+      if (selector === 'button[aria-label="More"]') return Array.from({length: moreButtonCount}, () => moreButton);
+      if (selector === 'button[aria-label="Chat actions"][data-size="xl"]')
+        return chatActionSizes.filter(size => size === 'xl').map(() => moreButton);
       if (selector.startsWith('button')) return [newChatButton, filesButton, createImageButton, moreButton].filter(item =>
         selector === 'button' || selector.includes(`aria-label="${item.getAttribute('aria-label')}"`));
       if (selector.includes('challenges.cloudflare.com') && (challengeState || (challengeAfterSend && clicks)))
@@ -398,6 +411,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     async sendMessage(message) {
       if (message.type === 'image-phase') { phases.push(message); phaseTimes.push({phase: message.phase, at: now}); }
       else { sent.push(message); if (message.type === 'image-timeout') timeoutAt = now; }
+      if (message.type === 'image-result' && resultResponse) return resultResponse(message);
       if (message.type === 'image-delete-prompt') return {ok: true};
       if (message.type === 'image-delete-confirmation') {
         onConfirmation?.(message);
@@ -2543,4 +2557,182 @@ test('content pairing marker round-trips only a client id and never page text', 
   rejected.receive({type: 'image-bind', clientId: 'not-a-client'}, {}, () => {});
   rejected.receive({type: 'image-identity'}, {}, value => { empty = value; });
   assert.equal(empty.client_id, '');
+});
+
+
+test('timeout cleanup preserves completed images, including one appearing at the final confirmation', async () => {
+  for (const assistantImageSequence of [null, [[], [], [], ['https://chatgpt.com/late.png']]]) {
+    const h = contentHarness({newUi: true, user: true, imageReady: !assistantImageSequence,
+      assistantImageSequence, conversationTurns: ['You said:', 'ChatGPT said:'],
+      conversationBodies: ['Create image Create one image. Return a generated image, not just a description. draw a cat']});
+    const result = await new Promise(resolve => h.receive({type: 'image-delete-timeout', jobId: 'job-timeout',
+      job: {job_id: 'job-timeout', expected_model: 'Create image', prompt: 'draw a cat'},
+      chatPath: h.location.pathname}, {}, resolve));
+    assert.match(result.error, /Generated output is already visible/);
+    assert.equal(h.finalDeleteClicks, 0);
+    if (!assistantImageSequence) assert.equal(h.clicks, 0);
+    assert.match(h.location.pathname, /^\/c\//);
+  }
+});
+
+test('saved-job preparation is scoped, single-use, and preserves changed drafts, paths and outputs', async () => {
+  for (const mutate of [
+    h => { h.editor.innerText = 'another agent draft'; },
+    h => { h.location.pathname = '/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'; },
+    h => h.setConversationBodies(['another prompt']),
+    h => h.setBusy(true)
+  ]) {
+    const h = await primeArchiveTarget();
+    mutate(h);
+    const response = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+      job: {expected_model: 'Create image'}}, {}, resolve));
+    assert.ok(response.error);
+    assert.equal(h.clicks, 0);
+  }
+  const h = await primeArchiveTarget();
+  const unknown = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'other-job',
+    job: {expected_model: 'Create image'}}, {}, resolve));
+  assert.ok(unknown.error);
+  assert.equal(h.clicks, 0);
+  const prepared = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+    job: {expected_model: 'Create image'}}, {}, resolve));
+  assert.equal(prepared.fresh, true);
+  assert.equal(h.finalDeleteClicks, 0);
+  const repeated = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+    job: {expected_model: 'Create image'}}, {}, resolve));
+  assert.ok(repeated.error);
+});
+
+test('post-save preparation can finish while image-result awaits its worker receipt', async () => {
+  let prepared;
+  let h;
+  h = contentHarness({newUi: true, user: true, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: ['Create image Create one image. Return a generated image, not just a description. draw a cat'],
+    async resultResponse(message) {
+      if (message.error) return {};
+      const ordinary = await new Promise(resolve => h.receive({type: 'image-prepare', job: {expected_model: 'Create image'}}, {}, resolve));
+      assert.match(ordinary.error, /already running/);
+      prepared = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: message.jobId,
+        job: {expected_model: 'Create image'}}, {}, resolve));
+      return {ok: true};
+    }});
+  await startCollect(h);
+  for (let i = 0; i < 20 && !prepared; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(prepared?.fresh, true);
+  assert.equal(h.sendClicks, 0);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('new unsaved output after capture prevents saved-chat deletion and preparation', async () => {
+  for (const type of ['image-delete', 'image-prepare']) {
+    const first = 'https://chatgpt.com/generated.png';
+    const h = await primeArchiveTarget({assistantImageSequence: [[first], [first], [first], [first],
+      [first, 'https://chatgpt.com/unsaved.png']]});
+    const result = await new Promise(resolve => h.receive({type, jobId: 'job-collect', chatPath: h.location.pathname,
+      afterSavedJobId: 'job-collect', job: {expected_model: 'Create image'}}, {}, resolve));
+    assert.ok(result.error);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+
+test('saved-job cleanup accepts exact visible prompt descendants in native wrappers but rejects a different prompt', async () => {
+  const expected = 'Create one image. Return a generated image, not just a description.\n\ndraw a cat';
+  for (const type of ['image-delete', 'image-prepare']) {
+    const h = await primeArchiveTarget({conversationBodies: [`Create image Sent in image mode ${expected} Copy Edit`],
+      userPromptDescendants: [{innerText: expected}], confirmationResponse: {confirmed: true}});
+    const result = await new Promise(resolve => h.receive({type, jobId: 'job-collect', chatPath: h.location.pathname,
+      afterSavedJobId: 'job-collect', job: {expected_model: 'Create image'}}, {}, resolve));
+    assert.equal(type === 'image-delete' ? result.deleted : result.fresh, true);
+  }
+  const changed = await primeArchiveTarget();
+  changed.setConversationBodies(['Create image Create one image. Return a generated image, not just a description. draw a dog']);
+  const result = await requestDelete(changed);
+  assert.match(result.error, /Chat changed/);
+  assert.equal(changed.clicks, 0);
+});
+
+
+test('post-save preparation rechecks the bound chat after waiting for its composer', async () => {
+  const h = await primeArchiveTarget();
+  let response;
+  h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect', job: {expected_model: 'Create image'}}, {}, value => { response = value; });
+  h.location.pathname = '/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  for (let i = 0; i < 10 && !response; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.match(response.error, /Saved job chat changed/);
+  assert.equal(h.clicks, 0);
+});
+
+
+test('native generated variant buttons preserve unextracted images and still permit scoped fresh preparation', async () => {
+  const h = await primeArchiveTarget({variantGalleries: [{count: 2}]});
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.equal(receipt.visibleVariantCount, 2);
+  assert.equal(receipt.imagesBase64, undefined);
+  assert.ok((await requestDelete(h)).error);
+  assert.equal(h.clicks, 0);
+  const prepared = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+    job: {expected_model: 'Create image'}}, {}, resolve));
+  assert.equal(prepared.fresh, true);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('hidden earlier galleries and controls before the current user do not inflate variant count', async () => {
+  const h = await primeArchiveTarget({variantGalleries: [{count: 3, hidden: true}, {count: 4, beforeUser: true}, {count: 1}],
+    confirmationResponse: {confirmed: true}});
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.equal(receipt.visibleVariantCount, 1);
+  assert.equal((await requestDelete(h)).deleted, true);
+});
+
+test('variant appearing after capture or during final approval prevents automatic deletion', async () => {
+  for (const duringApproval of [false, true]) {
+    const variantGalleries = [{count: 1}];
+    const h = await primeArchiveTarget({variantGalleries, confirmationResponse: {confirmed: true},
+      onConfirmation: () => { if (duringApproval) variantGalleries[0].count = 2; }});
+    if (!duringApproval) variantGalleries[0].count = 2;
+    const result = await requestDelete(h);
+    assert.ok(result.error);
+    assert.equal(h.finalDeleteClicks, 0);
+    if (!duringApproval) assert.equal(h.clicks, 0);
+  }
+});
+
+
+test('saved deletion supports the unique xl Chat actions header and excludes sidebar actions', async () => {
+  const h = await primeArchiveTarget({moreButtonCount: 0, chatActionSizes: ['3xs', 'xl', '3xs'],
+    confirmationResponse: {confirmed: true}});
+  assert.equal((await requestDelete(h)).deleted, true);
+  assert.equal(h.finalDeleteClicks, 1);
+});
+
+test('saved deletion refuses absent or ambiguous current-chat menus without clicking sidebar actions', async () => {
+  for (const options of [
+    {moreButtonCount: 0, chatActionSizes: ['3xs', '3xs']},
+    {moreButtonCount: 0, chatActionSizes: ['xl', 'xl', '3xs']},
+    {moreButtonCount: 2, chatActionSizes: ['xl']}
+  ]) {
+    const h = await primeArchiveTarget(options);
+    assert.match((await requestDelete(h)).error, /Native chat menu unavailable/);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+test('timeout cleanup uses only a unique legacy or xl current-chat menu', async () => {
+  for (const [options, deleted] of [
+    [{moreButtonCount: 1}, true],
+    [{moreButtonCount: 0, chatActionSizes: ['3xs', 'xl']}, true],
+    [{moreButtonCount: 0, chatActionSizes: ['3xs']}, false],
+    [{moreButtonCount: 0, chatActionSizes: ['xl', 'xl']}, false]
+  ]) {
+    const h = contentHarness({...options, newUi: true, user: true,
+      conversationTurns: ['You said:'],
+      conversationBodies: ['Create image Create one image. Return a generated image, not just a description. draw a cat']});
+    const result = await new Promise(resolve => h.receive({type: 'image-delete-timeout', jobId: 'job-timeout',
+      job: {job_id: 'job-timeout', expected_model: 'Create image', prompt: 'draw a cat'},
+      chatPath: h.location.pathname}, {}, resolve));
+    if (deleted) assert.equal(result.deleted, true);
+    else { assert.match(result.error, /Native chat menu unavailable/); assert.equal(h.clicks, 0); }
+  }
 });

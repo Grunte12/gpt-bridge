@@ -723,7 +723,11 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       // ChatGPT changes chats through SPA navigation; sender.url can retain the
       // previous document path. The paired content receiver verifies the live
       // path and original prompt again before it opens Delete confirmation.
-      const cleanup = !message.error && !active.job?.preserve_chat && !message.imagesBase64 && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
+      if (message.visibleVariantCount !== undefined &&
+          (!Number.isInteger(message.visibleVariantCount) || message.visibleVariantCount < 1 || message.visibleVariantCount > 100))
+        throw new Error("Invalid visible generated variant count");
+      const incompleteVariants = message.visibleVariantCount > (message.imagesBase64?.length || 1);
+      const cleanup = !incompleteVariants && !message.error && !active.job?.preserve_chat && !message.imagesBase64 && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
       finishing = true;
       let result;
       try {
@@ -731,6 +735,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
           ...(message.error ? {error: message.error} : active.job?.preflight_only ? {preflight_ready: true,
             ...(message.preflightUploadsCleared === true ? {preflight_uploads_cleared: true} : {})} : {
               ...(message.imagesBase64 ? {images_base64: message.imagesBase64} : {image_base64: message.imageBase64}), cleanup_pending: cleanup,
+              ...(message.visibleVariantCount !== undefined ? {visible_variant_count: message.visibleVariantCount} : {}),
               ...(/^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "") ? {chat_path: message.chatPath} : {})}),
           ...(message.promptBinding ? {prompt_binding: message.promptBinding} : {})});
         if (cleanup && result.state === "complete") {
@@ -747,11 +752,21 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
             result = {...result, cleanup_status: "pending", cleanup_error: "Saved image is safe; cleanup receipt unavailable. Do not regenerate or delete again automatically."};
           }
         }
+        let preparationError = "";
+        if (!message.error && !active.job?.preflight_only && result.state === "complete" &&
+            ["deleted", "preserved"].includes(result.cleanup_status)) {
+          try {
+            const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare",
+              afterSavedJobId: active.jobId, job: {expected_model: "Create image"}});
+            if (prepared?.fresh !== true || prepared.model !== "Create image")
+              preparationError = prepared?.error || "Fresh image composer could not be verified";
+          } catch (_) { preparationError = "Fresh composer preparation unavailable; saved output is safe"; }
+        }
         await chrome.storage.local.set({lastJob: result});
         await chrome.storage.local.remove("active");
-        await connection(message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", message.error
+        await connection(preparationError ? "needs_tab" : message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", preparationError || (message.error
           ? "งานไม่สำเร็จ ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการลองซ้ำอัตโนมัติ"
-          : result.cleanup_status === "preserved" ? "บันทึกภาพที่ได้ครบแล้ว เก็บแชตเดิมไว้ ยังไม่ได้ลบแชต"
+          : result.cleanup_status === "preserved" ? "บันทึกภาพที่ดึงได้แล้ว เก็บแชตเดิมไว้เพื่อรักษาภาพตัวเลือกที่อาจยังไม่ได้บันทึก"
           : result.uploads_cleared ? "นำไฟล์แนบของงานที่หยุดก่อนส่งออกแล้ว แท็บว่าง ไม่ได้เจนภาพ"
           : active.job?.preflight_only ? result.preflight_uploads_cleared
             ? "ตรวจอัปโหลดผ่านและนำไฟล์แนบทดสอบออกแล้ว แท็บว่าง ไม่มีการส่งหรือเจนภาพ"
@@ -759,7 +774,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
           : cleanup && result.cleanup_status !== "deleted"
             ? "รับไฟล์ภาพแล้ว แต่ยังยืนยันการลบไม่ได้ ตรวจแชตเดิม ไม่ต้องเจนซ้ำ"
             : cleanup ? "รับไฟล์ภาพและลบแชตแล้ว พร้อมรับภาพถัดไป"
-              : "รับไฟล์ภาพแล้ว สั่งภาพถัดไปผ่าน MCP ได้เลย ส่วนขยายเตรียมแชตให้เอง");
+              : "รับไฟล์ภาพแล้ว สั่งภาพถัดไปผ่าน MCP ได้เลย ส่วนขยายเตรียมแชตให้เอง"));
         return {ok: true};
       } finally { finishing = false; }
     }

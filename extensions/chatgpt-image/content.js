@@ -5,6 +5,7 @@
   if (installed && chrome.runtime.onMessage.hasListener(installed)) return;
   let running = false;
   let cleanupTarget = null;
+  let preparationTarget = null;
   let uploadBinding = null;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const visible = el => !!el && el.getClientRects().length > 0;
@@ -51,6 +52,21 @@
     const direct = displayedImages(assistantBody());
     return [...new Map((direct.length ? direct : galleryImagesAfterUserHeading()).map(img => [img.currentSrc || img.src, img])).values()];
   };
+  function generatedVariantCount() {
+    const user = turnHeadings("You said:").at(-1);
+    const controls = new Set();
+    for (const gallery of document.querySelectorAll('[data-testid="generated-image-gallery"], [role="group"][aria-label="Generated images"], [role="region"][aria-label="Generated images"]')) {
+      if (!visible(gallery)) continue;
+      for (const control of gallery.querySelectorAll('button[aria-label^="Show generated image "], input[type="checkbox"], [role="checkbox"]')) {
+        if ((visible(control) || visible(control.closest("label"))) &&
+            (!user || !!(user.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING))) controls.add(control);
+      }
+    }
+    return controls.size;
+  }
+  function savedOutputsComplete(target) {
+    return generatedVariantCount() <= JSON.parse(target.signature).length;
+  }
   function resultDomDiagnostics() {
     return {assistant_role_nodes: assistants().length, user_headings: turnHeadings("You said:").length,
       assistant_headings: turnHeadings("ChatGPT said:").length, assistant_body_found: !!assistantBody(),
@@ -360,11 +376,17 @@
       ...(chatPath ? {chatPath} : {})});
     if (receipt?.error) throw new Error("Durable lifecycle receipt failed; inspect ChatGPT and do not retry");
   }
-  async function prepare(job) {
+  function preparationMatches(target) {
+    return target && location.pathname === target.path &&
+      (target.deleted ? !hasTurns() : unchangedResult(target));
+  }
+  async function prepare(job, savedTarget = null) {
     if (job?.expected_model !== "Create image") throw new Error("Native image mode is Create image");
     // React may briefly unmount the composer just after an image completes.
     // Wait for that UI, without navigating or clearing an unseen draft.
     await waitFor(() => visible(editorElement()) && editorElement(), "ChatGPT composer unavailable");
+    if (savedTarget && !preparationMatches(savedTarget))
+      throw new Error("Saved job chat changed; preparation skipped to preserve other work");
     let editor = idleEditor(job);
     if (hasTurns()) {
       const newChat = [...document.querySelectorAll('button[aria-label="New chat"]')].find(visible) ||
@@ -405,6 +427,20 @@
       throw new Error("This job's native attachments are no longer verified ready");
     return editor;
   }
+  function unchangedResult(target) {
+    const users = turnHeadings("You said:");
+    const binding = originalPromptBinding(target.job);
+    return users.length === 1 && turnHeadings("ChatGPT said:").length === 1 &&
+      (binding.root_match || binding.exact_matching_descendant_count > 0) &&
+      JSON.stringify(outputImages().map(img => img.currentSrc || img.src)) === target.signature;
+  }
+  function currentChatMenu() {
+    const legacy = [...document.querySelectorAll('button[aria-label="More"]')].filter(visible);
+    if (legacy.length) return legacy.length === 1 ? legacy[0] : null;
+    // Sidebar Chat actions use 3xs; only the observed current-chat header uses xl.
+    const header = [...document.querySelectorAll('button[aria-label="Chat actions"][data-size="xl"]')].filter(visible);
+    return header.length === 1 ? header[0] : null;
+  }
   async function deleteSavedChat(message) {
     const target = cleanupTarget;
     if (!target || message.jobId !== target.jobId || message.chatPath !== target.path ||
@@ -412,18 +448,17 @@
         !/^\/c\/[a-f0-9-]{36}$/.test(target.path))
       throw new Error("Only this worker's saved image chat can be deleted");
     idleEditor();
-    const users = turnHeadings("You said:");
-    if (users.length !== 1 || turnHeadings("ChatGPT said:").length !== 1 ||
-        !users[0].nextElementSibling || promptText(users[0].nextElementSibling) !== normalizedText(target.prompt))
+    if (!unchangedResult(target) || !savedOutputsComplete(target))
       throw new Error("Chat changed after generation; nothing was deleted");
-    const more = [...document.querySelectorAll('button[aria-label="More"]')].find(visible);
+    const more = currentChatMenu();
     if (!more) throw new Error("Native chat menu unavailable; saved image is safe");
     // This native menu trigger opens on pointerdown, not programmatic click.
     more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
     const remove = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
       visible(el) && normalizedText(el.textContent) === "Delete"), "Native Delete control unavailable");
     idleEditor();
-    if (location.pathname !== target.path) throw new Error("Chat changed; nothing was deleted");
+    if (location.pathname !== target.path || !unchangedResult(target) || !savedOutputsComplete(target))
+      throw new Error("Chat changed; nothing was deleted");
     cleanupTarget = null; // Open confirmation once, only after the local file receipt.
     remove.click();
     const dialog = await waitFor(() => [...document.querySelectorAll('[role="dialog"]')].find(el =>
@@ -448,7 +483,10 @@
       while (Date.now() < deadline) {
         await sleep(250);
         if (location.pathname !== target.path) {
-          if (confirmed) return {deleted: true};
+          if (confirmed) {
+            preparationTarget = {jobId: target.jobId, path: location.pathname, deleted: true};
+            return {deleted: true};
+          }
           throw new Error("Chat changed without deletion confirmation; inspect it before further cleanup");
         }
         if (confirmed && clickedAt && Date.now() - clickedAt >= 20000)
@@ -462,6 +500,8 @@
             if (location.pathname !== target.path || !visible(dialog) || !visible(finalDelete) || finalDelete.disabled)
               throw new Error("Approved deletion dialog changed; nothing was clicked");
             idleEditor();
+            if (!unchangedResult(target) || !savedOutputsComplete(target))
+              throw new Error("Chat changed or has unsaved variants; nothing was deleted");
             confirmed = true;
             clickedAt = Date.now();
             finalDelete.click();
@@ -477,27 +517,39 @@
       throw new Error("Only the exact timed-out job chat can be deleted");
     if (verificationRequired())
       throw new Error("Owner action required: complete verification in ChatGPT and inspect the timed-out chat. Nothing was deleted.");
-    const users = turnHeadings("You said:");
-    if (users.length !== 1 || !users[0].nextElementSibling ||
-        originalPromptBinding(message.job).root_match !== true)
-      throw new Error("Timed-out chat no longer matches its original prompt");
+    const safeToDelete = () => {
+      if (location.origin !== "https://chatgpt.com" || location.pathname !== message.chatPath)
+        throw new Error("Timed-out chat changed before cleanup");
+      if (outputImages().length)
+        throw new Error("Generated output is already visible; preserve this chat and recover the result before cleanup");
+      const users = turnHeadings("You said:");
+      if (users.length !== 1 || !users[0].nextElementSibling ||
+          originalPromptBinding(message.job).root_match !== true)
+        throw new Error("Timed-out chat no longer matches its original prompt");
+      const editor = editorElement();
+      if (!visible(editor) || promptText(editor) || attachmentsPresent() || verificationRequired())
+        throw new Error("Timed-out chat has a draft or uncertain state; nothing was deleted");
+    };
+    safeToDelete();
     const stop = [...document.querySelectorAll('[data-testid="stop-button"], button[aria-label="Stop"]')].find(visible);
     if (stop) {
       stop.click();
       await waitFor(() => !busy(), "Timed-out generation did not stop");
     }
-    const more = [...document.querySelectorAll('button[aria-label="More"]')].find(visible);
+    safeToDelete();
+    const more = currentChatMenu();
     if (!more) throw new Error("Native chat menu unavailable for timed-out cleanup");
     more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
     const remove = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
       visible(el) && normalizedText(el.textContent) === "Delete"), "Native Delete control unavailable");
-    if (location.pathname !== message.chatPath) throw new Error("Timed-out chat changed before cleanup");
+    safeToDelete();
     remove.click();
     const dialog = await waitFor(() => [...document.querySelectorAll('[role="dialog"]')].find(el =>
       visible(el) && [...el.querySelectorAll("button")].some(button => normalizedText(button.textContent) === "Delete chat")),
       "Native deletion confirmation unavailable");
     const finalDelete = [...dialog.querySelectorAll("button")].find(button => normalizedText(button.textContent) === "Delete chat");
     if (!visible(finalDelete) || finalDelete.disabled) throw new Error("Timed-out Delete chat control unavailable");
+    safeToDelete();
     finalDelete.click();
     await waitFor(() => location.pathname !== message.chatPath, "Timed-out chat deletion was not confirmed");
     return {deleted: true};
@@ -629,9 +681,12 @@
           }
           await reportPhase(job, "result_captured", path);
         }
-        cleanupTarget = job.preserve_chat || outputs.length > 1 ? null : {jobId: job.job_id, path, prompt};
+        preparationTarget = {jobId: job.job_id, path, job, signature};
+        const visibleVariantCount = generatedVariantCount();
+        cleanupTarget = job.preserve_chat || outputs.length > 1 || visibleVariantCount > outputs.length ? null : preparationTarget;
         const result = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
           ...(outputs.length === 1 ? {imageBase64: outputs[0]} : {imagesBase64: outputs}), chatPath: path,
+          ...(visibleVariantCount ? {visibleVariantCount} : {}),
           ...(job.collect_only && promptBinding ? {promptBinding} : {})});
         if (result?.error) throw new Error("Image result could not be saved. Inspect ChatGPT; do not regenerate.");
         return;
@@ -659,9 +714,17 @@
       return true;
     }
     if (message.type === "image-prepare") {
-      if (running) { reply({error: "Content worker already running"}); return; }
+      const afterSave = message.afterSavedJobId !== undefined;
+      if (afterSave && (!preparationTarget || message.afterSavedJobId !== preparationTarget.jobId ||
+          !preparationMatches(preparationTarget))) {
+        reply({error: "Saved job chat changed; preparation skipped to preserve other work"}); return;
+      }
+      if (running && !afterSave) { reply({error: "Content worker already running"}); return; }
+      const wasRunning = running;
+      const savedTarget = afterSave ? preparationTarget : null;
+      preparationTarget = null;
       running = true;
-      void prepare(message.job).then(reply, error => reply({error: error.message})).finally(() => { running = false; });
+      void prepare(message.job, savedTarget).then(reply, error => reply({error: error.message})).finally(() => { running = wasRunning; });
       return true;
     }
     if (message.type === "image-identity") {

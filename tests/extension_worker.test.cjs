@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.37 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.37');
+test('0.1.39 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.39');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -2465,4 +2465,88 @@ test('adaptive timeout is exact-job bound, deletes the stalled chat, and clears 
   assert.deepEqual(h.requests.filter(item => item.url.endsWith('/timeout') || item.url.endsWith('/timeout-cleanup')).map(item => item.url.split('/').at(-1)),
     ['timeout', 'timeout-cleanup']);
   assert.ok(h.tabMessages.some(item => item.message.type === 'image-delete-timeout' && item.message.chatPath === chatPath));
+});
+
+
+test('fresh composer waits for saved output and confirmed cleanup receipt', async () => {
+  const active = {jobId: 'job-1', tabId: 7};
+  const h = harness({active, holdDeleteConfirmation: true, responses: {
+    result: {state: 'complete'}, cleanup: [
+      {state: 'complete', cleanup_status: 'confirmation_required'},
+      {state: 'complete', cleanup_status: 'deleted'}]}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+  const {message, sender} = pairedImageResult();
+  const completion = new Promise(resolve => h.receive(message, sender, resolve));
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
+  h.releaseDeleteConfirmation();
+  assert.equal((await completion).ok, true);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-delete', 'image-prepare']);
+  assert.equal(h.tabMessages[1].message.afterSavedJobId, 'job-1');
+  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
+});
+
+test('preserved multiple outputs prepare a fresh chat only after successful save, without deletion', async () => {
+  for (const state of ['complete', 'failed']) {
+    const active = {jobId: 'job-1', tabId: 7};
+    const h = harness({active, holdPath: '/result', responses: {result: {state, cleanup_status: 'preserved'}}});
+    Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+    const {message, sender} = pairedImageResult({imagesBase64: ['a', 'b'], imageBase64: undefined});
+    const completion = new Promise(resolve => h.receive(message, sender, resolve));
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.tabMessages.length, 0);
+    h.releaseNetwork();
+    await completion;
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+    assert.equal(h.tabMessages.filter(call => call.message.type === 'image-prepare').length, state === 'complete' ? 1 : 0);
+  }
+});
+
+test('uncertain cleanup never prepares or loses the successful result', async () => {
+  for (const cleanupStatus of ['pending', 'failed', 'confirmation_required']) {
+    const active = {jobId: 'job-1', tabId: 7};
+    const h = harness({active, responses: {result: {state: 'complete'}, cleanup: {state: 'complete', cleanup_status: cleanupStatus}}});
+    Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+    const {message, sender} = pairedImageResult();
+    await send(h, message, sender);
+    assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
+    assert.equal(h.storage.lastJob.state, 'complete');
+  }
+});
+
+test('preparation refusal keeps completed saved status and reports the draft protection', async () => {
+  const active = {jobId: 'job-1', tabId: 7, job: {preserve_chat: true}};
+  const h = harness({active, preparation: {error: 'Preserve the draft'},
+    responses: {result: {state: 'complete', cleanup_status: 'preserved'}}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+  const {message, sender} = pairedImageResult();
+  assert.equal((await send(h, message, sender)).ok, true);
+  assert.equal(h.storage.lastJob.state, 'complete');
+  assert.equal(h.storage.connection.state, 'needs_tab');
+});
+
+
+test('more native variants than saved images are forwarded and preserved before fresh preparation', async () => {
+  const active = {jobId: 'job-1', tabId: 7};
+  const h = harness({active, responses: {result: {state: 'complete', cleanup_status: 'preserved', visible_variant_count: 2}}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+  const {message, sender} = pairedImageResult({visibleVariantCount: 2});
+  assert.equal((await send(h, message, sender)).ok, true);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
+  assert.equal(h.requests[0].body.visible_variant_count, 2);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-prepare']);
+  assert.equal(h.storage.lastJob.cleanup_status, 'preserved');
+  assert.doesNotMatch(JSON.stringify(h.storage.connection), /ครบแล้ว/);
+});
+
+test('invalid variant counts fail closed without submitting a result or deleting a chat', async () => {
+  for (const visibleVariantCount of [0, -1, 1.5, '2', 101]) {
+    const active = {jobId: 'job-1', tabId: 7};
+    const h = harness({active});
+    Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+    const {message, sender} = pairedImageResult({visibleVariantCount});
+    assert.match((await send(h, message, sender)).error, /Invalid visible generated variant count/);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.tabMessages.length, 0);
+  }
 });
