@@ -1056,6 +1056,41 @@ def test_inspected_http_400_result_can_be_recovered_without_resending(tmp_path):
     assert result["sha256"] == hashlib.sha256(raw).hexdigest()
 
 
+def test_inspected_timeout_cleanup_failure_preserves_chat_without_resubmitting(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
+    submitted = queue.submit("Generate from the supplied reference.", "Create image",
+                             images=_local_reference(tmp_path))
+    job_id = submitted["job_id"]
+    queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, job_id, "submit_attempted", 17)
+    queue.phase(CLIENT_ID, job_id, "remote_started", 17, RESULT_CHAT_PATH)
+    queue.jobs[job_id]["remote_started_at"] -= queue.jobs[job_id]["generation_timeout_seconds"] + 1
+    queue.timeout(CLIENT_ID, job_id, RESULT_CHAT_PATH)
+    queue.timeout_cleanup(CLIENT_ID, job_id, False)
+    original_error = queue.status(job_id)["error"]
+    original_cleanup_error = queue.status(job_id)["cleanup_error"]
+
+    asyncio.run(create_mcp(queue).call_tool("resolve", {
+        "job_id": job_id, "inspected_chatgpt": True,
+    }))
+
+    status = queue.status(job_id)
+    assert status["state"] == "failed"
+    assert status["cleanup_status"] == "preserved"
+    assert status["previous_cleanup_status"] == "timeout_delete_failed"
+    assert status["error"] == original_error
+    assert status["cleanup_error"] == original_cleanup_error
+    assert status["chat_path"] == RESULT_CHAT_PATH
+    assert queue.claim(CLIENT_ID) == {}
+
+    running = queue.submit("A separate image job.", "Create image")
+    assert queue.claim(CLIENT_ID)["job_id"] == running["job_id"]
+    queued = queue.submit("Keep ordinary in-flight work gated.", "Create image")
+    assert queue.claim(CLIENT_ID) == {}
+    assert queue.status(queued["job_id"])["state"] == "queued"
+
+
 def test_inspected_completed_timeout_recovers_without_deleting_chat_or_resubmitting(tmp_path):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
     queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)

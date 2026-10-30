@@ -1031,7 +1031,8 @@ class ExtensionQueue:
 
     def resolve(self, job_id: str, clear_preflight_uploads: bool = False,
                 clear_failed_uploads: bool = False, native_upload_names: list[str] | None = None,
-                recover_outputs: bool = False, recovery_chat_path: str | None = None) -> dict:
+                recover_outputs: bool = False, recovery_chat_path: str | None = None,
+                inspected_chatgpt: bool = False) -> dict:
         """Explicit operator action after inspecting the upstream conversation."""
         with self.lock:
             if job_id not in self.jobs:
@@ -1169,9 +1170,15 @@ class ExtensionQueue:
                     job["original_preflight_error"] = error
                 self._save(job)
                 return self.status(job_id)
-            if self.jobs[job_id]["state"] not in TERMINAL:
-                self.jobs[job_id].update(state="interrupted", error="Operator resolved uncertain work; no automatic resubmission.")
-                self._save(self.jobs[job_id])
+            job = self.jobs[job_id]
+            if (inspected_chatgpt is True and job["state"] == "failed" and
+                    job.get("cleanup_status") == "timeout_delete_failed"):
+                job["previous_cleanup_status"] = job["cleanup_status"]
+                job["cleanup_status"] = "preserved"
+                self._save(job)
+            elif job["state"] not in TERMINAL:
+                job.update(state="interrupted", error="Operator resolved uncertain work; no automatic resubmission.")
+                self._save(job)
             return self.status(job_id)
 
 
@@ -1258,7 +1265,8 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                         raise ValueError("inspect ChatGPT before resolving uncertain work")
                     result = queue.resolve(data["job_id"], data.get("clear_preflight_uploads", False),
                                            data.get("clear_failed_uploads", False), data.get("native_upload_names"),
-                                           data.get("recover_outputs", False), data.get("recovery_chat_path"))
+                                           data.get("recover_outputs", False), data.get("recovery_chat_path"),
+                                           inspected_chatgpt=True)
                 else:
                     return self.reply(404, {"error": "unknown route"})
                 self.reply(200, result)
@@ -1361,10 +1369,10 @@ def create_mcp(queue):
         if inspected_chatgpt is not True:
             raise ValueError("inspect ChatGPT before resolving uncertain work")
         if recover_outputs or recovery_chat_path is not None:
-            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names, recover_outputs, recovery_chat_path))
+            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names, recover_outputs, recovery_chat_path, inspected_chatgpt=True))
         if clear_failed_uploads or native_upload_names is not None:
-            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names))
-        return compact_status(queue.resolve(job_id, clear_preflight_uploads))
+            return compact_status(queue.resolve(job_id, clear_preflight_uploads, clear_failed_uploads, native_upload_names, inspected_chatgpt=True))
+        return compact_status(queue.resolve(job_id, clear_preflight_uploads, inspected_chatgpt=True))
 
     return server
 
