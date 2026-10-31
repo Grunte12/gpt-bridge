@@ -224,7 +224,10 @@ class ExtensionClient:
 
     def resolve(self, job_id: str, clear_preflight_uploads: bool = False,
                 clear_failed_uploads: bool = False, native_upload_names: list[str] | None = None,
-                recover_outputs: bool = False, recovery_chat_path: str | None = None) -> dict:
+                recover_outputs: bool = False, recovery_chat_path: str | None = None,
+                inspected_chatgpt: bool = True) -> dict:
+        if inspected_chatgpt is not True:
+            raise ValueError("inspect ChatGPT before resolving uncertain work")
         return self.call("resolve", {"job_id": job_id, "inspected_chatgpt": True,
                                     **({"clear_preflight_uploads": clear_preflight_uploads} if clear_preflight_uploads is not False else {}),
                                     **({"clear_failed_uploads": clear_failed_uploads} if clear_failed_uploads is not False else {}),
