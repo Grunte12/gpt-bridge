@@ -3,7 +3,7 @@ import json
 import pytest
 
 import chatgpt_api.cli as cli
-from chatgpt_api.cli import main
+from chatgpt_api.cli import legacy_main as main  # Archived implementation tests; not the public CLI.
 from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.legacy_cli import translate_legacy_argv
 from chatgpt_api.providers.chatgpt.crypto import is_encrypted

@@ -1,23 +1,23 @@
 const $ = selector => document.querySelector(selector);
 const labels = {
-  checking: "กำลังตรวจการเชื่อมต่อ", unpaired: "เชื่อมครั้งแรก",
+  checking: "กำลังตรวจการเชื่อมต่อ", unpaired: "กำลังเชื่อมอัตโนมัติ",
   ready: "เชื่อมต่อแล้ว", busy: "กำลังทำงาน", complete: "เชื่อมต่อแล้ว", preflight_complete: "เชื่อมต่อแล้ว",
   confirmation_required: "บันทึกภาพแล้ว รอยืนยันลบแชท",
-  needs_tab: "ยังไม่มีแท็บที่เชื่อม", needs_relink: "ยืนยันแท็บ second", offline: "รอ MCP กลับมา",
+  needs_tab: "ยังไม่มีแท็บที่เชื่อม", needs_relink: "ยืนยันแท็บ ChatGPT", offline: "รอ MCP กลับมา",
   needs_pairing: "ต้องเชื่อมใหม่", interrupted: "ตรวจงานเดิมก่อน", failed: "มีปัญหากับงานล่าสุด"
 };
 const nextActions = {
   checking: "รอผลการตรวจสักครู่",
-  unpaired: "เปิด ChatGPT บัญชี second แล้วยืนยันก่อนเชื่อม ส่วนขยายจะเตรียมแชต Create image ให้เอง",
+  unpaired: "เปิด MCP ไว้ ระบบจะเปิดแท็บงานใน Chrome นี้และเชื่อมเอง ถ้ายังไม่ล็อกอิน ให้ล็อกอิน ChatGPT ตามปกติ",
   ready: "สั่งภาพผ่าน MCP ได้เลย",
   busy: "รอให้งานนี้จบ อย่าส่งซ้ำ",
   complete: "สั่งภาพถัดไปผ่าน MCP ได้",
   preflight_complete: "สั่งงานถัดไปผ่าน MCP ได้",
   confirmation_required: "รอให้การลบแชตของงานนี้จบ",
-  needs_tab: "เปิดแท็บ ChatGPT บัญชี second แล้วยืนยันด้านล่าง",
-  needs_relink: "ยืนยันว่าแท็บที่เปิดอยู่เป็นบัญชี second แล้วกดเชื่อมด้วยรหัสเดิม",
+  needs_tab: "เปิดแท็บ ChatGPT ที่ต้องการใช้ แล้วยืนยันด้านล่าง",
+  needs_relink: "ยืนยันให้ใช้บัญชีที่ล็อกอินในแท็บนี้ แล้วกดเชื่อมด้วยรหัสเดิม",
   offline: "รอ MCP กลับมา ไม่ต้องกรอกรหัสใหม่",
-  needs_pairing: "กรอกรหัสจับคู่ครั้งนี้ครั้งเดียว แล้วยืนยันบัญชี second",
+  needs_pairing: "เชื่อมแท็บ ChatGPT อีกครั้ง ระบบจะจับคู่ในเครื่องให้อัตโนมัติ",
   interrupted: "ตรวจงานเดิมใน ChatGPT ก่อนสั่งใหม่",
   failed: "ตรวจงานล่าสุดก่อนสั่งใหม่"
 };
@@ -50,13 +50,13 @@ function render(status) {
     ? `ตรวจล่าสุด: ${checkedDate.toLocaleString()}`
     : "ตรวจล่าสุด: ยังไม่ได้ตรวจ";
   $("#identity").hidden = !status.configured;
-  const showPair = !status.configured || relinking || ["needs_pairing", "needs_relink", "needs_tab"].includes(state);
+  const showPair = relinking || ["needs_pairing", "needs_relink", "needs_tab"].includes(state);
   $("#pair-form").hidden = !showPair;
-  $("#token-row").hidden = status.configured && state !== "needs_pairing";
-  $("#token").required = !$("#token-row").hidden;
+  $("#token-row").hidden = true;
+  $("#token").required = false;
   $("#pair-hint").textContent = status.configured && state !== "needs_pairing"
     ? "ใช้รหัสที่จำไว้แล้ว ยืนยันบัญชีของแท็บนี้ก่อนเปลี่ยนแท็บ"
-    : "รหัสนี้ไม่ใช่รหัสผ่านหรือโทเคน ChatGPT บัญชีที่ใช้ต้องตรวจด้วยตัวคุณเอง";
+    : "จับคู่ผ่านตัวเชื่อมในเครื่องอัตโนมัติ ไม่ต้องคัดลอกรหัสหรือใช้ Terminal";
   $("#refresh").hidden = !status.configured || showPair;
   $("#advanced").hidden = !status.configured;
   const job = status.lastJob;
@@ -102,7 +102,7 @@ $("#pair-form").onsubmit = event => {
   void action(async () => {
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
     const result = await chrome.runtime.sendMessage({type: "pair", tabId: tab?.id,
-      account: "second", confirmedAccount: $("#confirm-account").checked, token: $("#token").value.trim()});
+      confirmedTab: $("#confirm-account").checked, refreshPairing: current.connection?.state === "needs_pairing", token: $("#token").value.trim()});
     $("#token").value = "";
     if (result?.error) throw new Error(result.error);
     relinking = false;

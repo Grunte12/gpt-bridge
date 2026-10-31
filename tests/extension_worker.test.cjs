@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.39 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.39');
+test('0.1.41 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.41');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -149,13 +149,15 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
       if (httpError) return {ok: false, status: httpError, json: async () => httpErrorBody};
       const route = url.split('/').at(-1);
       const configuredResponse = responses[route];
-      const response = route === 'state' ? state : route === 'next' ? next
+      const response = route === 'status' ? {transport: 'extension-native-ui', ...(configuredResponse || {})} : route === 'state' ? state : route === 'next' ? next
         : Array.isArray(configuredResponse) ? configuredResponse.shift()
           : configuredResponse || (route === 'cleanup' ? {state: 'complete', cleanup_status: body.cleanup_status} : {});
       return {ok: true, json: async () => response};
     }};
   vm.runInNewContext(source, context, {filename: 'worker.js'});
   return {storage, requests, alarms, tabLookups, tabMessages, scriptInjections, receive: listener,
+    setNativePairing(fn) { chrome.runtime.sendNativeMessage = fn; },
+    resume() { return context.resume(); },
     get reloadCalls() { return reloadCalls; },
     fireAlarm() { alarmListener({name: 'poll'}); },
     releaseNetwork() { releaseNetwork(); },
@@ -213,8 +215,87 @@ async function waitForRequest(h, route, limit = 40) {
 const pairing = overrides => ({type: 'pair', tabId: 7, url: 'https://chatgpt.com/',
   token: 'x'.repeat(40), account: 'second', confirmedAccount: true, ...overrides});
 
+test('native pairing obtains local authorization without user-entered code', async () => {
+  const h = harness();
+  const nativeCalls = [];
+  h.setNativePairing(async (host, message) => {
+    nativeCalls.push({host, message});
+    return {token: 'n'.repeat(40)};
+  });
+  const response = await send(h, pairing({token: ''}));
+  assert.equal(response.ok, true, response.error);
+  assert.deepEqual(JSON.parse(JSON.stringify(nativeCalls)), [{host: 'org.gpt_bridge.pairing', message: {action: 'pair'}}]);
+  assert.equal(h.requests[0].authorization, 'Bearer ' + 'n'.repeat(40));
+  assert.equal(h.storage.config.token, 'n'.repeat(40));
+});
+
+test('native pairing failure does not send requests or save a config', async () => {
+  const h = harness();
+  h.setNativePairing(async () => { throw new Error('not installed'); });
+  const response = await send(h, pairing({token: ''}));
+  assert.match(response.error, /install-native/);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.storage.config, undefined);
+});
+
+test('startup auto-connects without popup and reuses the owned tab', async () => {
+  const h = harness({allowCreate: true, responses: {status: {queue_depth: 0}}});
+  h.setNativePairing(async () => ({token: 'n'.repeat(40)}));
+  await h.resume();
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.storage.config.tabId, 42);
+  assert.equal(h.createdTabs.length, 1);
+  assert.equal(h.createdTabs[0].active, false);
+  assert.equal(h.requests.some(r => r.url.endsWith('/pair')), true);
+  await h.resume();
+  assert.equal(h.createdTabs.length, 1);
+});
+
+test('auto-connect never replaces active or halted work or a deliberate disconnect', async () => {
+  for (const storage of [{active: {jobId: 'original'}}, {autoConnectDisabled: true}, {}]) {
+    const h = harness({storage, allowCreate: true, responses: {status: {line_halted: true}}});
+    h.setNativePairing(async () => ({token: 'n'.repeat(40)}));
+    await h.resume();
+    assert.equal(h.createdTabs.length, 0);
+    assert.equal(h.storage.config, undefined);
+  }
+});
+
+test('failed bootstrap reuses its own tab on the next attempt, not another new tab', async () => {
+  const h = harness({allowCreate: true, failPaths: ['pair']});
+  h.setNativePairing(async () => ({token: 'n'.repeat(40)}));
+  await h.resume();
+  await h.resume();
+  assert.equal(h.createdTabs.length, 1);
+});
+
+test('auto-connect does not steal an existing profile or trust a different server', async () => {
+  for (const status of [{paired: true}, {queue_depth: 3}, {transport: 'unknown'}]) {
+    const h = harness({allowCreate: true, responses: {status}});
+    h.setNativePairing(async () => ({token: 'n'.repeat(40)}));
+    await h.resume();
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.createdTabs.length, 0);
+    assert.equal(h.storage.config, undefined);
+    assert.equal(h.requests.some(r => r.url.endsWith('/pair')), false);
+  }
+});
+
+test('401 refreshes native authorization without losing original client, tab, or job', async () => {
+  const config = {token: 'old-token', clientId: 'original-client', tabId: 7};
+  const active = {jobId: 'original-job', tabId: 7};
+  const h = harness({storage: {config, active}, httpError: 401});
+  h.setNativePairing(async () => ({token: 'n'.repeat(40)}));
+  await h.resume();
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.storage.config.token, 'n'.repeat(40));
+  assert.equal(h.storage.config.clientId, 'original-client');
+  assert.equal(h.storage.config.tabId, 7);
+  assert.equal(h.storage.active.jobId, 'original-job');
+  assert.equal(h.requests.some(r => r.url.endsWith('/pair') || r.url.endsWith('/next')), false);
+});
+
 for (const [name, overrides, tabUrl] of [
-  ['main account', {account: 'main'}, 'https://chatgpt.com/'],
   ['unchecked owner confirmation', {confirmedAccount: false}, 'https://chatgpt.com/'],
   ['spoofed supplied URL', {url: 'https://chatgpt.com/'}, 'https://example.com/']
 ]) {
@@ -228,12 +309,12 @@ for (const [name, overrides, tabUrl] of [
   });
 }
 
-test('pair binds only the confirmed second account to the actual ChatGPT tab', async () => {
+test('pair uses the Chrome login without an account selector', async () => {
   const h = harness({preparation: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}});
   const result = await send(h, pairing());
   assert.equal(result.ok, true);
   assert.ok(h.tabLookups.length >= 1 && h.tabLookups.every(id => id === 7));
-  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', account: 'second', visible_model: 'Create image', input_protocol: 2, tab_id: 7});
+  assert.deepEqual(h.requests[0].body, {client_id: 'client-id', visible_model: 'Create image', input_protocol: 2, tab_id: 7});
   const prepared = h.tabMessages.filter(call => call.message.type === 'image-prepare');
   assert.equal(prepared.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(prepared[0].message)), {type: 'image-prepare', job: {expected_model: 'Create image'}});
@@ -241,7 +322,7 @@ test('pair binds only the confirmed second account to the actual ChatGPT tab', a
   assert.ok(h.tabMessages.some(call => call.message.type === 'image-bind'));
   assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
   assert.equal(JSON.stringify(h.tabMessages).includes('prompt'), false);
-  assert.equal(h.storage.config.account, 'second');
+  assert.equal(h.storage.config.account, undefined);
   assert.equal(h.storage.config.tabId, 7);
   assert.ok(h.alarms.some(args => args[0] === 'poll'));
   assert.equal(Object.hasOwn(h.requests[0].body, 'retry_timeout_cleanup'), false);
@@ -254,7 +335,7 @@ test('extension-page tabs can manage the worker while web content senders cannot
     const result = await send(h, pairing(), extensionPage);
     assert.equal(result.ok, true);
     assert.equal(h.requests[0].url.endsWith('/pair'), true);
-    assert.equal(h.storage.config.account, 'second');
+    assert.equal(h.storage.config.account, undefined);
   });
   await t.test('ChatGPT content sender is rejected before pairing side effects', async () => {
     const h = harness();
@@ -409,7 +490,7 @@ test('owner-confirmed pairing reuses saved token and client id for the second ta
 
   assert.ok(response.ok, response.error);
   assert.equal(h.requests[0].body.client_id, '123e4567-e89b-12d3-a456-426614174001');
-  assert.equal(h.requests[0].body.account, 'second');
+  assert.equal(h.requests[0].body.account, undefined);
   assert.equal(h.requests[0].authorization, 'Bearer ' + config.token);
   assert.equal(h.storage.config.tabId, 7);
   assert.equal(h.storage.config.clientId, '123e4567-e89b-12d3-a456-426614174001');
@@ -501,7 +582,7 @@ test('poll reconnects a saved config after offline state and claims only after f
   assert.equal(offline.requests.length, 1);
   assert.equal(offline.requests[0].url.endsWith('/heartbeat'), true);
   assert.equal(offline.requests[0].body.client_id, 'saved-client');
-  assert.equal(offline.requests[0].body.account, 'second');
+  assert.equal(offline.requests[0].body.account, undefined);
   assert.equal(offline.requests[0].body.tab_ready, true);
   assert.equal(offline.requests[0].body.input_protocol, 2);
   assert.equal(offline.requests[0].body.tab_idle, true);
@@ -652,19 +733,16 @@ test('a missing saved tab rebinds only a single matching client marker', async t
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
   });
 
-  await t.test('a matching marker does not override the multiple-tab guard', async () => {
+  await t.test('exact marker recovers among unrelated ChatGPT tabs', async () => {
     const h = harness({tabExists: false, candidateTabs: [chatgpt(8), chatgpt(9)], identities: {8: clientId, 9: ''}});
     Object.assign(h.storage, {config: {...config}});
     h.fireAlarm();
-    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-
-    assert.equal(h.storage.config.tabId, 7);
-    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 8);
     assert.equal(h.requests[0].body.chatgpt_tabs, 2);
-    assert.equal(h.tabMessages.some(call => call.message.type === 'image-bind' ||
-      call.message.type === 'image-inspect' || call.message.type === 'image-prepare'), false);
+    assert.equal(h.tabMessages.some(call => call.id === 9 && call.message.type !== 'image-identity'), false);
+    assert.equal(h.tabMessages.some(call => call.id === 8 && call.message.type === 'image-inspect'), true);
   });
-
   await t.test('open cleanup blocks sole-tab rebinding', async () => {
     const storage = {lastJob: {state: 'complete', cleanup_status: 'pending'}};
     const h = harness({tabExists: false, candidateTabs: [chatgpt(9)], identities: {9: ''}, storage});
@@ -678,48 +756,30 @@ test('a missing saved tab rebinds only a single matching client marker', async t
       call.message.type === 'image-inspect' || call.message.type === 'image-prepare'), false);
   });
 
-  await t.test('one unmarked tab is rebound after authenticated restart recovery and prepared without claiming work', async () => {
-    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)], identities: {9: ''}, next: {job_id: 'job-1'},
-      inspection: {fresh: false, error: 'Select native Create image in a normal fresh chat first.', input_protocol: 4},
-      preparation: {fresh: true, model: 'Create image', input_protocol: 4, idle: true}});
+  await t.test('one unmarked tab is rebound after authenticated restart recovery and prepared without claiming work — now rejected for ownership safety', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)],
+      identities: {9: ''}});
     Object.assign(h.storage, {config: {...config}});
     h.fireAlarm();
-    for (let i = 0; i < 20 && h.storage.connection?.state !== 'ready'; i++) await new Promise(resolve => setImmediate(resolve));
-
-    assert.equal(h.storage.config.tabId, 9);
-    assert.equal(h.requests[0].body.tab_recovery, 'none');
-    assert.equal(h.requests[0].body.chatgpt_tabs, 1);
-    assert.equal(h.requests[0].body.tab_ready, false);
-    assert.equal(h.requests[0].body.content_receiver, 'unreported');
-    assert.equal(h.requests[1].body.tab_recovery, 'rebound');
-    assert.equal(h.requests[1].body.tab_ready, true);
-    assert.equal(h.tabMessages.some(call => call.id === 9 && call.message.type === 'image-bind'), true);
-    assert.equal(h.tabMessages.findIndex(call => call.message.type === 'image-bind') <
-      h.tabMessages.findIndex(call => call.message.type === 'image-inspect'), true);
-    assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), true);
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.tabMessages.some(call => ['image-bind', 'image-inspect', 'image-prepare', 'image-job'].includes(call.message.type)), false);
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
-    assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
-    assert.equal(h.storage.connection.state, 'ready');
+    assert.equal(h.storage.connection.state, 'needs_relink');
   });
-
-  await t.test('a reused saved tab id recovers the sole ChatGPT tab after authenticated heartbeat', async () => {
-    const h = harness({tabUrl: 'https://example.com/', candidateTabs: [chatgpt(9)],
+  await t.test('a reused saved tab id recovers the sole ChatGPT tab after authenticated heartbeat — now rejected for ownership safety', async () => {
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(9)],
       identities: {9: '123e4567-e89b-12d3-a456-426614174099'}});
     Object.assign(h.storage, {config: {...config}});
     h.fireAlarm();
-    for (let i = 0; i < 20 && h.storage.connection?.state !== 'ready'; i++) await new Promise(resolve => setImmediate(resolve));
-
-    assert.equal(h.storage.config.tabId, 9);
-    assert.equal(h.requests[0].body.tab_ready, false);
-    assert.equal(h.requests[0].body.content_receiver, 'unreported');
-    assert.equal(h.requests[1].body.tab_ready, true);
-    assert.equal(h.tabMessages.some(call => call.id === 9 && call.message.type === 'image-bind'), true);
-    assert.equal(h.tabMessages.some(call => call.id === 9 && call.message.type === 'image-inspect'), true);
-    assert.equal(h.tabMessages.some(call => call.id === 7), false);
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.tabMessages.some(call => ['image-bind', 'image-inspect', 'image-prepare', 'image-job'].includes(call.message.type)), false);
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
-    assert.equal(h.storage.connection.state, 'ready');
+    assert.equal(h.storage.connection.state, 'needs_relink');
   });
-
   await t.test('multiple unmarked tabs stay unmatched', async () => {
     const h = harness({tabExists: false, candidateTabs: [chatgpt(8), chatgpt(9)], identities: {8: '', 9: ''}, next: {job_id: 'job-1'}});
     Object.assign(h.storage, {config: {...config}});
@@ -762,36 +822,29 @@ test('a missing saved tab rebinds only a single matching client marker', async t
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
   });
 
-  await t.test('a stale client marker is rebound only after authenticated single-tab recovery', async () => {
+  await t.test('a stale client marker is rebound only after authenticated single-tab recovery — now rejected for ownership safety', async () => {
     const h = harness({tabExists: false, candidateTabs: [chatgpt(9)],
       identities: {9: '123e4567-e89b-12d3-a456-426614174099'}});
     Object.assign(h.storage, {config: {...config}});
     h.fireAlarm();
-    for (let i = 0; i < 20 && h.storage.connection?.state !== 'ready'; i++) await new Promise(resolve => setImmediate(resolve));
-
-    assert.equal(h.storage.config.tabId, 9);
-    assert.equal(h.requests[0].body.tab_ready, false);
-    assert.equal(h.requests[0].body.content_receiver, 'unreported');
-    assert.equal(h.requests[1].body.tab_ready, true);
-    assert.equal(h.tabMessages.some(call => call.id === 9 && call.message.type === 'image-bind'), true);
-    assert.equal(h.storage.connection.state, 'ready');
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.tabMessages.some(call => ['image-bind', 'image-inspect', 'image-prepare', 'image-job'].includes(call.message.type)), false);
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.storage.connection.state, 'needs_relink');
   });
-
-  await t.test('a stale marker is not rebound when the saved pairing heartbeat is rejected', async () => {
+  await t.test('a stale marker is not rebound when the saved pairing heartbeat is rejected — now rejected for ownership safety', async () => {
     const h = harness({tabExists: false, candidateTabs: [chatgpt(9)],
-      identities: {9: '123e4567-e89b-12d3-a456-426614174099'}, httpError: 401});
+      identities: {9: '123e4567-e89b-12d3-a456-426614174099'}});
     Object.assign(h.storage, {config: {...config}});
     h.fireAlarm();
-    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.storage.config.tabId, 7);
-    assert.equal(h.requests.length, 1);
-    assert.equal(h.requests[0].body.tab_ready, false);
-    assert.equal(h.tabMessages.some(call => call.message.type === 'image-bind' ||
-      call.message.type === 'image-inspect' || call.message.type === 'image-prepare'), false);
+    assert.equal(h.requests[0].body.tab_recovery, 'unmatched');
+    assert.equal(h.tabMessages.some(call => ['image-bind', 'image-inspect', 'image-prepare', 'image-job'].includes(call.message.type)), false);
     assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
-    assert.equal(h.storage.connection.state, 'needs_pairing');
+    assert.equal(h.storage.connection.state, 'needs_relink');
   });
 
   await t.test('tab replacement keeps the same pairing without a new code', async () => {
@@ -1860,7 +1913,7 @@ test('get-status is sanitized and triggers a reconnect poll', async () => {
   assert.ok(status);
   assert.equal(serialized.includes('synthetic-secret'), false);
   assert.equal(serialized.includes('private-client-id'), false);
-  assert.match(serialized, /second/);
+  assert.match(serialized, /chrome_login/);
   assert.match(serialized, /7/);
   assert.equal(h.requests.some(call => call.url.endsWith('/heartbeat')), true);
 });

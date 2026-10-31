@@ -429,20 +429,20 @@ def test_tab_recovery_reports_one_next_action_without_adopting_a_count_as_identi
         CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, worker_version="0.1.24",
         content_receiver="tab_missing", receiver_error="tab_missing", tab_recovery="none", chatgpt_tabs=0,
     )
-    assert missing["next_action"] == "open_second_tab"
+    assert missing["next_action"] == "open_chatgpt_tab"
     blocked = queue.heartbeat(
         CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, content_receiver="available",
         tab_error="Owner action required: complete verification in ChatGPT. Nothing was submitted.",
         tab_recovery="rebound", chatgpt_tabs=1,
     )
-    assert blocked["next_action"] == "verify_second_tab"
+    assert blocked["next_action"] == "verify_paired_tab"
     assert missing["extension_diagnostics"]["chatgpt_tabs"] == 0
 
     unmatched = queue.heartbeat(
         CLIENT_ID, ACCOUNT, "Create image", tab_ready=False, worker_version="0.1.24",
         content_receiver="tab_missing", receiver_error="tab_missing", tab_recovery="unmatched", chatgpt_tabs=1,
     )
-    assert unmatched["next_action"] == "confirm_second_tab"
+    assert unmatched["next_action"] == "confirm_paired_tab"
     assert unmatched["extension_diagnostics"]["tab_recovery"] == "unmatched"
     assert "url" not in json.dumps(unmatched["extension_diagnostics"])
 
@@ -1986,6 +1986,60 @@ def test_full_queue_refuses_new_jobs(tmp_path):
         queue.submit(f"Job {index}.", "Create image")
     with pytest.raises(ValueError, match="queue is full"):
         queue.submit("One too many.", "Create image")
+
+
+def test_six_simultaneous_callers_and_claimers_keep_one_owner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    queue = _paired_queue(tmp_path)
+    barrier = Barrier(6)
+
+    def submit(index):
+        barrier.wait()
+        return queue.submit(f"Agent {index} unique request", "Create image")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        receipts = list(pool.map(submit, range(6)))
+    assert len({r["job_id"] for r in receipts}) == 6
+    assert queue.status()["queue_depth"] == 6
+    expected = next(iter(queue.jobs))  # FIFO means lock admission, not caller thread number.
+    barrier = Barrier(6)
+
+    def claim(_):
+        barrier.wait()
+        return queue.claim(CLIENT_ID)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        claimed = [r for r in pool.map(claim, range(6)) if r]
+    assert len(claimed) == 1
+    assert claimed[0]["job_id"] == expected
+    assert sum(j["state"] == "queued" for j in queue.jobs.values()) == 5
+    scheduling = compact_status(queue.status())["scheduler"]
+    assert scheduling == {"policy": "fifo", "worker_tabs": 1, "capacity": 10,
+                          "waiting": 5, "in_flight_or_cleanup": 1,
+                          "rate_limit_policy": "not_configured"}
+
+
+def test_simultaneous_admission_never_exceeds_global_capacity(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    queue = _paired_queue(tmp_path)
+    barrier = Barrier(16)
+
+    def submit(index):
+        barrier.wait()
+        try:
+            return queue.submit(f"Capacity caller {index}", "Create image")["job_id"]
+        except ValueError as error:
+            assert "queue is full" in str(error)
+            return None
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        admitted = [job for job in pool.map(submit, range(16)) if job]
+    assert len(admitted) == len(set(admitted)) == 10
+    assert queue.status()["queue_depth"] == 10
 
 
 def test_stale_pairing_cannot_submit_when_extension_is_offline(tmp_path):

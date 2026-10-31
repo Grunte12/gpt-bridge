@@ -305,7 +305,7 @@ def install_runtime(
     dry_run: bool = False,
     runner: Runner = subprocess.run,
 ) -> IntegrationResult:
-    command = [sys.executable, "-m", "pip", "install", "-e", str(repo_root.resolve())]
+    command = [sys.executable, "-m", "pip", "install", "-e", str(repo_root.resolve()) + "[mcp]"]
     home_dir = Path.home() if home is None else home
     shim = home_dir / ".local" / "bin" / ("gpt-bridge.cmd" if os.name == "nt" else "gpt-bridge")
     if dry_run:

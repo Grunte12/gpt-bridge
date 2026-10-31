@@ -17,9 +17,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from chatgpt_api.extension_bridge import ExtensionClient, read_token  # noqa: E402
+from chatgpt_api.extension_bridge import ExtensionClient, read_token, default_data_dir  # noqa: E402
 
-DATA_DIR = Path.home() / ".local/share/gpt-bridge/extension/second"
+DATA_DIR = default_data_dir()
 OLD_WORKER = "the running worker has no reload route: restart it with the current code, then run this again"
 
 

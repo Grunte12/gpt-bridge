@@ -309,8 +309,8 @@ def test_mcp_resolve_requires_inspection_before_calling_client(arguments):
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda job_id, clear_preflight_uploads=False: calls.append(
-        (job_id, clear_preflight_uploads)
+    client.resolve = lambda job_id, clear_preflight_uploads=False, *, inspected_chatgpt=False: calls.append(
+        (job_id, clear_preflight_uploads, inspected_chatgpt)
     ) or {"state": "interrupted"}
     server = create_mcp(client)
 
@@ -350,21 +350,21 @@ def test_mcp_resolve_calls_client_only_after_explicit_inspection():
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda job_id, clear_preflight_uploads=False: calls.append(
-        (job_id, clear_preflight_uploads)
+    client.resolve = lambda job_id, clear_preflight_uploads=False, *, inspected_chatgpt=False: calls.append(
+        (job_id, clear_preflight_uploads, inspected_chatgpt)
     ) or {"state": "interrupted"}
     server = create_mcp(client)
 
     result = asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True,
     }))
-    assert calls == [("synthetic", False)]
+    assert calls == [("synthetic", False, True)]
     assert "interrupted" in result[0].text
 
     result = asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True, "clear_preflight_uploads": True,
     }))
-    assert calls == [("synthetic", False), ("synthetic", True)]
+    assert calls == [("synthetic", False, True), ("synthetic", True, True)]
     assert "interrupted" in result[0].text
 
 
@@ -373,14 +373,14 @@ def test_mcp_failed_upload_cleanup_forwards_only_explicit_inspected_names():
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda *args: calls.append(args) or {"state": "queued"}
+    client.resolve = lambda *args, **kwargs: calls.append((args, kwargs)) or {"state": "queued"}
     server = create_mcp(client)
     names = ["input-001(1).png", "input-002(1).png"]
     asyncio.run(server.call_tool("resolve", {
         "job_id": "synthetic", "inspected_chatgpt": True,
         "clear_failed_uploads": True, "native_upload_names": names,
     }))
-    assert calls == [("synthetic", False, True, names)]
+    assert calls == [(("synthetic", False, True, names), {"inspected_chatgpt": True})]
 
 
 def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
@@ -388,7 +388,7 @@ def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
 
     client = ExtensionClient(TOKEN)
     calls = []
-    client.resolve = lambda *args: calls.append(args) or {"state": "queued"}
+    client.resolve = lambda *args, **kwargs: calls.append((args, kwargs)) or {"state": "queued"}
     server = create_mcp(client)
     chat_path = "/c/123e4567-e89b-12d3-a456-426614174000"
 
@@ -399,7 +399,7 @@ def test_mcp_output_recovery_forwards_explicit_chat_path_after_inspection():
         "recovery_chat_path": chat_path,
     }))
 
-    assert calls == [("synthetic-job", False, False, None, True, chat_path)]
+    assert calls == [(("synthetic-job", False, False, None, True, chat_path), {"inspected_chatgpt": True})]
     assert "queued" in result[0].text
 
 

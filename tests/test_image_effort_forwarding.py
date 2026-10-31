@@ -90,7 +90,7 @@ def test_cli_image_generate_and_edit_forward_thinking_effort(tmp_path, monkeypat
         return {"data": [{"url": "https://example.test/image.png"}]}
 
     monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
-    assert cli.main(argv) == 0
+    assert cli.legacy_main(argv) == 0
     capsys.readouterr()
     assert calls
     assert calls[0][0] == "POST"
@@ -113,7 +113,7 @@ def test_counted_image_session_retry_preserves_thinking_effort(tmp_path, monkeyp
         return {"data": [{"url": "https://example.test/retry.png"}]}
 
     monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
-    assert cli.main(
+    assert cli.legacy_main(
         [
             "worker", "--transport", "http", "image", "--prompt", "cat",
             "--count", "2", "--thinking-effort", "extended", "--brief",
@@ -151,12 +151,12 @@ def test_worker_doctor_live_models_uses_fresh_picker_without_changing_default(mo
         },
     )
 
-    assert cli.main(["worker", "--transport", "direct", "doctor", "--live-models", "--json"]) == 0
+    assert cli.legacy_main(["worker", "--transport", "direct", "doctor", "--live-models", "--json"]) == 0
     live = json.loads(capsys.readouterr().out)["checks"]["models"]
     assert live["source"] == "live_account_picker"
     assert live["data"]["default_model_slug"] == "gpt-6-thinking"
 
-    assert cli.main(["worker", "--transport", "direct", "doctor", "--json"]) == 0
+    assert cli.legacy_main(["worker", "--transport", "direct", "doctor", "--json"]) == 0
     captured = json.loads(capsys.readouterr().out)["checks"]["models"]
     assert captured["source"] == "capture_inference"
 
@@ -168,7 +168,7 @@ def test_worker_doctor_live_models_failure_does_not_fall_back_to_capture(monkeyp
         raise cli.ProviderError("fresh picker unavailable")
 
     monkeypatch.setattr(cli, "_fetch_account_models", fail_fresh_models)
-    assert cli.main(["worker", "--transport", "direct", "doctor", "--live-models", "--json"]) == 1
+    assert cli.legacy_main(["worker", "--transport", "direct", "doctor", "--live-models", "--json"]) == 1
     models = json.loads(capsys.readouterr().out)["checks"]["models"]
     assert models == {
         "ok": False,
@@ -178,5 +178,5 @@ def test_worker_doctor_live_models_failure_does_not_fall_back_to_capture(monkeyp
 
 
 def test_worker_doctor_live_models_is_direct_only(monkeypatch, capsys):
-    assert cli.main(["worker", "--transport", "http", "doctor", "--live-models", "--json"]) == 2
+    assert cli.legacy_main(["worker", "--transport", "http", "doctor", "--live-models", "--json"]) == 2
     assert "requires the direct worker transport" in capsys.readouterr().err

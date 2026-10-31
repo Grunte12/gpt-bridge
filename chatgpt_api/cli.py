@@ -92,6 +92,11 @@ from chatgpt_api.providers.chatgpt.transport import ChatGPTEndpoints, ChatGPTWeb
 
 
 def main(argv: list[str] | None = None) -> int:
+    from chatgpt_api.extension_cli import main as extension_main
+    return extension_main(argv)
+
+
+def legacy_main(argv: list[str] | None = None) -> int:
     register_builtin_providers()
     if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
         argv = ["menu"]

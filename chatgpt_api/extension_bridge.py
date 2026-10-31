@@ -313,10 +313,11 @@ class ExtensionQueue:
         with self.finished:
             self.finished.notify_all()
 
-    def pair(self, client_id: str, account: str, visible_model: str = "", input_protocol: int = 0,
-             tab_id: int | None = None, retry_timeout_cleanup: bool = False) -> dict:
-        if account != self.account or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
-            raise ValueError("account or client identity mismatch")
+    def pair(self, client_id: str, account: str | None = None, visible_model: str = "", input_protocol: int = 0,
+             tab_id: int | None = None, retry_timeout_cleanup: bool = False, automatic: bool = False) -> dict:
+        # Old clients sent a local queue namespace, never a verified ChatGPT identity.
+        if (account is not None and account != self.account) or not isinstance(client_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", client_id):
+            raise ValueError("legacy namespace or client identity mismatch")
         if not isinstance(visible_model, str) or len(visible_model) > 100:
             raise ValueError("invalid visible model label")
         if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
@@ -325,7 +326,13 @@ class ExtensionQueue:
             raise ValueError("invalid paired tab identity")
         if type(retry_timeout_cleanup) is not bool:
             raise ValueError("retry_timeout_cleanup must be a boolean")
+        if type(automatic) is not bool:
+            raise ValueError("automatic must be a boolean")
         with self.lock:
+            if automatic and self.client and self.client["client_id"] != client_id:
+                raise ValueError("another Chrome profile owns this worker; keep its pairing or explicitly reconnect")
+            if automatic and (self.halted_job or any(job_occupies_tab(job) for job in self.jobs.values())):
+                raise ValueError("existing work requires its original paired tab; automatic pairing refused")
             open_jobs = [job for job in self.jobs.values() if job_occupies_tab(job)]
             # A queued replacement could run after cleanup; keep it outside recovery.
             if len(open_jobs) > 1:
@@ -384,13 +391,13 @@ class ExtensionQueue:
                     self._save(replacements[0])
             self.client = {"client_id": client_id, "seen": time.monotonic(), "visible_model": visible_model,
                            "tab_ready": True, "input_protocol": input_protocol, "tab_id": tab_id}
-            result = {"paired": True, "account": self.account, "identity": "owner-confirmed, not independently verified"}
+            result = {"paired": True, "account_source": "chrome_login", "identity": "uses the login in the paired Chrome tab"}
             if cleanup_job is not None:
                 result.update(cleanup_pending=True, timeout_cleanup_job={key: cleanup_job[key] for key in
                     ("job_id", "prompt", "expected_model", "mode", "chat_path") if key in cleanup_job})
             return result
 
-    def heartbeat(self, client_id: str, account: str, visible_model: str = "Create image",
+    def heartbeat(self, client_id: str, account: str | None = None, visible_model: str = "Create image",
                   tab_ready: bool = False, input_protocol: int = 0,
                   tab_idle: bool | None = None, tab_error: str = "",
                   worker_version: str = "", content_receiver: str = "unreported",
@@ -398,8 +405,8 @@ class ExtensionQueue:
                   prompt_dom: dict | None = None, tab_recovery: str = "none", chatgpt_tabs: int = 0,
                   tab_id: int | None = None) -> dict:
         """Reconnect the already-authorized local extension, never replay old work."""
-        if account != self.account or type(tab_ready) is not bool:
-            raise ValueError("account or readiness mismatch")
+        if (account is not None and account != self.account) or type(tab_ready) is not bool:
+            raise ValueError("legacy namespace or readiness mismatch")
         if not isinstance(visible_model, str) or visible_model != "Create image":
             raise ValueError("native Create image mode is required")
         if type(input_protocol) is not int or input_protocol not in {0, 1, 2, 3, 4}:
@@ -522,11 +529,11 @@ class ExtensionQueue:
         recovery = self.client.get("tab_recovery", "none")
         receiver = self.client.get("content_receiver", "unreported")
         if (self.client.get("tab_error") or "").startswith("Owner action required"):
-            return "verify_second_tab"
+            return "verify_paired_tab"
         if recovery == "unmatched" or receiver == "wrong_origin" or (receiver == "tab_missing" and tabs > 0):
-            return "confirm_second_tab"
+            return "confirm_paired_tab"
         if receiver == "tab_missing":
-            return "open_second_tab"
+            return "open_chatgpt_tab"
         if receiver == "unavailable" and self.client.get("receiver_error") == "no_receiver":
             return "refresh_paired_tab_once"
         if any(job_occupies_tab(job) for job in self.jobs.values()):
@@ -975,9 +982,9 @@ class ExtensionQueue:
     def status(self, job_id: str = "") -> dict:
         with self.lock:
             if not job_id:
-                return {"account": self.account, "paired": bool(self.client),
+                return {"account_source": "chrome_login", "paired": bool(self.client),
                         "cleanup_policy": "automatic_saved_chats" if self.auto_delete_saved_chats else "per_job_confirmation",
-                        "account_binding": "owner-confirmed, not independently verified",
+                        "account_binding": "uses the login in the paired Chrome tab",
                         "browser_binding": {"paired_tab": bool(self.client and self.client.get("tab_id") is not None),
                                             "exact_job_tab_required": True, "exact_result_chat_required": True},
                         "transport": "extension-native-ui",
@@ -999,6 +1006,11 @@ class ExtensionQueue:
                         "installed_extension_version": repo_extension_version(),
                         "line_halted": self.halted_job,
                         "queue_depth": sum(1 for j in self.jobs.values() if job_occupies_tab(j)),
+                        "scheduler": {"policy": "fifo", "worker_tabs": 1,
+                                      "capacity": MAX_WAITING_JOBS,
+                                      "waiting": sum(j.get("state") == "queued" for j in self.jobs.values()),
+                                      "in_flight_or_cleanup": sum(job_holds_tab(j) for j in self.jobs.values()),
+                                      "rate_limit_policy": "not_configured"},
                         "extension_diagnostics": {
                             "worker_version": (self.client.get("worker_version") or None) if self.client else None,
                             "content_receiver": self.client.get("content_receiver", "unreported") if self.client else "unreported",
@@ -1232,9 +1244,9 @@ def make_handler(queue: ExtensionQueue, token: str, port: int):
                 if not isinstance(data, dict):
                     raise ValueError("request must be an object")
                 if self.path == "/pair":
-                    result = queue.pair(data["client_id"], data["account"], data.get("visible_model", ""),
+                    result = queue.pair(data["client_id"], data.get("account"), data.get("visible_model", ""),
                                         data.get("input_protocol", 0), data.get("tab_id"),
-                                        data.get("retry_timeout_cleanup", False))
+                                        data.get("retry_timeout_cleanup", False), data.get("automatic", False))
                 elif self.path == "/heartbeat":
                     result = queue.heartbeat(**data)
                 elif self.path == "/phase":
@@ -1311,11 +1323,12 @@ def compact_status(raw: dict) -> dict:
         if raw.get("cleanup_confirmation"):
             receipt["cleanup_confirmation"] = raw.get("cleanup_confirmation")
         return receipt
-    brief = {"account": raw.get("account"), "paired": raw.get("paired"),
+    brief = {"account_source": "chrome_login", "paired": raw.get("paired"),
+             "running_extension_version": (raw.get("extension_diagnostics") or {}).get("worker_version"),
              "extension_online": raw.get("extension_online"), "next_action": raw.get("next_action"),
              "transport": raw.get("transport"), "browser_binding": raw.get("browser_binding"),
              "preflight_available": (raw.get("input_capabilities") or {}).get("preflight_only"),
-             **{key: raw[key] for key in ("queue_depth", "line_halted", "installed_extension_version") if raw.get(key) is not None}}
+             **{key: raw[key] for key in ("queue_depth", "line_halted", "installed_extension_version", "scheduler") if raw.get(key) is not None}}
     jobs = raw.get("jobs") if isinstance(raw.get("jobs"), list) else []
     open_job = next((job for job in jobs if isinstance(job, dict) and job_occupies_tab(job)), None)
     if open_job:
@@ -1326,11 +1339,11 @@ def compact_status(raw: dict) -> dict:
 
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
-    server = FastMCP("gpt-bridge", instructions="Use one persistent paired browser owner. Call status, optionally preflight uploads, then generate or edit exactly once. Use job or wait for durable phase receipts. A proven adaptive timeout may create one replacement only after the exact stalled chat is deleted.")
+    server = FastMCP("gpt-bridge", instructions="Use one persistent paired browser owner shared by all callers. Requests queue FIFO; never re-submit because another agent is running or the queue is full. Track your own job_id with job or wait, not the global status job_id. Call status, optionally preflight uploads, then generate or edit exactly once. Use job or wait for durable phase receipts. A proven adaptive timeout may create one replacement only after the exact stalled chat is deleted.")
 
     @server.tool()
     def status(job_id: str = "") -> dict:
-        """Paired tab, or one job. Returns account, paired, extension_online, next_action. With job_id, returns state and image_path."""
+        """Paired Chrome tab, or one job. Uses its current ChatGPT login; no account selection. Returns paired, extension_online, next_action. With job_id, returns state and image_path."""
         return compact_status(queue.status(job_id))
 
     @server.tool()
@@ -1390,11 +1403,17 @@ def read_token(root: Path) -> str:
     return token
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Opt-in GPT Bridge extension MCP (no browser-control tools)")
-    parser.add_argument("--account", required=True, choices=["second"],
-                        help="Experimental runtime is restricted to the owner's second account")
-    parser.add_argument("--data-dir", type=Path, default=Path.home() / ".local/share/gpt-bridge/extension/second")
+def default_data_dir() -> Path:
+    base = Path.home() / ".local/share/gpt-bridge/extension"
+    # Preserve the existing queue and pairing secret; the old folder name is not an account selector.
+    legacy = base / "second"
+    return legacy if legacy.exists() else base / "chrome"
+
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="GPT Bridge extension MCP — uses the ChatGPT login in your paired Chrome tab")
+    parser.add_argument("--account", choices=["second"], help=argparse.SUPPRESS)  # Legacy storage namespace, not a login selector.
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     lifecycle = parser.add_mutually_exclusive_group()
     lifecycle.add_argument("--connect", action="store_true",
                            help="Share an already running local extension worker; do not create another queue or listener")
@@ -1402,7 +1421,7 @@ def main():
                            help="Run only the loopback worker, independent of MCP stdio; agent hosts use --connect")
     parser.add_argument("--auto-delete-saved-chats", action="store_true",
                         help="Owner opt-in: permanently delete only new Bridge-created image chats after validated local save, without per-image prompts")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.connect and args.auto_delete_saved_chats:
         parser.error("automatic cleanup is an owner-worker policy; set it on the owning command, not --connect")
     if args.data_dir.is_symlink():
@@ -1422,7 +1441,8 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.error("another extension MCP owns this data directory")
-    queue = ExtensionQueue(root, args.account, auto_delete_saved_chats=args.auto_delete_saved_chats)
+    namespace = args.account or ("second" if root.name == "second" else "chrome")
+    queue = ExtensionQueue(root, namespace, auto_delete_saved_chats=args.auto_delete_saved_chats)
     token_path = queue.root / "extension-token"
     if not token_path.exists():
         descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

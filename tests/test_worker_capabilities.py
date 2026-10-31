@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from chatgpt_api.cli import main
+from chatgpt_api.cli import legacy_main as main
 from chatgpt_api.worker.capabilities import capability_reference_paths, search_capabilities
 
 

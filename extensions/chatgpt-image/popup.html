@@ -58,7 +58,7 @@
   </style>
 </head>
 <body data-state="checking">
-  <header><h1>GPT Bridge</h1><span id="identity" hidden>บัญชี second</span></header>
+  <header><h1>GPT Bridge</h1><span id="identity" hidden>ใช้บัญชีใน Chrome</span></header>
   <p id="version">เวอร์ชันที่กำลังรัน: <span id="version-value">ไม่ทราบ</span></p>
   <section id="connection" role="status" aria-live="polite" aria-atomic="true">
     <h2 id="connection-title">กำลังตรวจการเชื่อมต่อ</h2>
@@ -75,11 +75,11 @@
     </details>
   </section>
   <form id="pair-form" hidden>
-    <p>เปิด ChatGPT บัญชี second แล้วเลือกแท็บนี้ ส่วนขยายจะเตรียมแชตใหม่และเลือก <strong>Create image</strong> ให้เอง</p>
+    <p>เปิด ChatGPT ที่ล็อกอินไว้ แล้วเลือกแท็บที่ต้องการใช้ ส่วนขยายจะเตรียมแชตใหม่และเลือก <strong>Create image</strong> ให้เอง</p>
     <label id="token-row">รหัสจับคู่ในเครื่อง
       <input id="token" type="password" autocomplete="off" placeholder="ใช้เฉพาะการเชื่อมครั้งแรก">
     </label>
-    <label class="confirm"><input id="confirm-account" type="checkbox" required><span>แท็บนี้เป็นบัญชี second ไม่ใช่ main</span></label>
+    <label class="confirm"><input id="confirm-account" type="checkbox" required><span>ใช้บัญชี ChatGPT ที่ล็อกอินอยู่ในแท็บนี้</span></label>
     <button id="pair" type="submit">เชื่อมแท็บนี้</button>
     <p class="hint" id="pair-hint">รหัสนี้ไม่ใช่รหัสผ่านหรือโทเคน ChatGPT บัญชีที่ใช้ต้องตรวจด้วยตัวคุณเอง</p>
   </form>

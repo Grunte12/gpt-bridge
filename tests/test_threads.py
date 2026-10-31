@@ -3,7 +3,7 @@ import json
 import pytest
 
 import chatgpt_api.cli as cli
-from chatgpt_api.cli import main
+from chatgpt_api.cli import legacy_main as main
 from chatgpt_api.threads import ThreadState, load_thread, lock_thread, save_thread
 
 

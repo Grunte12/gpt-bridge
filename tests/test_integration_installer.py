@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from chatgpt_api.cli import main as cli_main
+from chatgpt_api.cli import legacy_main as cli_main
 from chatgpt_api.integration_installer import (
     install_claude,
     install_codex,
@@ -32,7 +32,7 @@ def test_codex_installer_copies_skill_without_marketplace(tmp_path):
     destination = tmp_path / ".codex" / "skills" / "gpt-bridge-worker" / "SKILL.md"
     assert result.ok is True
     assert destination.is_file()
-    assert "worker tools --query" in destination.read_text(encoding="utf-8")
+    assert "gpt-bridge mcp" in destination.read_text(encoding="utf-8")
     assert result.commands == []
 
 
@@ -42,7 +42,7 @@ def test_claude_installer_copies_project_skill_without_marketplace(tmp_path):
     destination = tmp_path / ".claude" / "skills" / "gpt-bridge-worker" / "SKILL.md"
     assert result.ok is True
     assert destination.is_file()
-    assert "worker tools --query" in destination.read_text(encoding="utf-8")
+    assert "gpt-bridge mcp" in destination.read_text(encoding="utf-8")
     assert result.commands == []
 
 

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 import chatgpt_api.cli as cli
-from chatgpt_api.cli import main
+from chatgpt_api.cli import legacy_main as main  # Archived implementation tests; not the public CLI.
 from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.types import ChatDelta, ImageAsset, ImageResponse
 from chatgpt_api.providers.chatgpt.crypto import (

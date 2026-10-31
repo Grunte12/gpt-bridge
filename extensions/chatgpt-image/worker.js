@@ -85,11 +85,11 @@ function scheduleSoon() {
 function heartbeatFields(config, fields) {
   const recovery = ["none", "rebound", "unmatched"].includes(fields.tab_recovery) ? fields.tab_recovery : "none";
   const tabs = Number.isInteger(fields.chatgpt_tabs) && fields.chatgpt_tabs >= 0 ? Math.min(fields.chatgpt_tabs, 20) : 0;
-  return {client_id: config.clientId, account: config.account, visible_model: "Create image", tab_id: config.tabId,
+  return {client_id: config.clientId, visible_model: "Create image", tab_id: config.tabId,
     worker_version: workerVersion, ...fields, tab_recovery: recovery, chatgpt_tabs: tabs};
 }
 async function findPairedTab(config) {
-  // Match only the saved client marker. An open ChatGPT tab is not proof of the second account.
+  // Match only the saved client marker, never an arbitrary open ChatGPT tab.
   if (!chrome.tabs.query || !/^[a-f0-9-]{36}$/.test(config.clientId || ""))
     return {count: 0, tabId: null, soleCandidateTabId: null};
   let tabs = [];
@@ -225,7 +225,7 @@ async function connection(state, detail) {
 }
 async function publicStatus() {
   const {config, connection: status, active, lastJob} = await chrome.storage.local.get(["config", "connection", "active", "lastJob"]);
-  return {configured: !!config, account: config?.account, tabId: config?.tabId,
+  return {configured: !!config, account_source: "chrome_login", tabId: config?.tabId,
     connection: status || {state: config ? "checking" : "unpaired"},
     active: active ? {jobId: active.jobId} : null, lastJob: publicJob(lastJob)};
 }
@@ -265,9 +265,9 @@ async function poll() {
   try {
     const {config, active, lastJob} = await chrome.storage.local.get(["config", "active", "lastJob"]);
     if (!config) return;
-    if (config.account !== "second" || !Number.isInteger(config.tabId) || typeof config.token !== "string" ||
+    if (!Number.isInteger(config.tabId) || typeof config.token !== "string" ||
         typeof config.clientId !== "string") {
-      await connection("needs_pairing", "การจับคู่เดิมไม่ถูกต้อง กรุณาเชื่อมบัญชี second ใหม่");
+      await connection("needs_pairing", "การจับคู่เดิมไม่ถูกต้อง กรุณาเชื่อมแท็บ ChatGPT ใหม่");
       return;
     }
     const openCleanup = ["pending", "confirmation_required", "timeout_delete_pending", "timeout_delete_failed"]
@@ -281,7 +281,7 @@ async function poll() {
     }
     let ready = {fresh: false}, available = false, tab;
     let contentReceiver = "tab_missing", receiverError = "tab_missing";
-    let tabRecovery = "none", chatgptTabs = 0, soleSingleTabRecovery = false, staleWrongOrigin = false;
+    let tabRecovery = "none", chatgptTabs = 0, staleWrongOrigin = false;
     try {
       tab = await chrome.tabs.get(config.tabId);
     } catch (_) { /* Never forward native exception text, which may include private URLs. */ }
@@ -292,9 +292,8 @@ async function poll() {
     if (!tab) {
       const recovered = await findPairedTab(config);
       chatgptTabs = recovered.count;
-      const candidateTabId = Number.isInteger(recovered.tabId) ? recovered.tabId : recovered.soleCandidateTabId;
-      if (chatgptTabs === 1 && Number.isInteger(candidateTabId) && !localJobOpen) {
-        const markerMatches = candidateTabId === recovered.tabId;
+      const candidateTabId = recovered.tabId;
+      if (Number.isInteger(candidateTabId) && !localJobOpen) {
         const tabId = candidateTabId;
         let candidate;
         try { candidate = await chrome.tabs.get(tabId); } catch (_) { candidate = null; }
@@ -304,14 +303,10 @@ async function poll() {
           const reboundConfig = {...config, tabId};
           await request(reboundConfig, "/heartbeat", heartbeatFields(reboundConfig, {tab_ready: false,
             content_receiver: "unreported", receiver_error: "", tab_recovery: "none", chatgpt_tabs: chatgptTabs}));
-          if (!markerMatches) {
-            try { await chrome.tabs.sendMessage(tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
-          }
           config.tabId = tabId;
           await chrome.storage.local.set({config});
           tab = candidate;
           tabRecovery = "rebound";
-          soleSingleTabRecovery = !markerMatches;
         } else tabRecovery = "unmatched";
       } else if (chatgptTabs === 0 && !localJobOpen) {
         const opened = await openRecoveryTab(config);
@@ -372,11 +367,6 @@ async function poll() {
           break;
         }
       }
-    }
-    if (soleSingleTabRecovery && available && (ready.fresh !== true || ready.model !== "Create image")) {
-      try { ready = await chrome.tabs.sendMessage(config.tabId,
-        {type: "image-prepare", job: {expected_model: "Create image"}}); }
-      catch (_) { ready = {error: "Fresh composer preparation was unavailable"}; }
     }
     const beat = await request(config, "/heartbeat", heartbeatFields(config, {
       tab_ready: ready.fresh === true && ready.model === "Create image",
@@ -487,15 +477,8 @@ async function poll() {
         : receiverError === "no_receiver"
         ? "รีเฟรชแท็บ ChatGPT ที่เชื่อมไว้ครั้งเดียว ตัวรับจะกลับมาเอง ไม่ต้องกรอกรหัสใหม่"
         : tabRecovery === "unmatched"
-        ? "มีแท็บ ChatGPT เปิดอยู่ แต่ยังไม่ใช่แท็บที่จับคู่ เปิดแท็บ second แล้วยืนยันด้านล่าง ใช้รหัสเดิม"
-        : "ยังไม่มีแท็บ ChatGPT ส่วนขยายจะเปิดให้หนึ่งแท็บเมื่อไม่มีแท็บอื่น ถ้ามีหลายแท็บให้ยืนยันบัญชี second");
-      return;
-    }
-    if (soleSingleTabRecovery) {
-      const readyForImages = ready?.fresh === true && ready.model === "Create image";
-      await connection(readyForImages ? "ready" : "needs_tab", readyForImages
-        ? "Paired ChatGPT tab recovered after restart; Create image is ready. No image was sent."
-        : String(ready?.error || "Recovered ChatGPT tab needs owner review; no image was sent."));
+        ? "มีแท็บ ChatGPT เปิดอยู่ แต่ยังไม่ใช่แท็บที่จับคู่ เปิดแท็บที่ต้องการแล้วยืนยันด้านล่าง ใช้รหัสเดิม"
+        : "ยังไม่มีแท็บ ChatGPT ส่วนขยายจะเปิดให้หนึ่งแท็บเมื่อไม่มีแท็บอื่น ถ้ามีหลายแท็บให้เลือกแท็บที่ต้องการใช้");
       return;
     }
     await connection("ready", "พร้อมรับคำสั่งภาพใหม่ ส่วนขยายจะเตรียมแชตและเลือก Create image ให้เอง");
@@ -539,21 +522,141 @@ async function poll() {
       await connection("failed", "แท็บไม่รับงาน ตรวจ ChatGPT ก่อนสั่งใหม่ ไม่มีการส่งซ้ำ");
     }
   } catch (error) {
+    if (error.status === 401 && typeof chrome.runtime.sendNativeMessage === "function") {
+      try {
+        const {config} = await chrome.storage.local.get("config");
+        const local = await chrome.runtime.sendNativeMessage("org.gpt_bridge.pairing", {action: "pair"});
+        if (config && typeof local?.token === "string" && local.token.length >= 32 && local.token !== config.token) {
+          await chrome.storage.local.set({config: {...config, token: local.token}});
+          await connection("offline", "อัปเดตการเชื่อมต่อในเครื่องแล้ว กำลังเชื่อมกลับโดยรักษางานเดิม");
+          scheduleSoon();
+          return;
+        }
+      } catch (_) { /* Preserve the original client/tab/job; never re-pair uncertain work. */ }
+    }
     await connection(error.status === 401 ? "needs_pairing" : "offline", error.status === 401
       ? "รหัสในเครื่องเปลี่ยน ต้องจับคู่ใหม่หนึ่งครั้ง"
       : `รอ MCP กลับมา ส่วนขยายจะเชื่อมให้อัตโนมัติ ไม่ต้องกรอกรหัสซ้ำ (${requestFailure(error)})`);
   } finally { polling = false; }
 }
+async function pairTab(message) {
+      if (message.confirmedTab !== true && message.confirmedAccount !== true)
+        throw new Error("กรุณายืนยันให้ใช้บัญชีที่ล็อกอินในแท็บนี้ก่อนเชื่อม");
+      if (message.retryTimeoutCleanup !== undefined && typeof message.retryTimeoutCleanup !== "boolean")
+        throw new Error("Invalid timeout cleanup retry confirmation");
+      if (!Number.isInteger(message.tabId))
+        throw new Error("เปิดแท็บ ChatGPT ที่ต้องการใช้งานก่อน");
+      const tab = await chrome.tabs.get(message.tabId);
+      if (new URL(tab.url || "about:blank").origin !== "https://chatgpt.com")
+        throw new Error("เปิดแท็บ ChatGPT ที่ต้องการใช้งานก่อน");
+      const {active, config: saved} = await chrome.storage.local.get(["active", "config"]);
+      let token = message.token?.trim() || (message.refreshPairing === true ? "" : saved?.token) || "";
+      if (!token) {
+        try {
+          const local = await chrome.runtime.sendNativeMessage("org.gpt_bridge.pairing", {action: "pair"});
+          token = local?.token;
+        } catch (_) {
+          throw new Error("ให้ Agent ติดตั้งตัวเชื่อม GPT Bridge ด้วย install-native แล้วลองเชื่อมอีกครั้ง ไม่ต้องคัดลอกรหัส");
+        }
+      }
+      if (typeof token !== "string" || token.length < 32) throw new Error("รหัสจับคู่ไม่ถูกต้อง");
+      if (active) throw new Error("มีงานค้างอยู่ ตรวจ MCP และ ChatGPT ก่อนเชื่อมใหม่");
+      let inspected;
+      try { inspected = await chrome.tabs.sendMessage(message.tabId, {type: "image-inspect"}); }
+      catch (_) { throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่"); }
+      if (!inspected || typeof inspected !== "object")
+        throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่");
+      const config = {token, tabId: message.tabId,
+        clientId: typeof saved?.clientId === "string" ? saved.clientId : crypto.randomUUID()};
+      const pairPayload = {client_id: config.clientId,
+        visible_model: typeof inspected.model === "string" && inspected.model.length <= 100 ? inspected.model : "Create image",
+        input_protocol: [1, 2, 3, 4].includes(inspected.input_protocol) ? inspected.input_protocol : 0,
+        tab_id: config.tabId};
+      if (message.automatic === true) pairPayload.automatic = true;
+      if (message.retryTimeoutCleanup === true) pairPayload.retry_timeout_cleanup = true;
+      const paired = await request(config, "/pair", pairPayload);
+      if (paired?.cleanup_pending === true) {
+        const job = paired.timeout_cleanup_job;
+        if (!job || !/^[a-f0-9]{32}$/.test(job.job_id || "") || typeof job.prompt !== "string" || !job.prompt.trim() ||
+            job.expected_model !== "Create image" || job.mode !== "create" ||
+            !/^\/c\/[a-f0-9-]{36}$/.test(job.chat_path || ""))
+          throw new Error("A previous timed-out image chat cannot be safely identified. Inspect MCP status; no new image was sent.");
+        const timeoutCleanupJob = {job_id: job.job_id, prompt: job.prompt, expected_model: job.expected_model,
+          mode: job.mode, chat_path: job.chat_path};
+        await chrome.storage.local.set({config, lastJob: {job_id: job.job_id, state: "failed",
+          cleanup_status: "timeout_delete_pending", timeout_cleanup_job: timeoutCleanupJob}});
+        try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
+        await connection("busy", "A previous timed-out chat needs exact cleanup. No new image will be sent.");
+        await chrome.alarms.create("poll", {periodInMinutes: 0.5});
+        return {ok: true};
+      }
+      await chrome.storage.local.set({config, autoConnectDisabled: false});
+      try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
+      let prepared;
+      try { prepared = await chrome.tabs.sendMessage(config.tabId,
+        {type: "image-prepare", job: {expected_model: "Create image"}}); }
+      catch (_) { prepared = {error: "Refresh the selected ChatGPT tab to load image preparation support"}; }
+      await connection(prepared?.fresh === true && prepared.model === "Create image" ? "ready" : "needs_tab",
+        prepared?.fresh === true && prepared.model === "Create image"
+          ? "เตรียมแชตใหม่และเลือก Create image แล้ว รอคำสั่งสร้างภาพจากเอเจนต์ได้เลย"
+          : String(prepared?.error || "เตรียมแชต Create image ไม่สำเร็จ รักษาดราฟต์และงานเดิมไว้ แล้วตรวจแท็บ ChatGPT"));
+      await chrome.alarms.create("poll", {periodInMinutes: 0.5});
+      return {ok: true};
+}
+
+async function autoConnect() {
+  if (polling || managing || typeof chrome.runtime.sendNativeMessage !== "function") return;
+  managing = true;
+  try {
+    const saved = await chrome.storage.local.get(["config", "active", "autoTabId", "autoConnectDisabled"]);
+    if (saved.config || saved.active || saved.autoConnectDisabled) return;
+    const local = await chrome.runtime.sendNativeMessage("org.gpt_bridge.pairing", {action: "pair"});
+    if (typeof local?.token !== "string" || local.token.length < 32) throw new Error("Local connector unavailable");
+    const state = await request({token: local.token}, "/agent/status", {});
+    if (state.transport !== "extension-native-ui") throw new Error("Unexpected local worker protocol");
+    if (state.paired) {
+      await connection("needs_relink", "Worker เชื่อมกับ Chrome profile อื่นหรือการจับคู่เดิมอยู่แล้ว จะไม่เชื่อมทับอัตโนมัติ");
+      return;
+    }
+    if (state.line_halted || state.queue_depth > 0 || state.jobs?.some(job => !["complete", "failed", "interrupted"].includes(job.state)))
+      {
+        await connection("interrupted", "มีงานเดิมค้างอยู่ รอแท็บเดิมเชื่อมกลับ ไม่เปิดแท็บใหม่หรือส่งงานซ้ำ");
+        return;
+      }
+    let tab;
+    if (Number.isInteger(saved.autoTabId)) {
+      try { tab = await chrome.tabs.get(saved.autoTabId); } catch (_) {}
+      if (tab && new URL(tab.url || "about:blank").origin !== "https://chatgpt.com") tab = null;
+    }
+    if (!tab) {
+      tab = await chrome.tabs.create({url: "https://chatgpt.com/", active: false});
+      await chrome.storage.local.set({autoTabId: tab.id});
+    }
+    if (chrome.scripting?.executeScript) {
+      try { await chrome.scripting.executeScript({target: {tabId: tab.id}, files: ["content.js"]}); } catch (_) {}
+    }
+    await pairTab({tabId: tab.id, token: local.token, confirmedTab: true, automatic: true});
+  } catch (_) {
+    await connection("offline", "กำลังเชื่อมอัตโนมัติ เปิด MCP และล็อกอิน ChatGPT ใน Chrome นี้ ไม่ต้องกรอกรหัส");
+  } finally { managing = false; }
+}
 async function resume() {
   const {config} = await chrome.storage.local.get("config");
-  if (!config) return;
+  if (!config && typeof chrome.runtime.sendNativeMessage !== "function") return;
   await chrome.alarms.create("poll", {periodInMinutes: 0.5});
+  if (!config) await autoConnect();
   await poll();
 }
 chrome.runtime.onStartup?.addListener(() => void resume());
 chrome.runtime.onInstalled?.addListener(() => void resume());
+chrome.tabs.onUpdated?.addListener((tabId, change) => {
+  if (change.status !== "complete") return;
+  void chrome.storage.local.get(["autoTabId", "config"]).then(saved => {
+    if (!saved.config && saved.autoTabId === tabId) void resume();
+  });
+});
 void resume();
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "poll") void poll(); });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "poll") void resume(); });
 chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => (async () => {
   const {config} = await chrome.storage.local.get("config");
   if (!config || config.tabId !== removedTabId || !Number.isInteger(addedTabId) || addedTabId === removedTabId) return;
@@ -573,61 +676,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       return publicStatus();
     }
     if (message.type === "pair" && managementSender) {
-      if (message.account !== "second" || message.confirmedAccount !== true)
-        throw new Error("โหมดทดลองใช้เฉพาะบัญชี second กรุณายืนยันบัญชีก่อนเชื่อม");
-      if (message.retryTimeoutCleanup !== undefined && typeof message.retryTimeoutCleanup !== "boolean")
-        throw new Error("Invalid timeout cleanup retry confirmation");
-      if (!Number.isInteger(message.tabId))
-        throw new Error("เปิดแท็บ ChatGPT ที่ต้องการใช้งานก่อน");
-      const tab = await chrome.tabs.get(message.tabId);
-      if (new URL(tab.url || "about:blank").origin !== "https://chatgpt.com")
-        throw new Error("เปิดแท็บ ChatGPT ที่ต้องการใช้งานก่อน");
-      const {active, config: saved} = await chrome.storage.local.get(["active", "config"]);
-      const token = message.token?.trim() || (saved?.account === "second" ? saved.token : "");
-      if (typeof token !== "string" || token.length < 32) throw new Error("รหัสจับคู่ไม่ถูกต้อง");
-      if (active) throw new Error("มีงานค้างอยู่ ตรวจ MCP และ ChatGPT ก่อนเชื่อมใหม่");
-      let inspected;
-      try { inspected = await chrome.tabs.sendMessage(message.tabId, {type: "image-inspect"}); }
-      catch (_) { throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่"); }
-      if (!inspected || typeof inspected !== "object")
-        throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่");
-      const config = {token, tabId: message.tabId,
-        clientId: saved?.account === "second" && typeof saved.clientId === "string" ? saved.clientId : crypto.randomUUID(), account: "second"};
-      const pairPayload = {client_id: config.clientId, account: config.account,
-        visible_model: typeof inspected.model === "string" && inspected.model.length <= 100 ? inspected.model : "Create image",
-        input_protocol: [1, 2, 3, 4].includes(inspected.input_protocol) ? inspected.input_protocol : 0,
-        tab_id: config.tabId};
-      if (message.retryTimeoutCleanup === true) pairPayload.retry_timeout_cleanup = true;
-      const paired = await request(config, "/pair", pairPayload);
-      if (paired?.cleanup_pending === true) {
-        const job = paired.timeout_cleanup_job;
-        if (!job || !/^[a-f0-9]{32}$/.test(job.job_id || "") || typeof job.prompt !== "string" || !job.prompt.trim() ||
-            job.expected_model !== "Create image" || job.mode !== "create" ||
-            !/^\/c\/[a-f0-9-]{36}$/.test(job.chat_path || ""))
-          throw new Error("A previous timed-out image chat cannot be safely identified. Inspect MCP status; no new image was sent.");
-        const timeoutCleanupJob = {job_id: job.job_id, prompt: job.prompt, expected_model: job.expected_model,
-          mode: job.mode, chat_path: job.chat_path};
-        await chrome.storage.local.set({config, lastJob: {job_id: job.job_id, state: "failed",
-          cleanup_status: "timeout_delete_pending", timeout_cleanup_job: timeoutCleanupJob}});
-        try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
-        resumePolling = true;
-        await connection("busy", "A previous timed-out chat needs exact cleanup. No new image will be sent.");
-        await chrome.alarms.create("poll", {periodInMinutes: 0.5});
-        return {ok: true};
-      }
-      await chrome.storage.local.set({config});
-      try { await chrome.tabs.sendMessage(config.tabId, {type: "image-bind", clientId: config.clientId}); } catch (_) {}
-      let prepared;
-      try { prepared = await chrome.tabs.sendMessage(config.tabId,
-        {type: "image-prepare", job: {expected_model: "Create image"}}); }
-      catch (_) { prepared = {error: "Refresh the selected ChatGPT tab to load image preparation support"}; }
+      const result = await pairTab(message);
       resumePolling = true;
-      await connection(prepared?.fresh === true && prepared.model === "Create image" ? "ready" : "needs_tab",
-        prepared?.fresh === true && prepared.model === "Create image"
-          ? "เตรียมแชตใหม่และเลือก Create image แล้ว รอคำสั่งสร้างภาพจากเอเจนต์ได้เลย"
-          : String(prepared?.error || "เตรียมแชต Create image ไม่สำเร็จ รักษาดราฟต์และงานเดิมไว้ แล้วตรวจแท็บ ChatGPT"));
-      await chrome.alarms.create("poll", {periodInMinutes: 0.5});
-      return {ok: true};
+      return result;
     }
     if (message.type === "disconnect" && managementSender) {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);
@@ -637,6 +688,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         if (!["complete", "failed", "interrupted"].includes(state.state))
           throw new Error("งานยังไม่จบ ตรวจ ChatGPT และสถานะ MCP ก่อน รักษาการเชื่อมต่อไว้เพื่อรับผล");
       }
+      await chrome.storage.local.set({autoConnectDisabled: true});
       await chrome.storage.local.remove(["config", "active", "connection", "lastJob"]);
       await chrome.alarms.clear("poll");
       return {ok: true};

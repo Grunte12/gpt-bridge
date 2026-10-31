@@ -150,8 +150,8 @@ test('needs relink shows one saved-key confirmation and does not ask for a new p
 
   assert.equal(h.elements['version-value'].textContent, '0.1.14');
   assert.equal(h.elements.identity.hidden, false);
-  assert.equal(h.elements['connection-title'].textContent, 'ยืนยันแท็บ second');
-  assert.equal(h.elements['next-action'].textContent, 'ยืนยันว่าแท็บที่เปิดอยู่เป็นบัญชี second แล้วกดเชื่อมด้วยรหัสเดิม');
+  assert.equal(h.elements['connection-title'].textContent, 'ยืนยันแท็บ ChatGPT');
+  assert.equal(h.elements['next-action'].textContent, 'ยืนยันให้ใช้บัญชีที่ล็อกอินในแท็บนี้ แล้วกดเชื่อมด้วยรหัสเดิม');
   assert.equal(h.elements['pair-form'].hidden, false);
   assert.equal(h.elements['token-row'].hidden, true);
   assert.equal(h.elements.token.required, false);
@@ -189,20 +189,20 @@ test('connected, offline, and busy states never expose saved key entry', async t
   });
 });
 
-test('first-time setup and rotated-key state show a required token only when needed', async t => {
+test('first-time setup and rotated-key state never require manual token entry', async t => {
   const first = harness({configured: false, connection: {state: 'unpaired'}, active: null, lastJob: null});
   await settle();
-  assert.equal(first.elements['pair-form'].hidden, false);
-  assert.equal(first.elements['token-row'].hidden, false);
-  assert.equal(first.elements.token.required, true);
+  assert.equal(first.elements['pair-form'].hidden, true);
+  assert.equal(first.elements['token-row'].hidden, true);
+  assert.equal(first.elements.token.required, false);
   assert.equal(first.elements['confirm-account'].required, true);
 
   const rotated = harness({configured: true, account: 'second', tabId: 7,
     connection: {state: 'needs_pairing'}, active: null, lastJob: null});
   await settle();
   assert.equal(rotated.elements['pair-form'].hidden, false);
-  assert.equal(rotated.elements['token-row'].hidden, false);
-  assert.equal(rotated.elements.token.required, true);
+  assert.equal(rotated.elements['token-row'].hidden, true);
+  assert.equal(rotated.elements.token.required, false);
 });
 
 test('storage changes request cached get-status without starting a refresh poll', async () => {
@@ -236,8 +236,8 @@ test('relink reveals confirmation but reuses stored key without showing the toke
 
   const pairMessage = h.messages.find(message => message.type === 'pair');
   assert.equal(pairMessage.tabId, 7);
-  assert.equal(pairMessage.account, 'second');
-  assert.equal(pairMessage.confirmedAccount, true);
+  assert.equal(pairMessage.account, undefined);
+  assert.equal(pairMessage.confirmedTab, true);
   assert.equal(pairMessage.token, '');
 });
 
