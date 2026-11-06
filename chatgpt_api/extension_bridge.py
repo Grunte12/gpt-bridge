@@ -1053,6 +1053,10 @@ class ExtensionQueue:
             if job_id not in self.jobs:
                 raise ValueError("unknown job")
             if self.halted_job == job_id:
+                # Plain inspection has no later recovery write. Persist before releasing the queue.
+                if (recover_outputs is False and recovery_chat_path is None and
+                        not clear_preflight_uploads and not clear_failed_uploads and native_upload_names is None):
+                    self._save({**self.jobs[job_id], "inspected": True})
                 self.jobs[job_id]["inspected"] = True
                 self.halted_job = next((j["job_id"] for j in self.jobs.values() if ended_uncertain(j)), None)
             if type(recover_outputs) is not bool:
