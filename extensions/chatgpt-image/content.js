@@ -374,7 +374,8 @@
   async function reportPhase(job, phase, chatPath = "") {
     const receipt = await chrome.runtime.sendMessage({type: "image-phase", jobId: job.job_id, phase,
       ...(chatPath ? {chatPath} : {})});
-    if (receipt?.error) throw new Error("Durable lifecycle receipt failed; inspect ChatGPT and do not retry");
+    if (receipt?.error) throw new Error("Durable lifecycle receipt failed; inspect ChatGPT and do not retry: " +
+      String(receipt.error).slice(0, 240));
   }
   function preparationMatches(target) {
     return target && location.pathname === target.path &&

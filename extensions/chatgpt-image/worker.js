@@ -21,6 +21,7 @@ const imageMetadata = image => Object.fromEntries(
 const jobMetadata = job => ({job_id: job.job_id, prompt: job.prompt, expected_model: job.expected_model,
   mode: job.mode || "create", ...(job.preflight_only === true ? {preflight_only: true} : {}),
   ...(job.preserve_chat === true ? {preserve_chat: true} : {}),
+  ...(job.auto_delete_saved_chat === true ? {auto_delete_saved_chat: true} : {}),
   ...(Number.isInteger(job.generation_timeout_seconds) ? {generation_timeout_seconds: job.generation_timeout_seconds} : {}),
   ...(typeof job.generation_baseline_seconds === "number" ? {generation_baseline_seconds: job.generation_baseline_seconds} : {}),
   ...(Number.isInteger(job.generation_timing_samples) ? {generation_timing_samples: job.generation_timing_samples} : {}),

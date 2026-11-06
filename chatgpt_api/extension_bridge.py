@@ -683,7 +683,7 @@ class ExtensionQueue:
                     if job["phase_capable"]:
                         job["browser_tab_id"] = self.client["tab_id"]  # Bind when the job actually starts, not when it queued.
                     self._save(job)  # Persist BEFORE delivery. Never repeat on uncertain response.
-                    claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed", "collect_only", "preserve_chat", "recovery_chat_path", "generation_timeout_seconds", "generation_baseline_seconds", "generation_timing_samples", "retry_count", "replaces_job_id") if k in job}
+                    claimed = {k: job[k] for k in ("job_id", "prompt", "expected_model", "mode", "preflight_only", "clear_preflight_uploads", "preflight_cleanup_only", "preflight_cleanup_resumed", "collect_only", "preserve_chat", "recovery_chat_path", "generation_timeout_seconds", "generation_baseline_seconds", "generation_timing_samples", "retry_count", "replaces_job_id", "auto_delete_saved_chat") if k in job}
                     if job.get("collect_only"):
                         if job.get("output_binding_revision") == 2:
                             claimed["output_binding_revision"] = 2
