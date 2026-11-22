@@ -7,6 +7,9 @@ let finishing = false;
 let receiverRecoveryTab = null;
 let soonTimer = null;
 let recoveryTabId = null;
+// Bound failed discovery recovery across polls, including tabs that keep losing receivers.
+const identityRecoveryTabs = new Set();
+const isNoReceiver = error => /receiving end does not exist|could not establish connection/i.test(String(error?.message || ""));
 const maxInputBytes = 8 * 1024 * 1024; // Bridge messaging budget, not a provider count limit.
 function isManagementSender(sender) {
   if (!sender?.tab) return true;
@@ -78,6 +81,78 @@ function pageHasFinishedOutput(ready) {
     Number.isInteger(dom.assistant_images) && dom.assistant_images >= 1 && dom.assistant_images <= 4 &&
     typeof dom.chat_path === "string" && /^\/c\/[a-f0-9-]{36}$/.test(dom.chat_path);
 }
+const stallRecheckGraceMs = 45000; // Fresh load plus image fetch, before a timeout is believed.
+// Least intrusive first: activate the job tab inside its own window. Chrome focus moves only if the page
+// still reports hidden later (focusJobWindow).
+async function revealJobTab(tabId) {
+  let previousTabId = null;
+  try {
+    const current = await chrome.tabs.get(tabId);
+    if (Number.isInteger(current?.windowId) && chrome.tabs.query) {
+      const shown = await chrome.tabs.query({active: true, windowId: current.windowId});
+      if (Number.isInteger(shown?.[0]?.id) && shown[0].id !== tabId) previousTabId = shown[0].id;
+    }
+  } catch (_) { /* Restoring the user's tab is a courtesy, not a requirement. */ }
+  await chrome.tabs.update(tabId, {active: true});
+  return previousTabId;
+}
+async function focusJobWindow(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (Number.isInteger(tab?.windowId) && chrome.windows?.update) await chrome.windows.update(tab.windowId, {focused: true});
+  } catch (_) { /* The watcher still decides from what the page reports. */ }
+}
+async function restoreUserTab(active) {
+  const previous = active?.stallRecheck?.previousTabId;
+  if (!Number.isInteger(previous) || !chrome.tabs?.update) return;
+  try { await chrome.tabs.update(previous, {active: true}); } catch (_) { /* The user closed it. */ }
+}
+// One fresh, visible load of the exact bound chat. The poll loop then watches it (watchStallRecheck).
+async function startStallRecheck(config, active, chatPath, deadline) {
+  if (active.stallRecheck || !chrome.tabs?.update || !/^\/c\/[a-f0-9-]{36}$/.test(chatPath || "")) return false;
+  try {
+    const previousTabId = await revealJobTab(config.tabId);
+    active.stallRecheck = {at: Date.now(), chatPath, deadline, previousTabId};
+    await chrome.storage.local.set({active});
+    await chrome.tabs.update(config.tabId, {url: "https://chatgpt.com" + chatPath});
+    scheduleSoon();
+    return true;
+  } catch (_) {
+    delete active.stallRecheck;
+    await chrome.storage.local.set({active});
+    return false;
+  }
+}
+function timeoutReason(ready) {
+  const dom = ready?.result_dom;
+  if (ready?.page_hidden === true) return "page_hidden_unverified";
+  if (!dom || dom.chat_path === "") return "";
+  if (dom.busy === true) return "still_generating";
+  return dom.assistant_headings >= 1 && dom.assistant_images === 0 ? "no_image_returned" : "";
+}
+// The generation really timed out: record it, delete the exact stalled chat if that is safe, never block the line.
+async function finishTimeout(config, active, chatPath, reason = "") {
+  let state = await request(config, "/timeout", {client_id: config.clientId, job_id: active.jobId,
+    chat_path: chatPath, ...(reason ? {reason} : {})});
+  let removed = {error: "The page could not be seen; the chat is kept."};
+  if (state.cleanup_status === "timeout_delete_pending") {
+    try {
+      removed = await chrome.tabs.sendMessage(config.tabId, {type: "image-delete-timeout",
+        job: active.job, jobId: active.jobId, chatPath});
+    } catch (_) { removed = {error: "Timed-out chat deletion delivery failed"}; }
+    const outputVisible = typeof removed?.error === "string" && removed.error.startsWith("Generated output is already visible");
+    state = await request(config, "/timeout-cleanup", {client_id: config.clientId, job_id: active.jobId,
+      deleted: removed?.deleted === true, error: removed?.error || "", ...(outputVisible ? {output_visible: true} : {})});
+  }
+  await restoreUserTab(active);
+  await chrome.storage.local.set({lastJob: state});
+  await chrome.storage.local.remove("active");
+  await connection(removed?.deleted === true ? "retrying" : "failed", removed?.deleted === true
+    ? "งานเกินเวลา ลบแชตที่ค้างแล้ว กำลังเริ่มใหม่ในแชตใหม่หนึ่งครั้ง"
+    : "งานเกินเวลา เก็บแชตเดิมไว้ คิวทำงานต่อได้");
+  scheduleSoon();
+  return {ok: removed?.deleted === true, state};
+}
 function scheduleSoon() {
   if (soonTimer) return;
   soonTimer = setTimeout(() => { soonTimer = null; void poll(); }, 3000);
@@ -89,7 +164,7 @@ function heartbeatFields(config, fields) {
   return {client_id: config.clientId, visible_model: "Create image", tab_id: config.tabId,
     worker_version: workerVersion, ...fields, tab_recovery: recovery, chatgpt_tabs: tabs};
 }
-async function findPairedTab(config) {
+async function findPairedTab(config, recoverReceiver = true) {
   // Match only the saved client marker, never an arbitrary open ChatGPT tab.
   if (!chrome.tabs.query || !/^[a-f0-9-]{36}$/.test(config.clientId || ""))
     return {count: 0, tabId: null, soleCandidateTabId: null};
@@ -99,17 +174,33 @@ async function findPairedTab(config) {
   if (!Array.isArray(tabs)) return {count: 0, tabId: null, soleCandidateTabId: null};
   const ids = [];
   for (const candidate of tabs) {
-    if (!candidate || !Number.isInteger(candidate.id) || ids.length >= 20) continue;
+    if (!candidate || !Number.isInteger(candidate.id)) continue;
     let originOk = !candidate.url;
     try { if (candidate.url) originOk = new URL(candidate.url).origin === "https://chatgpt.com"; } catch (_) { originOk = false; }
     if (originOk) ids.push(candidate.id);
+    // Do not claim uniqueness when additional candidates were not inspected.
+    if (ids.length > 20) return {count: 20, tabId: null, soleCandidateTabId: null};
   }
   const matches = [];
   for (const id of ids) {
-    try {
-      const reply = await chrome.tabs.sendMessage(id, {type: "image-identity"});
-      if (reply?.client_id === config.clientId) matches.push(id);
-    } catch (_) { /* No marker: leave the tab unpaired. */ }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const reply = await chrome.tabs.sendMessage(id, {type: "image-identity"});
+        if (reply?.client_id === config.clientId) matches.push(id);
+      } catch (error) {
+        // Unknown discarded tabs stay asleep: their account/marker is not verified.
+        if (attempt === 0 && recoverReceiver && isNoReceiver(error) &&
+            !tabs.find(tab => tab?.id === id)?.discarded && chrome.scripting?.executeScript &&
+            !identityRecoveryTabs.has(id) && identityRecoveryTabs.size < 20) {
+          identityRecoveryTabs.add(id);
+          try {
+            await chrome.scripting.executeScript({target: {tabId: id}, files: ["content.js"]});
+            continue;
+          } catch (_) { /* One attempt per candidate per worker lifetime, even on failure. */ }
+        }
+      }
+      break;
+    }
   }
   return {count: ids.length, tabId: matches.length === 1 ? matches[0] : null,
     soleCandidateTabId: ids.length === 1 && matches.length === 0 ? ids[0] : null};
@@ -118,7 +209,17 @@ async function openRecoveryTab(config) {
   // One tab, only when this profile has none. Never chooses among existing accounts.
   if (!chrome.tabs?.create || !/^[a-f0-9-]{36}$/.test(config.clientId || "")) return null;
   if (recoveryTabId) {
-    try { return await chrome.tabs.get(recoveryTabId); } catch (_) { recoveryTabId = null; }
+    let cached;
+    try { cached = await chrome.tabs.get(recoveryTabId); }
+    catch (_) { /* A closed recovery tab can be recreated. */ }
+    if (cached) {
+      try {
+        if (new URL(cached.url || "about:blank").origin !== "https://chatgpt.com") return null;
+        const identity = await chrome.tabs.sendMessage(cached.id, {type: "image-identity"});
+        return identity?.client_id === config.clientId ? cached : null;
+      } catch (_) { return null; }
+    }
+    recoveryTabId = null;
   }
   const created = await chrome.tabs.create({url: "https://chatgpt.com/", active: false});
   if (!created || !Number.isInteger(created.id)) return null;
@@ -291,7 +392,7 @@ async function poll() {
       catch (_) { tab = null; staleWrongOrigin = true; }
     }
     if (!tab) {
-      const recovered = await findPairedTab(config);
+      const recovered = await findPairedTab(config, !localJobOpen);
       chatgptTabs = recovered.count;
       const candidateTabId = recovered.tabId;
       if (Number.isInteger(candidateTabId) && !localJobOpen) {
@@ -353,7 +454,7 @@ async function poll() {
           } catch (error) {
             contentReceiver = "unavailable";
             const message = String(error?.message || "");
-            receiverError = /receiving end does not exist|could not establish connection/i.test(message) ? "no_receiver"
+            receiverError = isNoReceiver(error) ? "no_receiver"
               : /message port closed|message channel closed/i.test(message) ? "port_closed" : "message_failed";
             // Reattach only our bundled listener; never navigate or change a draft.
             if (attempt === 0 && receiverError === "no_receiver" &&
@@ -432,17 +533,33 @@ async function poll() {
       return;
     }
     if (active) {
-      const state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
+      let state = await request(config, "/state", {client_id: config.clientId, job_id: active.jobId});
       if (finishing) return;
       if (!["complete", "failed", "interrupted"].includes(state.state)) {
         const alreadyRunning = typeof ready.error === "string" && ready.error.startsWith("Content worker already running");
-        if (!alreadyRunning && available && pageHasFinishedOutput(ready) && active.visibleOutputSaved !== true &&
+        const recheck = active.stallRecheck;
+        const finished = !alreadyRunning && available && pageHasFinishedOutput(ready) &&
+          (!recheck || ready.result_dom.chat_path === recheck.chatPath);
+        if (recheck && !finished && !alreadyRunning && active.visibleOutputSaved !== true) {
+          if (ready.page_hidden === true && recheck.focused !== true && Date.now() - recheck.at >= 10000) {
+            recheck.focused = true;
+            await chrome.storage.local.set({active});
+            await focusJobWindow(config.tabId);
+          }
+          // The reloaded page had its fresh look. Past the job deadline, the stall is real.
+          if (Date.now() >= Math.max(recheck.deadline || 0, recheck.at + stallRecheckGraceMs)) {
+            await finishTimeout(config, active, recheck.chatPath, timeoutReason(ready));
+            return;
+          }
+        }
+        if (finished && active.visibleOutputSaved !== true &&
             active.job?.preflight_only !== true && active.job?.collect_only !== true) {
           active.visibleOutputSaved = true;
           await chrome.storage.local.set({active});
           try {
             const accepted = await chrome.tabs.sendMessage(config.tabId, {type: "image-collect",
-              job: {...(active.job || {}), job_id: active.jobId, expected_model: "Create image", visible_output_only: true}});
+              job: {...(active.job || {}), job_id: active.jobId, expected_model: "Create image", visible_output_only: true,
+                ...(recheck ? {stall_recovered: true} : {})}});
             if (!accepted?.accepted) throw new Error(accepted?.error || "Content worker did not accept the finished image");
           } catch (_) {
             active.visibleOutputSaved = false;
@@ -460,9 +577,10 @@ async function poll() {
           removed = await chrome.tabs.sendMessage(config.tabId, {type: "image-delete-timeout",
             job: active.job, jobId: active.jobId, chatPath: state.chat_path});
         } catch (_) { removed = {error: "Timed-out chat deletion delivery failed after restart"}; }
+        const outputVisible = typeof removed?.error === "string" && removed.error.startsWith("Generated output is already visible");
         state = await request(config, "/timeout-cleanup", {client_id: config.clientId, job_id: active.jobId,
-          deleted: removed?.deleted === true, error: removed?.error || ""});
-        if (removed?.deleted === true) scheduleSoon();
+          deleted: removed?.deleted === true, error: removed?.error || "", ...(outputVisible ? {output_visible: true} : {})});
+        scheduleSoon();
       }
       await chrome.storage.local.set({lastJob: state});
       await chrome.storage.local.remove("active");
@@ -564,7 +682,16 @@ async function pairTab(message) {
       if (active) throw new Error("มีงานค้างอยู่ ตรวจ MCP และ ChatGPT ก่อนเชื่อมใหม่");
       let inspected;
       try { inspected = await chrome.tabs.sendMessage(message.tabId, {type: "image-inspect"}); }
-      catch (_) { throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่"); }
+      catch (error) {
+        // A reloaded extension can lose its receiver on an already open tab.
+        if (!/receiving end does not exist|could not establish connection/i.test(String(error?.message || "")) ||
+            !chrome.scripting?.executeScript)
+          throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่");
+        try {
+          await chrome.scripting.executeScript({target: {tabId: message.tabId}, files: ["content.js"]});
+          inspected = await chrome.tabs.sendMessage(message.tabId, {type: "image-inspect"});
+        } catch (_) { throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่"); }
+      }
       if (!inspected || typeof inspected !== "object")
         throw new Error("ยังตรวจแท็บ ChatGPT ที่เลือกไม่ได้ รีเฟรชแท็บนั้นแล้วเชื่อมใหม่");
       const config = {token, tabId: message.tabId,
@@ -661,8 +788,9 @@ chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "poll") void res
 chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => (async () => {
   const {config} = await chrome.storage.local.get("config");
   if (!config || config.tabId !== removedTabId || !Number.isInteger(addedTabId) || addedTabId === removedTabId) return;
-  config.tabId = addedTabId;
-  await chrome.storage.local.set({config});
+  // Replacement is a discovery hint, not proof of the saved client marker.
+  // poll authenticates the unique marker and keeps active/cleanup work on its saved target.
+  scheduleSoon();
 })());
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   void (async () => {
@@ -724,28 +852,19 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         : "บันทึกไฟล์ภาพแล้ว ให้เอเจนต์ขอยืนยันจากคุณก่อนลบแชทผ่าน MCP");
       return {ok: true};
     }
-    if (message.type === "image-timeout") {
+    if (message.type === "image-timeout" || message.type === "image-stall") {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);
       if (!config || !active || sender.tab?.id !== config.tabId || sender.tab.id !== active.tabId ||
           new URL(sender.url).origin !== "https://chatgpt.com" || message.jobId !== active.jobId ||
           message.chatPath !== active.phaseChatPath || active.phase !== "remote_started")
         throw new Error("Adaptive timeout is not from the exact paired job/tab");
-      let state = await request(config, "/timeout", {client_id: config.clientId, job_id: active.jobId,
-        chat_path: message.chatPath});
-      let removed;
-      try {
-        removed = await chrome.tabs.sendMessage(config.tabId, {type: "image-delete-timeout",
-          job: active.job, jobId: active.jobId, chatPath: message.chatPath});
-      } catch (_) { removed = {error: "Timed-out chat deletion delivery failed"}; }
-      state = await request(config, "/timeout-cleanup", {client_id: config.clientId, job_id: active.jobId,
-        deleted: removed?.deleted === true, error: removed?.error || ""});
-      await chrome.storage.local.set({lastJob: state});
-      await chrome.storage.local.remove("active");
-      await connection(removed?.deleted === true ? "retrying" : "failed", removed?.deleted === true
-        ? "งานเกินเวลา ลบแชตที่ค้างแล้ว กำลังเริ่มใหม่ในแชตใหม่หนึ่งครั้ง"
-        : "งานเกินเวลาแต่ยังลบแชตเดิมไม่ได้ หยุดคิวเพื่อให้ตรวจสอบ");
-      if (removed?.deleted === true) scheduleSoon();
-      return {ok: removed?.deleted === true, state};
+      // Before any timeout is believed: reload the exact chat in a visible tab and look again.
+      const early = message.type === "image-stall";
+      const deadline = early && Number.isFinite(message.deadline)
+        ? Math.min(message.deadline, Date.now() + 900000) : Date.now() + stallRecheckGraceMs;
+      if (await startStallRecheck(config, active, message.chatPath, deadline)) return {ok: true, recheck: true};
+      if (early) return {ok: true, recheck: false};
+      return finishTimeout(config, active, message.chatPath);
     }
     if (message.type === "image-phase") {
       const {config, active} = await chrome.storage.local.get(["config", "active"]);
@@ -773,14 +892,13 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       if (!message.error && active.job?.clear_preflight_uploads && message.preflightUploadsCleared !== true)
         throw new Error("Verified preflight upload clearing receipt is required");
       if (message.preflightReady && !active.job?.preflight_only) throw new Error("Generation requires a saved image, not a readiness receipt");
-      // ChatGPT changes chats through SPA navigation; sender.url can retain the
-      // previous document path. The paired content receiver verifies the live
-      // path and original prompt again before it opens Delete confirmation.
       if (message.visibleVariantCount !== undefined &&
           (!Number.isInteger(message.visibleVariantCount) || message.visibleVariantCount < 1 || message.visibleVariantCount > 100))
         throw new Error("Invalid visible generated variant count");
-      const incompleteVariants = message.visibleVariantCount > (message.imagesBase64?.length || 1);
-      const cleanup = !incompleteVariants && !message.error && !active.job?.preserve_chat && !message.imagesBase64 && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
+      const cleanup = active.job?.auto_delete_saved_chat === true && !message.error &&
+        !active.job?.preflight_only && !active.job?.preserve_chat && !message.imagesBase64 &&
+        !(message.visibleVariantCount > 1) && active.phase === "result_captured" &&
+        active.phaseChatPath === message.chatPath && /^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "");
       finishing = true;
       let result;
       try {
@@ -789,9 +907,10 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
             ...(message.preflightUploadsCleared === true ? {preflight_uploads_cleared: true} : {})} : {
               ...(message.imagesBase64 ? {images_base64: message.imagesBase64} : {image_base64: message.imageBase64}), cleanup_pending: cleanup,
               ...(message.visibleVariantCount !== undefined ? {visible_variant_count: message.visibleVariantCount} : {}),
+              ...(message.stallRecovered === true && active.stallRecheck ? {stall_recovered: true} : {}),
               ...(/^\/c\/[a-f0-9-]{36}$/.test(message.chatPath || "") ? {chat_path: message.chatPath} : {})}),
           ...(message.promptBinding ? {prompt_binding: message.promptBinding} : {})});
-        if (cleanup && result.state === "complete") {
+        if (cleanup && result.state === "complete" && result.cleanup_status === "pending") {
           let removed;
           try {
             removed = await chrome.tabs.sendMessage(config.tabId,
@@ -802,12 +921,13 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
               cleanup_status: removed?.deleted === true ? "deleted" : "failed",
               error: removed?.error || (removed?.deleted === true ? "" : "Deletion was not confirmed")});
           } catch (_) {
-            result = {...result, cleanup_status: "pending", cleanup_error: "Saved image is safe; cleanup receipt unavailable. Do not regenerate or delete again automatically."};
+            result = {...result, cleanup_status: "pending", cleanup_error: "Cleanup receipt unavailable; inspect and never repeat automatically."};
           }
         }
         let preparationError = "";
         if (!message.error && !active.job?.preflight_only && result.state === "complete" &&
-            ["deleted", "preserved"].includes(result.cleanup_status)) {
+            !(cleanup && result.cleanup_status === "failed") &&
+            ["deleted", "preserved", "failed", "not_requested"].includes(result.cleanup_status)) {
           try {
             const prepared = await chrome.tabs.sendMessage(config.tabId, {type: "image-prepare",
               afterSavedJobId: active.jobId, job: {expected_model: "Create image"}});
@@ -815,6 +935,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
               preparationError = prepared?.error || "Fresh image composer could not be verified";
           } catch (_) { preparationError = "Fresh composer preparation unavailable; saved output is safe"; }
         }
+        await restoreUserTab(active);
         await chrome.storage.local.set({lastJob: result});
         await chrome.storage.local.remove("active");
         await connection(preparationError ? "needs_tab" : message.error ? "failed" : active.job?.preflight_only ? "preflight_complete" : "complete", preparationError || (message.error
@@ -824,10 +945,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
           : active.job?.preflight_only ? result.preflight_uploads_cleared
             ? "ตรวจอัปโหลดผ่านและนำไฟล์แนบทดสอบออกแล้ว แท็บว่าง ไม่มีการส่งหรือเจนภาพ"
             : "ตรวจอัปโหลดพร้อมแล้ว ยังไม่ส่งและไม่เจนภาพ ดราฟต์ทดสอบยังอยู่ในแท็บเดิม"
-          : cleanup && result.cleanup_status !== "deleted"
-            ? "รับไฟล์ภาพแล้ว แต่ยังยืนยันการลบไม่ได้ ตรวจแชตเดิม ไม่ต้องเจนซ้ำ"
-            : cleanup ? "รับไฟล์ภาพและลบแชตแล้ว พร้อมรับภาพถัดไป"
-              : "รับไฟล์ภาพแล้ว สั่งภาพถัดไปผ่าน MCP ได้เลย ส่วนขยายเตรียมแชตให้เอง"));
+          : "รับไฟล์ภาพแล้ว เก็บแชตเดิมไว้ พร้อมรับภาพถัดไป"));
         return {ok: true};
       } finally { finishing = false; }
     }

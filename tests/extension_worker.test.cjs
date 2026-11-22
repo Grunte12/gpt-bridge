@@ -8,8 +8,8 @@ const {createHash} = require('node:crypto');
 const source = fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/worker.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../extensions/chatgpt-image/manifest.json'), 'utf8'));
 
-test('0.1.41 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
-  assert.equal(manifest.version, '0.1.41');
+test('0.1.46 manifest grants only the host access needed for local bridge and ChatGPT reinjection', () => {
+  assert.equal(manifest.version, '0.1.46');
   assert.ok(manifest.permissions.includes('scripting'));
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1:18767/*', 'https://chatgpt.com/*']);
   for (const permission of ['tabs', 'cookies', 'webRequest', 'debugger'])
@@ -17,7 +17,7 @@ test('0.1.41 manifest grants only the host access needed for local bridge and Ch
   assert.doesNotMatch(source, /targetAddressSpace/);
 });
 
-function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', removeError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, requestError = null, httpError = 0, httpErrorBody = {}, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = '', candidateTabs = [], identities = {}, queryError = '', allowCreate = false, createError = '', settleCleanupRoute = false, cleanupOwnerAction = false} = {}) {
+function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabExists = true, active = null, state = {state: 'claimed', expected_model: 'Create image'}, next = {}, inspection = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, preparation = {fresh: true, model: 'Create image', input_protocol: 2, idle: true}, inspectError = '', prepareError = '', deleteResponse = {deleted: true}, deleteError = '', removeError = '', holdDeleteConfirmation = false, autoDeleteConfirmation = false, responses = {}, failPaths = [], storage: sharedStorage = null, failures = 0, requestError = null, httpError = 0, httpErrorBody = {}, holdPath = '', holdTabLookup = false, scriptingAvailable = false, scriptingError = '', inspectionAfterInjection = null, inspectErrorAfterInjection = '', candidateTabs = [], identities = {}, identityErrors = {}, identityErrorsAfterInjection = {}, queryError = '', allowCreate = false, createError = '', settleCleanupRoute = false, cleanupOwnerAction = false, allowUpdate = false, windowId = undefined, activeTabs = []} = {}) {
   let listener;
   let alarmListener;
   const storage = sharedStorage || {};
@@ -38,12 +38,15 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
   let reloadCalls = 0;
   let replacedListener;
   const createdTabs = [];
+  const tabUpdates = [];
+  const windowUpdates = [];
   const removedTabs = [];
   const cleanupInspectionPaths = [];
   let cleanupRouteSettled = false;
   const scripting = scriptingAvailable ? {async executeScript(details) {
     scriptInjections.push(details);
     if (scriptingError) throw new Error(scriptingError);
+    identityErrors[details.target.tabId] = identityErrorsAfterInjection[details.target.tabId] || '';
     activeInspection = inspectionAfterInjection || activeInspection;
     activeInspectError = inspectErrorAfterInjection;
   }} : undefined;
@@ -58,12 +61,14 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
     alarms: {onAlarm: {addListener(fn) { alarmListener = fn; }}, async create(...args) { alarms.push(args); }, async clear(...args) { alarms.push(['clear', ...args]); }},
     tabs: {
       onReplaced: {addListener(fn) { replacedListener = fn; }},
-      async query({url} = {}) {
+      async query({url, active: onlyActive} = {}) {
         if (queryError) throw new Error(queryError);
+        if (onlyActive === true) return activeTabs;
         if (typeof url !== 'string') return candidateTabs;
         const prefix = url.endsWith('*') ? url.slice(0, -1) : '';
         return candidateTabs.filter(tab => prefix ? (tab.url || '').startsWith(prefix) : tab.url === url);
       },
+      ...(allowUpdate ? {async update(id, props) { tabUpdates.push({id, ...props}); return {id, windowId}; }} : {}),
       ...(allowCreate ? {async create(props) {
         createdTabs.push(props);
         if (createError) throw new Error(createError);
@@ -85,7 +90,7 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
           return {...candidate};
         }
         if (!tabExists) return null;
-        return {id, ...(tabUrlRedacted ? {} : {url: tabUrl})};
+        return {id, ...(windowId === undefined ? {} : {windowId}), ...(tabUrlRedacted ? {} : {url: tabUrl})};
       },
       async remove(id) {
         if (removeError) throw new Error(removeError);
@@ -95,7 +100,10 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
       },
       async sendMessage(id, message) {
         tabMessages.push({id, message});
-        if (message.type === 'image-identity') return {client_id: identities[id] || ''};
+        if (message.type === 'image-identity') {
+          if (identityErrors[id]) throw new Error(identityErrors[id]);
+          return {client_id: identities[id] || ''};
+        }
         if (message.type === 'image-bind') return {ok: true};
         if (message.type === 'image-inspect') {
           if (candidateTabs.find(tab => tab.id === id)?._timeoutCleanup) {
@@ -136,6 +144,7 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
         return {accepted: true};
       }
     },
+    ...(allowUpdate ? {windows: {async update(id, props) { windowUpdates.push({id, ...props}); }}} : {}),
     ...(scripting ? {scripting} : {})
   };
   const context = {chrome, URL, crypto: {randomUUID: () => 'client-id'}, AbortSignal, setTimeout,
@@ -158,12 +167,14 @@ function harness({tabUrl = 'https://chatgpt.com/', tabUrlRedacted = false, tabEx
   return {storage, requests, alarms, tabLookups, tabMessages, scriptInjections, receive: listener,
     setNativePairing(fn) { chrome.runtime.sendNativeMessage = fn; },
     resume() { return context.resume(); },
+    openRecoveryTab(config) { return context.openRecoveryTab(config); },
     get reloadCalls() { return reloadCalls; },
     fireAlarm() { alarmListener({name: 'poll'}); },
     releaseNetwork() { releaseNetwork(); },
     releaseTabLookup() { releaseTabLookup(); },
     releaseDeleteConfirmation() { releaseDeleteConfirmation(); },
     replaceTab(added, removed) { return replacedListener(added, removed); }, createdTabs, removedTabs, cleanupInspectionPaths,
+    tabUpdates, windowUpdates,
     get cleanupRouteSettled() { return cleanupRouteSettled; }};
 }
 
@@ -370,6 +381,32 @@ test('pair refuses when selected tab inspection is unavailable', async () => {
   assert.equal(h.requests.length, 0);
   assert.equal(h.storage.config, undefined);
   assert.deepEqual(h.alarms, []);
+});
+
+test('owner-confirmed pairing repairs a missing receiver on only the selected tab', async () => {
+  const h = harness({inspectError: 'Could not establish connection. Receiving end does not exist.',
+    scriptingAvailable: true, inspectionAfterInjection: {fresh: true, model: 'Create image', input_protocol: 4}});
+  const result = await send(h, pairing());
+  assert.equal(result.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.scriptInjections)), [{target: {tabId: 7}, files: ['content.js']}]);
+  assert.equal(h.requests.find(r => r.url.endsWith('/pair')).body.input_protocol, 4);
+  assert.equal(h.tabMessages.some(call => ['image-job', 'image-collect'].includes(call.message.type)), false);
+});
+
+test('pair receiver repair fails closed without changing saved config or claiming jobs', async t => {
+  for (const options of [{scriptingError: 'Denied'}, {inspectErrorAfterInjection: 'Receiving end does not exist'},
+      {inspectError: 'The message port closed before a response was received.'}]) {
+    await t.test(JSON.stringify(options), async () => {
+      const h = harness({inspectError: 'Receiving end does not exist', scriptingAvailable: true, ...options});
+      const config = {token: 'saved-secret', clientId: 'saved-client', tabId: 99};
+      h.storage.config = config;
+      assert.ok((await send(h, pairing())).error);
+      assert.equal(h.storage.config, config);
+      assert.equal(h.requests.length, 0);
+      assert.ok(h.scriptInjections.length <= 1);
+      if (options.inspectError) assert.equal(h.scriptInjections.length, 0);
+    });
+  }
 });
 
 test('explicit cleanup retry waits for the SPA path, preserves the selected tab, and sends no replacement', async () => {
@@ -848,17 +885,140 @@ test('a missing saved tab rebinds only a single matching client marker', async t
   });
 
   await t.test('tab replacement keeps the same pairing without a new code', async () => {
-    const h = harness({next: {}});
+    const h = harness({tabExists: false, candidateTabs: [chatgpt(11)], identities: {11: clientId}, next: {}});
     Object.assign(h.storage, {config: {...config}});
     await h.replaceTab(11, 7);
+    assert.equal(h.storage.config.tabId, 7);
+    h.fireAlarm();
     for (let i = 0; i < 10 && h.storage.config.tabId !== 11; i++) await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.storage.config.tabId, 11);
     assert.equal(h.storage.config.token, config.token);
     h.fireAlarm();
     for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-    assert.equal(h.requests[0].body.tab_recovery, 'none');
-    assert.equal(h.requests[0].body.content_receiver, 'available');
+    assert.equal(h.requests[0].body.tab_ready, false);
+    assert.equal(h.requests.at(-2).body.content_receiver, 'available');
     assert.equal(h.tabLookups.at(-1), 11);
+  });
+});
+
+test('restored candidates recover missing receivers without guessing ownership', async t => {
+  const clientId = '123e4567-e89b-12d3-a456-426614174001';
+  const config = {token: 'synthetic-token', clientId, tabId: 7, account: 'second'};
+  const noReceiver = 'Could not establish connection. Receiving end does not exist.';
+  const chatgpt = id => ({id, url: 'https://chatgpt.com/', status: 'complete'});
+  const settle = async h => {
+    h.fireAlarm();
+    for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+  const make = options => {
+    const h = harness({tabExists: false, scriptingAvailable: true,
+      candidateTabs: [chatgpt(9)], identities: {9: clientId}, identityErrors: {9: noReceiver}, ...options});
+    Object.assign(h.storage, {config: {...config}});
+    return h;
+  };
+  const assertNoWork = h => {
+    assert.equal(h.tabMessages.some(call => !['image-identity', 'image-inspect'].includes(call.message.type)), false);
+    assert.equal(h.requests.some(call => ['/pair', '/result', '/cleanup', '/timeout-cleanup'].some(route => call.url.endsWith(route))), false);
+    assert.equal(h.createdTabs.length, 0);
+    assert.equal(h.removedTabs.length, 0);
+  };
+
+  await t.test('changed restored ID with preserved marker rebinds after bundled listener injection', async () => {
+    const h = make();
+    await settle(h);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.scriptInjections)), [{target: {tabId: 9}, files: ['content.js']}]);
+    assert.deepEqual(h.tabMessages.slice(0, 3).map(call => call.message.type),
+      ['image-identity', 'image-identity', 'image-inspect']);
+    assert.deepEqual(h.storage.config, {...config, tabId: 9});
+    assert.equal(h.requests[0].body.tab_id, 9);
+    assert.equal(h.requests[0].body.tab_ready, false);
+    assert.equal(h.requests.find(call => call.body.tab_recovery === 'rebound').body.content_receiver, 'available');
+    await settle(h);
+    assert.equal(h.scriptInjections.length, 1);
+    assertNoWork(h);
+  });
+
+  for (const [name, identities, candidateTabs] of [
+    ['marker absent after restart', {9: ''}, [chatgpt(9)]],
+    ['different marker', {9: '123e4567-e89b-12d3-a456-426614174099'}, [chatgpt(9)]],
+    ['duplicate restored markers', {8: clientId, 9: clientId}, [chatgpt(8), chatgpt(9)]]
+  ]) await t.test(name, async () => {
+    const h = make({identities, candidateTabs, identityErrors: {8: noReceiver, 9: noReceiver}});
+    await settle(h);
+    await settle(h);
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.scriptInjections.length, candidateTabs.length);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assert.equal(h.requests.at(-1).body.tab_recovery, 'unmatched');
+    assertNoWork(h);
+  });
+
+  for (const error of ['The message port closed before a response was received.', 'Unexpected private failure'])
+    await t.test('other identity failure does not trigger injection: ' + error, async () => {
+      const h = make({identityErrors: {9: error}});
+      await settle(h);
+      assert.equal(h.scriptInjections.length, 0);
+      assert.equal(h.storage.config.tabId, 7);
+      assertNoWork(h);
+    });
+
+  for (const options of [
+    {scriptingError: 'permission denied'},
+    {identityErrorsAfterInjection: {9: noReceiver}},
+    {scriptingAvailable: false},
+    {candidateTabs: [{...chatgpt(9), discarded: true}]}
+  ]) await t.test('unrecoverable receiver is bounded across polls: ' + JSON.stringify(options), async () => {
+    const h = make(options);
+    for (let i = 0; i < 4; i++) await settle(h);
+    assert.equal(h.scriptInjections.length, options.scriptingAvailable === false || options.candidateTabs ? 0 : 1);
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assertNoWork(h);
+  });
+
+  for (const storage of [
+    {active: {jobId: 'open-job', tabId: 7}},
+    {lastJob: {state: 'complete', cleanup_status: 'pending'}}
+  ]) await t.test('open work blocks candidate reinjection and replacement adoption: ' + JSON.stringify(storage), async () => {
+    const h = make({storage});
+    await h.replaceTab(9, 7);
+    await settle(h);
+    assert.equal(h.scriptInjections.length, 0);
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
+    assertNoWork(h);
+  });
+
+  await t.test('replacement notification cannot adopt an unmarked tab', async () => {
+    const h = make({identities: {9: ''}});
+    await h.replaceTab(9, 7);
+    assert.equal(h.storage.config.tabId, 7);
+    await settle(h);
+    assert.equal(h.storage.config.tabId, 7);
+    assertNoWork(h);
+  });
+
+  await t.test('candidate churn has a total twenty-injection worker lifetime budget', async () => {
+    const candidateTabs = [chatgpt(9)];
+    const identityErrors = {9: noReceiver};
+    const h = make({candidateTabs, identities: {}, identityErrors});
+    for (let id = 9; id < 32; id++) {
+      candidateTabs[0] = chatgpt(id);
+      identityErrors[id] = noReceiver;
+      await settle(h);
+    }
+    assert.equal(h.scriptInjections.length, 20);
+    assert.equal(h.storage.config.tabId, 7);
+    assertNoWork(h);
+  });
+
+  await t.test('more than twenty candidates cannot hide a duplicate outside the scan bound', async () => {
+    const candidateTabs = Array.from({length: 21}, (_, i) => chatgpt(i + 8));
+    const h = make({candidateTabs, identities: {8: clientId, 28: clientId}, identityErrors: {}});
+    await settle(h);
+    assert.equal(h.storage.config.tabId, 7);
+    assert.equal(h.scriptInjections.length, 0);
+    assertNoWork(h);
   });
 });
 
@@ -933,6 +1093,37 @@ test('zero ChatGPT tabs open one recovery tab and never spend a job when that ta
     assert.equal(h.tabMessages.some(call => call.message.type === 'image-job' || call.message.type === 'image-prepare'), false);
     assert.match(h.requests[0].body.tab_error, /^Owner action required/);
     assert.equal(h.storage.connection.state, 'needs_tab');
+  });
+});
+
+test('a cached recovery tab is reused only with its original origin and exact marker', async t => {
+  const clientId = '123e4567-e89b-12d3-a456-426614174001';
+  const config = {token: 'synthetic-token', clientId, tabId: 7, account: 'second'};
+  for (const [name, url, marker, expected] of [
+    ['same marked tab', 'https://chatgpt.com/', clientId, 42],
+    ['navigated elsewhere', 'https://example.com/', clientId, null],
+    ['redacted origin', '', clientId, null],
+    ['missing marker', 'https://chatgpt.com/', '', null],
+    ['different marker', 'https://chatgpt.com/', '123e4567-e89b-12d3-a456-426614174099', null]
+  ]) await t.test(name, async () => {
+    const candidateTabs = [], identities = {42: marker};
+    const h = harness({tabExists: false, allowCreate: true, candidateTabs, identities});
+    assert.equal((await h.openRecoveryTab(config)).id, 42);
+    candidateTabs[0].url = url;
+    const reused = await h.openRecoveryTab(config);
+    assert.equal(reused?.id ?? null, expected);
+    assert.equal(h.createdTabs.length, 1);
+    assert.equal(h.tabMessages.filter(call => call.message.type === 'image-bind').length, 1);
+    assert.equal(h.removedTabs.length, 0);
+  });
+
+  await t.test('closed cached tab does not permanently prevent a replacement', async () => {
+    const candidateTabs = [];
+    const h = harness({tabExists: false, allowCreate: true, candidateTabs});
+    await h.openRecoveryTab(config);
+    candidateTabs.length = 0;
+    assert.equal((await h.openRecoveryTab(config)).id, 42);
+    assert.equal(h.createdTabs.length, 2);
   });
 });
 
@@ -1986,61 +2177,22 @@ test('pair refuses to replace an active job without contacting the bridge', asyn
   assert.deepEqual(h.alarms, []);
 });
 
-test('saved paired image opens Delete confirmation and records owner-confirmed deletion', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, responses: {result: {state: 'complete'}, cleanup: [
-    {state: 'complete', cleanup_status: 'confirmation_required'},
-    {state: 'complete', cleanup_status: 'deleted'}
-  ]}});
-  Object.assign(h.storage, {active, config});
-  const {message, sender} = pairedImageResult();
-
-  const response = await send(h, message, sender);
-
-  assert.equal(response.ok, true);
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'cleanup']);
-  assert.equal(h.requests[0].body.cleanup_pending, true);
-  assert.equal(h.requests[0].body.chat_path, message.chatPath);
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-  assert.equal(h.requests[2].body.cleanup_status, 'deleted');
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-  assert.equal(h.tabMessages.some(call => call.message.type === 'image-archive'), false);
-  assert.equal(h.tabMessages[0].id, 7);
-  assert.equal(h.tabMessages[0].message.chatPath, message.chatPath);
-  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
-  assert.equal(h.storage.active, undefined);
-
-  const duplicate = await send(h, message, sender);
-  assert.ok(duplicate.error);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-});
-
-test('automatic saved-chat deletion follows requested confirmation through the existing native handshake', async () => {
+test('normal saved results ignore automatic-delete confirmation and reject duplicate receipts', async () => {
   const active = {jobId: 'job-1', tabId: 7};
   const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
   const h = harness({active, autoDeleteConfirmation: true, responses: {
-    result: {state: 'complete'},
-    cleanup: [
-      {state: 'complete', cleanup_status: 'confirmation_required', cleanup_confirmation: 'requested'},
-      {state: 'complete', cleanup_status: 'deleted'}
-    ],
-    'cleanup-confirmation': {confirmed: true}
+    result: {state: 'complete', cleanup_status: 'not_requested', cleanup_confirmation: 'requested'}
   }});
   Object.assign(h.storage, {active, config});
   const {message, sender} = pairedImageResult();
-
-  const response = await send(h, message, sender);
-
-  assert.equal(response.ok, true);
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)),
-    ['result', 'cleanup', 'cleanup-confirmation', 'cleanup']);
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-  assert.deepEqual(h.requests[2].body, {client_id: 'client', job_id: 'job-1'});
-  assert.equal(h.requests[3].body.cleanup_status, 'deleted');
-  assert.equal(h.requests.some(call => call.url.endsWith('/agentconfirm')), false);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
+  assert.equal((await send(h, message, sender)).ok, true);
+  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-prepare']);
+  assert.equal(h.storage.lastJob.cleanup_status, 'not_requested');
+  assert.equal(h.storage.active, undefined);
+  assert.ok((await send(h, message, sender)).error);
+  assert.equal(h.tabMessages.length, 1);
 });
 
 test('image-delete-prompt requires the currently finishing paired job', async t => {
@@ -2148,11 +2300,11 @@ test('image-delete-confirmation forwards only for the currently finishing paired
   });
 });
 
-test('image-result only opens Delete confirmation after a successful save with a valid chat path', async t => {
+test('image-result never requests deletion for failed or legacy results', async t => {
   const active = {jobId: 'job-1', tabId: 7};
   const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
   for (const [name, options, resultBody, expectedCleanupPending] of [
-    ['failed save', {}, {state: 'failed'}, true],
+    ['failed save', {}, {state: 'failed'}, false],
     ['content error', {}, {state: 'failed'}, undefined],
     ['legacy result without chat path', {message: {chatPath: undefined}}, {state: 'complete'}, false],
     ['invalid chat path', {message: {chatPath: '/'}}, {state: 'complete'}, false]
@@ -2270,135 +2422,22 @@ test('preflight rejects multiple generated outputs without sending a result or c
   assert.equal(h.storage.active, active);
 });
 
-test('valid result chat path opens Delete confirmation when sender URL still names the previous SPA chat', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, responses: {
-    result: {state: 'complete'}, cleanup: [
-      {state: 'complete', cleanup_status: 'confirmation_required'},
-      {state: 'complete', cleanup_status: 'deleted'}
-    ]
-  }});
-  Object.assign(h.storage, {active, config});
-  const {message, sender: pairedSender} = pairedImageResult();
-  const sender = {...pairedSender, url: 'https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'};
-
-  const response = await send(h, message, sender);
-
-  assert.equal(response.ok, true);
-  assert.equal(h.requests[0].body.cleanup_pending, true);
-  assert.equal(h.requests[0].body.chat_path, message.chatPath);
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'cleanup']);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-  assert.equal(h.tabMessages[0].message.chatPath, message.chatPath);
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-  assert.equal(h.requests[2].body.cleanup_status, 'deleted');
-});
-
-test('delete failure preserves saved image success and records cleanup failure once', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, deleteResponse: {error: 'Owner cancelled'}, responses: {
-    result: {state: 'complete'}, cleanup: [
-      {state: 'complete', cleanup_status: 'confirmation_required'},
-      {state: 'complete', cleanup_status: 'failed'}
-    ]
-  }});
-  Object.assign(h.storage, {active, config});
-  const {message, sender} = pairedImageResult();
-
-  const response = await send(h, message, sender);
-
-  assert.equal(response.ok, true);
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'cleanup']);
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-  assert.equal(h.requests[2].body.cleanup_status, 'failed');
-  assert.match(h.requests[2].body.error, /Owner cancelled/);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-  assert.equal(h.storage.lastJob.state, 'complete');
-  assert.equal(h.storage.active, undefined);
-});
-
-test('a lost confirmation or cleanup receipt stays pending without repeating Delete or losing the saved image', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, failPaths: ['/cleanup'], responses: {result: {state: 'complete'}}});
-  Object.assign(h.storage, {active, config});
-  const {message, sender} = pairedImageResult();
-
-  const response = await send(h, message, sender);
-
-  assert.equal(response.ok, true);
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'cleanup']);
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-  assert.equal(h.requests[2].body.cleanup_status, 'failed');
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-  assert.equal(h.storage.lastJob.state, 'complete');
-  assert.equal(h.storage.lastJob.cleanup_status, 'pending');
-  assert.equal(h.storage.active, undefined);
-
-  const duplicate = await send(h, message, sender);
-  assert.ok(duplicate.error);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-delete').length, 1);
-});
-
-test('polling heartbeats but does not claim or repeat cleanup while deletion cleanup is in flight', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, holdPath: '/cleanup', responses: {
-    result: {state: 'complete'}, cleanup: [
-      {state: 'complete', cleanup_status: 'confirmation_required'},
-      {state: 'complete', cleanup_status: 'deleted'}
-    ]
-  }});
-  Object.assign(h.storage, {active, config});
-  const {message, sender} = pairedImageResult();
-  let finishResult;
-  const finished = new Promise(resolve => h.receive(message, sender, value => { finishResult = value; resolve(value); }));
-  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.ok(h.requests.some(call => call.url.endsWith('/cleanup')));
-
-  h.fireAlarm();
-  for (let i = 0; i < 3; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'heartbeat']);
-  assert.equal(h.requests.filter(call => call.url.endsWith('/next')).length, 0);
-  assert.equal(h.requests.filter(call => call.url.endsWith('/cleanup')).length, 1);
-  assert.equal(h.storage.active, active);
-
-  h.releaseNetwork();
-  await finished;
-  assert.equal(finishResult.ok, true);
-  assert.equal(h.storage.active, undefined);
-});
-
-test('poll heartbeats during owner confirmation without inspecting or claiming another job', async () => {
-  const active = {jobId: 'job-1', tabId: 7};
-  const config = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
-  const h = harness({active, holdDeleteConfirmation: true, responses: {result: {state: 'complete'}, cleanup: [
-    {state: 'complete', cleanup_status: 'confirmation_required'},
-    {state: 'complete', cleanup_status: 'deleted'}
-  ]}});
-  Object.assign(h.storage, {active, config});
-  const {message, sender} = pairedImageResult();
-  let result;
-  const finished = new Promise(resolve => h.receive(message, sender, value => { result = value; resolve(value); }));
-  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.requests[1].body.cleanup_status, 'confirmation_required');
-
-  h.fireAlarm();
-  for (let i = 0; i < 3; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result', 'cleanup', 'heartbeat']);
-  assert.equal(h.requests[2].body.tab_ready, false);
-  assert.equal(h.requests[2].body.worker_version, manifest.version);
-  assert.equal(h.requests[2].body.content_receiver, 'unreported');
-  assert.equal(h.requests[2].body.receiver_error, '');
-  assert.equal(h.requests.some(call => call.url.endsWith('/next')), false);
-  assert.equal(h.tabMessages.filter(call => call.message.type === 'image-inspect').length, 0);
-
-  h.releaseDeleteConfirmation();
-  await finished;
-  assert.equal(result.ok, true);
-  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
+test('saved result preserves the exact SPA chat and prepares once without cleanup', async () => {
+  for (const cleanup_status of ['not_requested', 'failed', 'preserved', 'deleted']) {
+    const active = {jobId: 'job-1', tabId: 7};
+    const h = harness({active, responses: {result: {state: 'complete', cleanup_status}}});
+    Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7}});
+    const {message, sender} = pairedImageResult();
+    sender.url = 'https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    assert.equal((await send(h, message, sender)).ok, true);
+    assert.deepEqual(h.requests.map(call => call.url.split('/').at(-1)), ['result']);
+    assert.equal(h.requests[0].body.cleanup_pending, false);
+    assert.equal(h.requests[0].body.chat_path, message.chatPath);
+    assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-prepare']);
+    assert.equal(h.tabMessages[0].message.afterSavedJobId, active.jobId);
+    assert.equal(h.storage.lastJob.cleanup_status, cleanup_status);
+    assert.equal(h.storage.active, undefined);
+  }
 });
 
 test('collect-existing requires the paired current tab and a claimed job', async t => {
@@ -2521,22 +2560,19 @@ test('adaptive timeout is exact-job bound, deletes the stalled chat, and clears 
 });
 
 
-test('fresh composer waits for saved output and confirmed cleanup receipt', async () => {
+test('fresh composer waits for a confirmed saved output and never deletes', async () => {
   const active = {jobId: 'job-1', tabId: 7};
-  const h = harness({active, holdDeleteConfirmation: true, responses: {
-    result: {state: 'complete'}, cleanup: [
-      {state: 'complete', cleanup_status: 'confirmation_required'},
-      {state: 'complete', cleanup_status: 'deleted'}]}});
-  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
+  const h = harness({active, holdPath: '/result', responses: {
+    result: {state: 'complete', cleanup_status: 'not_requested'}}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7}});
   const {message, sender} = pairedImageResult();
   const completion = new Promise(resolve => h.receive(message, sender, resolve));
-  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
-  h.releaseDeleteConfirmation();
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.tabMessages.length, 0);
+  h.releaseNetwork();
   assert.equal((await completion).ok, true);
-  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-delete', 'image-prepare']);
-  assert.equal(h.tabMessages[1].message.afterSavedJobId, 'job-1');
-  assert.equal(h.storage.lastJob.cleanup_status, 'deleted');
+  assert.deepEqual(h.tabMessages.map(call => call.message.type), ['image-prepare']);
+  assert.equal(h.requests[0].body.cleanup_pending, false);
 });
 
 test('preserved multiple outputs prepare a fresh chat only after successful save, without deletion', async () => {
@@ -2556,9 +2592,9 @@ test('preserved multiple outputs prepare a fresh chat only after successful save
 });
 
 test('uncertain cleanup never prepares or loses the successful result', async () => {
-  for (const cleanupStatus of ['pending', 'failed', 'confirmation_required']) {
+  for (const cleanupStatus of ['pending', 'confirmation_required', undefined, 'unknown']) {
     const active = {jobId: 'job-1', tabId: 7};
-    const h = harness({active, responses: {result: {state: 'complete'}, cleanup: {state: 'complete', cleanup_status: cleanupStatus}}});
+    const h = harness({active, responses: {result: {state: 'complete', cleanup_status: cleanupStatus}}});
     Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7, account: 'second'}});
     const {message, sender} = pairedImageResult();
     await send(h, message, sender);
@@ -2602,4 +2638,166 @@ test('invalid variant counts fail closed without submitting a result or deleting
     assert.equal(h.requests.length, 0);
     assert.equal(h.tabMessages.length, 0);
   }
+});
+
+test('opted-in saved single output dispatches exact owned cleanup after result receipt', async () => {
+  const active = {jobId: 'job-1', tabId: 7, job: {auto_delete_saved_chat: true}, phase: 'result_captured', phaseChatPath: '/c/123e4567-e89b-12d3-a456-426614174000'};
+  const h = harness({active, responses: {result: {state: 'complete', cleanup_status: 'pending'}}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7}});
+  const {message, sender} = pairedImageResult();
+  assert.equal((await send(h, message, sender)).ok, true);
+  assert.equal(h.requests[0].body.cleanup_pending, true);
+  const deletion = h.tabMessages.find(call => call.message.type === 'image-delete');
+  assert.equal(deletion.message.jobId, active.jobId);
+  assert.equal(deletion.message.chatPath, message.chatPath);
+  assert.ok(h.requests.some(call => call.url.endsWith('/cleanup')));
+});
+
+test('failed batch verification never dispatches saved-chat cleanup', async () => {
+  const active = {jobId: 'job-1', tabId: 7, job: {auto_delete_saved_chat: true}, phase: 'result_captured', phaseChatPath: '/c/123e4567-e89b-12d3-a456-426614174000'};
+  const h = harness({active, responses: {result: {state: 'complete', cleanup_status: 'failed'}}});
+  Object.assign(h.storage, {active, config: {token: 'secret', clientId: 'client', tabId: 7}});
+  const {message, sender} = pairedImageResult();
+  assert.equal((await send(h, message, sender)).ok, true);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete'), false);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-prepare'), false);
+});
+
+// 2026-11-18 one-call workflow: a stall gets one fresh visible look before any timeout is believed.
+const stallChat = '/c/123e4567-e89b-12d3-a456-426614174000';
+const stallJob = {job_id: 'job-1', prompt: 'draw a cat', expected_model: 'Create image', mode: 'create'};
+const stallActive = (extra = {}) => ({jobId: 'job-1', tabId: 7, phase: 'remote_started', phaseChatPath: stallChat, job: stallJob, ...extra});
+const stallConfig = {token: 'secret', clientId: 'client', tabId: 7, account: 'second'};
+const stallSender = {tab: {id: 7}, url: `https://chatgpt.com${stallChat}`};
+const pastRecheck = () => ({at: Date.now() - 60000, deadline: Date.now() - 1, chatPath: stallChat});
+const preservedPage = dom => ({fresh: false, input_protocol: 4, idle: false,
+  error: 'Existing conversation preserved; inspect its job result instead of submitting again', result_dom: resultDom(dom)});
+async function settle(turns = 12) { for (let i = 0; i < turns; i++) await new Promise(resolve => setImmediate(resolve)); }
+
+test('a hidden-tab false stall is reloaded visibly, collected once, and the user tab is restored', async () => {
+  const active = stallActive();
+  const h = harness({active, allowUpdate: true, windowId: 3, activeTabs: [{id: 11}],
+    inspection: preservedPage({assistant_images: 1}), state: {state: 'claimed', phase: 'remote_started'},
+    responses: {result: {state: 'complete', cleanup_status: 'not_requested'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  const reply = await send(h, {type: 'image-stall', jobId: 'job-1', chatPath: stallChat, deadline: Date.now() + 450000, hidden: true}, stallSender);
+
+  assert.deepEqual({...reply}, {ok: true, recheck: true});
+  assert.deepEqual(h.tabUpdates.map(update => ({...update})), [{id: 7, active: true}, {id: 7, url: `https://chatgpt.com${stallChat}`}]);
+  assert.deepEqual(h.windowUpdates, [], 'Chrome focus is not taken while the tab can simply be activated');
+  assert.equal(h.storage.active.stallRecheck.previousTabId, 11);
+  assert.equal(h.requests.some(item => item.url.endsWith('/timeout')), false);
+
+  h.fireAlarm();
+  await settle();
+  h.fireAlarm();
+  await settle();
+  const collects = h.tabMessages.filter(call => call.message.type === 'image-collect');
+  assert.equal(collects.length, 1);
+  assert.equal(collects[0].message.job.visible_output_only, true);
+  assert.equal(collects[0].message.job.stall_recovered, true);
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-job'), false);
+  assert.equal(h.requests.some(item => item.url.endsWith('/next') || item.url.endsWith('/timeout')), false);
+
+  const saved = await send(h, {type: 'image-result', jobId: 'job-1', imageBase64: 'cG5n', chatPath: stallChat, stallRecovered: true}, stallSender);
+  assert.equal(saved.ok, true);
+  assert.equal(h.requests.find(item => item.url.endsWith('/result')).body.stall_recovered, true);
+  assert.deepEqual({...h.tabUpdates.at(-1)}, {id: 11, active: true});
+  assert.equal(h.storage.active, undefined);
+});
+
+test('a second stall report or a timeout during the recheck never reloads twice', async () => {
+  const active = stallActive();
+  const h = harness({active, allowUpdate: true, state: {state: 'claimed', phase: 'remote_started'},
+    responses: {timeout: {state: 'failed', timed_out: true, cleanup_status: 'timeout_delete_pending'},
+      'timeout-cleanup': {state: 'failed', timed_out: true, cleanup_status: 'deleted'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  await send(h, {type: 'image-stall', jobId: 'job-1', chatPath: stallChat, deadline: Date.now() + 1000}, stallSender);
+  const again = await send(h, {type: 'image-stall', jobId: 'job-1', chatPath: stallChat, deadline: Date.now() + 1000}, stallSender);
+  assert.deepEqual({...again}, {ok: true, recheck: false});
+  assert.equal(h.tabUpdates.filter(update => update.url).length, 1);
+  const timedOut = await send(h, {type: 'image-timeout', jobId: 'job-1', chatPath: stallChat}, stallSender);
+  assert.equal(timedOut.ok, true);
+  assert.equal(h.tabUpdates.filter(update => update.url).length, 1);
+});
+
+test('a timeout first reloads the exact chat; only a still-empty page becomes a real timeout', async () => {
+  const active = stallActive();
+  const h = harness({active, allowUpdate: true, inspection: preservedPage({assistant_images: 0, conversation_images: 0}),
+    state: {state: 'claimed', phase: 'remote_started'}, deleteResponse: {error: 'Native chat menu unavailable for timed-out cleanup'},
+    responses: {timeout: {state: 'failed', timed_out: true, cleanup_status: 'timeout_delete_pending', replacement_job_id: 'job-2'},
+      'timeout-cleanup': {state: 'failed', timed_out: true, cleanup_status: 'preserved', replacement_job_id: 'job-2'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  const reply = await send(h, {type: 'image-timeout', jobId: 'job-1', chatPath: stallChat}, stallSender);
+  assert.deepEqual({...reply}, {ok: true, recheck: true});
+  assert.equal(h.requests.some(item => item.url.endsWith('/timeout')), false);
+
+  h.fireAlarm();  // Inside the grace period: keep watching.
+  await settle();
+  assert.equal(h.requests.some(item => item.url.endsWith('/timeout')), false);
+
+  h.storage.active.stallRecheck = pastRecheck();
+  h.fireAlarm();
+  await settle(20);
+  const timeout = h.requests.find(item => item.url.endsWith('/timeout'));
+  assert.equal(timeout.body.reason, 'no_image_returned');
+  const cleanup = h.requests.find(item => item.url.endsWith('/timeout-cleanup'));
+  assert.equal(cleanup.body.deleted, false);
+  assert.equal(Object.hasOwn(cleanup.body, 'output_visible'), false);
+  // A failed delete keeps the chat and frees the line: the next poll asks for the next job.
+  assert.equal(h.storage.active, undefined);
+  assert.equal(h.storage.lastJob.cleanup_status, 'preserved');
+  h.fireAlarm();
+  await settle(20);
+  assert.equal(h.requests.some(item => item.url.endsWith('/next')), true);
+});
+
+test('a finished image found by the timed-out delete is reported for collection, not regenerated', async () => {
+  const active = stallActive({stallRecheck: pastRecheck()});
+  const h = harness({active, allowUpdate: true, inspection: preservedPage({assistant_images: 0, conversation_images: 0}),
+    state: {state: 'claimed', phase: 'remote_started'},
+    deleteResponse: {error: 'Generated output is already visible; preserve this chat and recover the result before cleanup'},
+    responses: {timeout: {state: 'failed', timed_out: true, cleanup_status: 'timeout_delete_pending'},
+      'timeout-cleanup': {state: 'queued', collect_only: true, cleanup_status: 'preserved'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  h.fireAlarm();
+  await settle(20);
+  assert.equal(h.requests.find(item => item.url.endsWith('/timeout-cleanup')).body.output_visible, true);
+  assert.equal(h.storage.active, undefined);
+});
+
+test('a page that stays hidden gets Chrome focus once, then is kept unchecked without deletion', async () => {
+  const hiddenPage = {...preservedPage({assistant_images: 0, conversation_images: 0}), page_hidden: true};
+  const active = stallActive({stallRecheck: {at: Date.now() - 11000, deadline: Date.now() + 60000, chatPath: stallChat}});
+  const h = harness({active, allowUpdate: true, windowId: 3, inspection: hiddenPage,
+    state: {state: 'claimed', phase: 'remote_started'},
+    responses: {timeout: {state: 'failed', timed_out: true, cleanup_status: 'preserved'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  h.fireAlarm();
+  await settle();
+  h.fireAlarm();
+  await settle();
+  assert.deepEqual(h.windowUpdates.map(update => ({...update})), [{id: 3, focused: true}]);
+  assert.equal(h.requests.some(item => item.url.endsWith('/timeout')), false);
+
+  h.storage.active.stallRecheck = {...pastRecheck(), focused: true};
+  h.fireAlarm();
+  await settle(20);
+  assert.equal(h.requests.find(item => item.url.endsWith('/timeout')).body.reason, 'page_hidden_unverified');
+  assert.equal(h.tabMessages.some(call => call.message.type === 'image-delete-timeout'), false);
+  assert.equal(h.requests.some(item => item.url.endsWith('/timeout-cleanup')), false);
+  assert.equal(h.storage.active, undefined);
+});
+
+test('a timed-out delete resumed after restart records its receipt and clears the job', async () => {
+  const active = stallActive();
+  const h = harness({active, deleteResponse: {error: 'Native chat menu unavailable for timed-out cleanup'},
+    state: {state: 'failed', timed_out: true, cleanup_status: 'timeout_delete_pending', chat_path: stallChat},
+    responses: {'timeout-cleanup': {state: 'failed', timed_out: true, cleanup_status: 'preserved'}}});
+  Object.assign(h.storage, {active, config: stallConfig});
+  h.fireAlarm();
+  await settle(20);
+  assert.equal(h.requests.find(item => item.url.endsWith('/timeout-cleanup')).body.deleted, false);
+  assert.equal(h.storage.active, undefined);
+  assert.equal(h.storage.lastJob.cleanup_status, 'preserved');
 });

@@ -420,7 +420,7 @@ def test_mcp_exposes_uniform_status_preflight_job_wait_tools_and_requires_true_o
     tools = server._tool_manager.list_tools()
     assert {tool.name for tool in tools} == {
         "status", "generate", "edit", "wait", "confirm_delete", "resolve",
-        "preflight", "job",
+        "preflight", "job", "batch_start", "batch_status", "enqueue", "run",
     }
 
     with pytest.raises(Exception, match="actual owner confirmation"):
@@ -542,3 +542,41 @@ def test_connect_rejects_auto_cleanup_policy_before_reading_token_or_starting_wo
 
     assert error.value.code == 2
     assert not data_dir.exists()
+
+
+def test_batch_authenticated_transport_and_mcp_status(tmp_path):
+    import hashlib
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "raw").mkdir(); (root / "receipts").mkdir()
+    prompt = "transport prompt"
+    item = {"scenario_id": "test", "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
+    (root / "prompts.json").write_text(json.dumps([item]))
+    (root / "generation_log.tsv").write_text("scenario_id\tstatus\n")
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT, batch_allowed_runs=[root])
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=3, tab_id=7)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=True, tab_id=7)
+    handler = make_handler(queue, TOKEN, 18767)
+    payload = {"batch_id": "transport", "items": [item], "destination": str(root / "raw"), "attempts": str(root / "receipts")}
+    assert _request(handler, "/agent/batch-start", payload, token="wrong")[0] == 401
+    status, result = _request(handler, "/agent/batch-start", payload)
+    assert status == 200 and result["batch_id"] == "transport"
+    assert _request(handler, "/agent/batch-status", {"batch_id": "transport"})[0] == 200
+    from chatgpt_api.extension_bridge import create_mcp
+    server = create_mcp(queue)
+    result = asyncio.run(server.call_tool("batch_start", payload))
+    assert "transport" in str(result)
+    result = asyncio.run(server.call_tool("batch_status", {"batch_id": "transport"}))
+    assert "transport" in str(result)
+
+
+def test_enqueue_client_uses_authenticated_owner_transport(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image")
+    client = ExtensionClient(TOKEN)
+    client.http = _LocalWorkerTransport(make_handler(queue, TOKEN, 18767))
+    receipt = client.enqueue("one-client-request", "One immutable image.")
+    again = client.enqueue("one-client-request", "One immutable image.")
+    assert again["job_id"] == receipt["job_id"]
+    assert client.status(receipt["job_id"])["request_id"] == "one-client-request"
+    assert len(queue.jobs) == 1

@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-07",
+  "cohort": 3,
+  "provider": "Claude CLI Pro",
+  "model": "claude-haiku-5-5",
+  "first_attempts": true,
+  "unchanged_product_revision": true,
+  "infrastructure": {
+    "fixture_only_executable_surface": true,
+    "connected_mcp_servers": 1,
+    "executable_tools": 11,
+    "skills": 0,
+    "custom_plugins": 0,
+    "off_route_calls": 0,
+    "unsafe_path_attempts": 0,
+    "additional_dispatches": 0,
+    "real_generation": false
+  },
+  "token_counting": "total_sum = provider-reported input_uncached + cache_creation + cache_read + output; no inferred usage",
+  "cases": [
+    {
+      "case": "A1",
+      "duration_seconds": 13.766,
+      "business_tools": ["enqueue"],
+      "accepted_jobs": 1,
+      "exact_reference_and_brief": true,
+      "final_state": "queued",
+      "final_claim_empty": true,
+      "draft_preserved_by_tools": true,
+      "response_excerpts": ["Open the paired ChatGPT tab and clear the draft's attachment.", "Don't remove the file yourself if you think it's needed; the tool says to leave the attachment in place."],
+      "known_issue": "Contradictory advice includes clearing the foreign attachment; queued acceptance also called not booked yet.",
+      "tokens": {"input_uncached":4,"cache_creation":1520,"cache_read":8366,"output":659,"total_sum":10549}
+    },
+    {
+      "case": "A2",
+      "duration_seconds": 13.244,
+      "business_tools": ["enqueue"],
+      "accepted_jobs": 1,
+      "exact_reference_and_brief": true,
+      "final_state": "queued",
+      "final_claim_empty": true,
+      "draft_preserved_by_tools": true,
+      "response_excerpts": ["You'll need to check the paired ChatGPT tab and clear or move that attachment yourself.", "It is blocked by an existing attachment in the ChatGPT draft tab, which needs to be cleared before it can send."],
+      "known_issue": "Tells the human/designer to clear or move the foreign attachment despite earlier preservation wording.",
+      "tokens": {"input_uncached":4,"cache_creation":1539,"cache_read":8373,"output":699,"total_sum":10615}
+    },
+    {
+      "case": "B1",
+      "duration_seconds": 12.174,
+      "business_tools": ["job","status"],
+      "original_receipt_read": true,
+      "new_jobs": 0,
+      "mutations": 0,
+      "final_state": "interrupted",
+      "final_claim_empty": true,
+      "response_excerpts": ["The system can't tell whether ChatGPT actually started the image.", "Don't resubmit it yet."],
+      "known_issue": "Independent final-answer review required; no infrastructure issue.",
+      "tokens": {"input_uncached":4,"cache_creation":2107,"cache_read":8384,"output":651,"total_sum":11146}
+    },
+    {
+      "case": "B2",
+      "duration_seconds": 12.924,
+      "business_tools": ["job","status"],
+      "original_receipt_read": true,
+      "new_jobs": 0,
+      "mutations": 0,
+      "final_state": "interrupted",
+      "final_claim_empty": true,
+      "response_excerpts": ["The system sent the request to ChatGPT before the interruption, but it never recorded a result.", "Don't resubmit."],
+      "known_issue": "Overstates submit-attempted as confirmed sent; does not claim a saved output.",
+      "tokens": {"input_uncached":4,"cache_creation":2094,"cache_read":8369,"output":698,"total_sum":11165}
+    }
+  ],
+  "acceptance_score": "Requires independent reviewer; infrastructure success is not 4/4 final-answer acceptance."
+}

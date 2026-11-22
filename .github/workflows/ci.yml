@@ -20,6 +20,17 @@ jobs:
         run: python -m compileall -q chatgpt_api
       - name: Run test suite
         run: python -m pytest -q
+      - name: Exercise two MCP clients against an isolated worker
+        run: python scripts/mcp-readiness-smoke.py
+      - name: Check extension behavior in JavaScript and offline Chromium
+        env:
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/bridge-browser/node_modules/playwright
+        run: |
+          node --test tests/extension_content.test.cjs tests/extension_worker.test.cjs tests/extension_cleanup_regression.test.cjs tests/extension_popup.test.cjs
+          npm install --prefix "$RUNNER_TEMP/bridge-browser" --no-audit --no-fund playwright@1.64.1
+          "$RUNNER_TEMP/bridge-browser/node_modules/.bin/playwright" install --with-deps chromium
+          node --test tests/extension_content.chromium.test.cjs tests/extension_native_upload.chromium.test.cjs
+          python scripts/mcp-chromium-readiness.py
       - name: Whitespace/conflict-marker check
         run: |
           git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -- \

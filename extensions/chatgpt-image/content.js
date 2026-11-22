@@ -8,6 +8,7 @@
   let preparationTarget = null;
   let uploadBinding = null;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const stallRecheckMs = 150000; // About three normal generations (45-53 s observed).
   const visible = el => !!el && el.getClientRects().length > 0;
   const normalizedText = text => text.replace(/\s+/g, " ").trim();
   const imageChipSelector = '[data-inline-selection-pill][data-system-hint-type="picture_v2"], [data-prompt-link-href="chatgpt-system-hint://picture_v2"]';
@@ -52,6 +53,17 @@
     const direct = displayedImages(assistantBody());
     return [...new Map((direct.length ? direct : galleryImagesAfterUserHeading()).map(img => [img.currentSrc || img.src, img])).values()];
   };
+  const pageHidden = () => document.visibilityState === "hidden";
+  // A hidden tab skips lazy image loads and intersection observers. Loading the gallery eagerly and scrolling
+  // it into view costs the user nothing; only the worker may bring the tab forward.
+  function nudgeOutput() {
+    try {
+      const target = [...document.querySelectorAll('[data-testid="generated-image-gallery"]')].at(-1) ||
+        turnHeadings("ChatGPT said:").at(-1);
+      for (const img of target?.querySelectorAll?.("img") || []) if (img.loading === "lazy") img.loading = "eager";
+      target?.scrollIntoView?.({block: "center"});
+    } catch (_) { /* Best effort: never fail a job on a nudge. */ }
+  }
   function generatedVariantCount() {
     const user = turnHeadings("You said:").at(-1);
     const controls = new Set();
@@ -79,7 +91,8 @@
     const observed = body ? promptText(body) : "";
     const matches = element => {
       if (!element || !visible(element) || typeof element.innerText !== "string") return false;
-      const rendered = normalizedText(element.innerText);
+      // ChatGPT clamps long user messages and appends "… Show more" to innerText.
+      const rendered = normalizedText(element.innerText).replace(/ ?… Show (?:more|less)$/, "");
       if (rendered === expected) return true;
       const chips = [...element.querySelectorAll(imageChipSelector)].filter(visible);
       // Only the native leading image pill may be excluded, never wrapper text.
@@ -114,6 +127,14 @@
   const editorElement = () => [...document.querySelectorAll('#prompt-textarea[contenteditable="true"], textarea#prompt-textarea, [role="textbox"][contenteditable="true"][aria-label="Ask ChatGPT"]')].find(visible);
   const hasTurns = () => assistants().length || document.querySelector('[data-message-author-role="user"]') ||
     turnHeadings("You said:").length || turnHeadings("ChatGPT said:").length;
+  function finishedChat() {
+    const viewer = [...document.querySelectorAll('button[aria-label="Close viewer"]')].some(visible);
+    const heading = text => turnHeadings(text).length || (viewer &&
+      [...document.querySelectorAll("h4")].some(el => normalizedText(el.innerText || el.textContent) === text));
+    return /^\/c\/[a-f0-9-]{36}$/.test(location.pathname) &&
+      (document.querySelector('[data-message-author-role="user"]') || heading("You said:")) &&
+      (assistants().some(visible) || heading("ChatGPT said:"));
+  }
   const attachmentSelector = '[data-testid="attachment-preview"], [data-testid="file-thumbnail"]';
   const removeAttachmentSelector = 'button[aria-label^="Remove "]';
   function attachmentCards(root = document) {
@@ -175,9 +196,20 @@
     counts.attachment_cards = Math.min(10000, attachmentCards(form || document).length);
     return counts;
   }
-  const attachmentsPresent = () => [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length) ||
-    document.querySelector('[data-testid="file-upload-progress"], ' + attachmentSelector) ||
-    [...(editorElement()?.closest("form")?.querySelectorAll(removeAttachmentSelector + ', [role="progressbar"], [aria-busy="true"]') || [])].some(visible);
+  function historicalAttachment(element) {
+    const editor = editorElement();
+    const turn = element.closest?.('[data-message-author-role="user"], [data-message-author-role="assistant"]');
+    // Only explicit message ancestry proves history. Unknown wrappers, portals,
+    // and anything in a form remain blockers, even on an existing conversation.
+    return !!turn && !element.closest?.("form") && !(editor && turn.contains(editor));
+  }
+  function attachmentsPresent() {
+    const selector = '[data-testid="file-upload-progress"], ' + attachmentSelector;
+    const markers = [document.querySelector(selector), ...document.querySelectorAll(selector)].filter(Boolean);
+    return [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length) ||
+      markers.some(element => !historicalAttachment(element)) ||
+      [...(editorElement()?.closest("form")?.querySelectorAll(removeAttachmentSelector + ', [role="progressbar"], [aria-busy="true"]') || [])].some(visible);
+  }
   function ownedUploads(job) {
     return uploadBinding && uploadBinding.jobId === job?.job_id && uploadBinding.path === location.pathname &&
       uploadBinding.editor === editorElement() && uploadBinding.names.join("\n") === (job.images || []).map(image => image.name).join("\n");
@@ -185,7 +217,7 @@
   function verifiedUploadCards(job) {
     if (!ownedUploads(job)) return false;
     const scope = uploadBinding.scope;
-    if (attachmentCards().some(card => !scope.contains(card)) ||
+    if (attachmentCards().some(card => !scope.contains(card) && !historicalAttachment(card)) ||
         [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length && !scope.contains(input)))
       throw new Error("Unexpected attachments outside this job's composer");
     if (scope.querySelector('[data-testid="file-upload-progress"], [role="progressbar"], [aria-busy="true"]')) return null;
@@ -326,7 +358,21 @@
       throw new Error("Native file input did not accept the ordered images");
     input.dispatchEvent(new Event("input", {bubbles: true}));
     input.dispatchEvent(new Event("change", {bubbles: true}));
-    await waitFor(() => { inspect(job, true); return uploadsReady(job); }, "Native uploads not verified ready; inspect the unsent draft");
+    try {
+      await waitFor(() => { inspect(job, true); return uploadsReady(job); }, "Native uploads not verified ready; inspect the unsent draft");
+    } catch (error) {
+      if (error.message.startsWith("Native uploads not verified ready;")) {
+        // Counts only: never persist filenames, image URLs, or composer text.
+        const cards = attachmentCards(scope).filter(visible);
+        const count = nodes => Math.min(10000, nodes.length);
+        const detail = {expected: images.length, cards: count(cards),
+          removes: count([...scope.querySelectorAll(removeAttachmentSelector)].filter(visible)),
+          loaded_thumbnails: count([...scope.querySelectorAll("img")].filter(img => visible(img) && img.complete && img.naturalWidth > 0)),
+          pending: !!scope.querySelector('[data-testid="file-upload-progress"], [role="progressbar"], [aria-busy="true"]')};
+        error.message += " Upload readiness: " + JSON.stringify(detail);
+      }
+      throw error;
+    }
   }
   function bindInspectedPreflight(job) {
     const images = job.images || [], editor = editorElement(), scope = editor?.closest("form");
@@ -348,14 +394,15 @@
     if (!uploadsReady(remaining)) throw new Error("Existing preflight attachments do not exactly match; nothing was removed");
     return remaining;
   }
-  function idleEditor(job) {
+  function idleEditor(job, allowMissing = false) {
     if (location.origin !== "https://chatgpt.com") throw new Error("Wrong site");
     if (verificationRequired()) throw new Error("Owner action required: complete verification in ChatGPT. Nothing was submitted.");
     if (new URL(location.href).searchParams.get("temporary-chat") === "true")
       throw new Error("Use a normal ChatGPT chat, not temporary chat. Nothing was submitted.");
     const editor = editorElement();
-    if (!visible(editor)) throw new Error("ChatGPT composer unavailable. Nothing was submitted.");
-    if (busy() || (promptText(editor) && !matchingDraft(job, editor)))
+    if (!visible(editor) && !allowMissing) throw new Error("ChatGPT composer unavailable. Nothing was submitted.");
+    const drafts = editor ? [editor] : [...document.querySelectorAll('#prompt-textarea[contenteditable="true"], textarea#prompt-textarea, [role="textbox"][contenteditable="true"][aria-label="Ask ChatGPT"]')];
+    if (busy() || drafts.some(el => promptText(el) && (!editor || !matchingDraft(job, el))))
       throw new Error("Preserve the draft or running work. Nothing was submitted.");
     if (attachmentsPresent())
       throw new Error("Remove existing attachments before using the image worker");
@@ -383,16 +430,31 @@
   }
   async function prepare(job, savedTarget = null) {
     if (job?.expected_model !== "Create image") throw new Error("Native image mode is Create image");
-    // React may briefly unmount the composer just after an image completes.
-    // Wait for that UI, without navigating or clearing an unseen draft.
-    await waitFor(() => visible(editorElement()) && editorElement(), "ChatGPT composer unavailable");
+    const closeViewer = () => [...document.querySelectorAll('button[aria-label="Close viewer"]')].find(visible);
+    const viewerEditors = () => [...document.querySelectorAll('[role="textbox"][contenteditable="true"][aria-label="Describe edits"]')];
+    // A finished conversation may never remount its composer; New chat can recover it.
+    await waitFor(() => visible(editorElement()) || finishedChat(), "ChatGPT composer unavailable");
     if (savedTarget && !preparationMatches(savedTarget))
       throw new Error("Saved job chat changed; preparation skipped to preserve other work");
-    let editor = idleEditor(job);
+    let editor = idleEditor(job, !!finishedChat());
+    const viewer = closeViewer();
+    if (viewer) {
+      const edits = viewerEditors();
+      if (!finishedChat() || !edits.some(visible) || edits.some(el => normalizedText(el.innerText || el.textContent || "")))
+        throw new Error("Preserve the image edit draft or unknown viewer. Nothing was submitted.");
+      if (savedTarget && !preparationMatches(savedTarget))
+        throw new Error("Saved job chat changed; preparation skipped to preserve other work");
+      viewer.click();
+      await waitFor(() => !closeViewer(), "Image preview did not close");
+      editor = idleEditor(job, !!finishedChat());
+    }
     if (hasTurns()) {
       const newChat = [...document.querySelectorAll('button[aria-label="New chat"]')].find(visible) ||
         [...document.querySelectorAll("button")].find(el => visible(el) && normalizedText(el.textContent) === "New chat");
       if (!newChat) throw new Error("Native New chat control unavailable. Nothing was submitted.");
+      idleEditor(job, !!finishedChat());
+      if (savedTarget && !preparationMatches(savedTarget))
+        throw new Error("Saved job chat changed; preparation skipped to preserve other work");
       newChat.click();
       await waitFor(() => !hasTurns() && visible(editorElement()) && editorElement(), "Fresh chat did not become ready");
       editor = idleEditor(job);
@@ -440,7 +502,43 @@
     if (legacy.length) return legacy.length === 1 ? legacy[0] : null;
     // Sidebar Chat actions use 3xs; only the observed current-chat header uses xl.
     const header = [...document.querySelectorAll('button[aria-label="Chat actions"][data-size="xl"]')].filter(visible);
-    return header.length === 1 ? header[0] : null;
+    if (header.length) return header.length === 1 ? header[0] : null;
+    // 2026-11 header: one surface owns the current chat's menu. It is the trigger itself or wraps one menu button.
+    const surfaces = [...document.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"]')].filter(visible);
+    if (surfaces.length !== 1) return null;
+    const surface = surfaces[0];
+    const buttons = [...surface.querySelectorAll("button")].filter(visible);
+    const menus = buttons.filter(button => button.getAttribute("aria-haspopup") === "menu");
+    const trigger = menus.length === 1 ? menus[0] : menus.length === 0 && buttons.length === 1 ? buttons[0] :
+      buttons.length === 0 ? surface : null;
+    if (trigger) headerSurfaceTriggers.add(trigger);
+    return trigger;
+  }
+  const headerSurfaceTriggers = new WeakSet();
+  const deleteMenuItem = () => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
+    visible(el) && normalizedText(el.textContent) === "Delete");
+  // Older triggers open on pointerdown. The header surface may open on pointerdown, right-click or click:
+  // try each once, and recheck the chat before every gesture.
+  async function openDeleteMenu(more, recheck) {
+    const pointerDown = () => more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
+    if (!headerSurfaceTriggers.has(more)) {
+      pointerDown();
+      return waitFor(deleteMenuItem, "Native Delete control unavailable");
+    }
+    const gestures = [pointerDown,
+      () => more.dispatchEvent(new MouseEvent("contextmenu", {bubbles: true, cancelable: true, button: 2})),
+      () => more.click()];
+    for (const gesture of gestures) {
+      recheck();
+      gesture();
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        const item = deleteMenuItem();
+        if (item) return item;
+        await sleep(100);
+      }
+    }
+    throw new Error("Native Delete control unavailable. Nothing was submitted.");
   }
   async function deleteSavedChat(message) {
     const target = cleanupTarget;
@@ -453,10 +551,11 @@
       throw new Error("Chat changed after generation; nothing was deleted");
     const more = currentChatMenu();
     if (!more) throw new Error("Native chat menu unavailable; saved image is safe");
-    // This native menu trigger opens on pointerdown, not programmatic click.
-    more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
-    const remove = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
-      visible(el) && normalizedText(el.textContent) === "Delete"), "Native Delete control unavailable");
+    const remove = await openDeleteMenu(more, () => {
+      idleEditor();
+      if (location.pathname !== target.path || !unchangedResult(target) || !savedOutputsComplete(target))
+        throw new Error("Chat changed; nothing was deleted");
+    });
     idleEditor();
     if (location.pathname !== target.path || !unchangedResult(target) || !savedOutputsComplete(target))
       throw new Error("Chat changed; nothing was deleted");
@@ -531,6 +630,7 @@
       if (!visible(editor) || promptText(editor) || attachmentsPresent() || verificationRequired())
         throw new Error("Timed-out chat has a draft or uncertain state; nothing was deleted");
     };
+    nudgeOutput();
     safeToDelete();
     const stop = [...document.querySelectorAll('[data-testid="stop-button"], button[aria-label="Stop"]')].find(visible);
     if (stop) {
@@ -540,9 +640,7 @@
     safeToDelete();
     const more = currentChatMenu();
     if (!more) throw new Error("Native chat menu unavailable for timed-out cleanup");
-    more.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, button: 0, pointerType: "mouse", isPrimary: true}));
-    const remove = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')].find(el =>
-      visible(el) && normalizedText(el.textContent) === "Delete"), "Native Delete control unavailable");
+    const remove = await openDeleteMenu(more, safeToDelete);
     safeToDelete();
     remove.click();
     const dialog = await waitFor(() => [...document.querySelectorAll('[role="dialog"]')].find(el =>
@@ -635,6 +733,7 @@
       let deadline = Date.now() + timeoutSeconds * 1000;
       let previous = "", stable = 0;
       let remoteStarted = collectOnly;
+      let remoteAt = Date.now(), stallReported = false;
       while (Date.now() < deadline) {
         await sleep(2500);
         if (verificationRequired()) throw new Error("Owner action required: complete verification and inspect ChatGPT before any new request.");
@@ -642,10 +741,25 @@
         if (!remoteStarted && livePath && (busy() || hasTurns() || assistants().length || outputImages().length)) {
           await reportPhase(job, "remote_started", livePath);
           remoteStarted = true;
+          remoteAt = Date.now();
           deadline = Date.now() + timeoutSeconds * 1000; // Server measures from the remote-start receipt.
         }
         const images = outputImages();
-        if (!images.length || busy()) { stable = 0; continue; }
+        if (!images.length || busy()) {
+          stable = 0;
+          if (!images.length && remoteStarted) {
+            nudgeOutput();
+            // Far past a normal generation with no image in this tab: ask the worker for one fresh, visible
+            // look at this exact chat. The worker then watches the reloaded page; this loop ends with the reload.
+            if (!collectOnly && !stallReported && livePath && Date.now() - remoteAt >= stallRecheckMs) {
+              stallReported = true;
+              const stalled = await chrome.runtime.sendMessage({type: "image-stall", jobId: job.job_id,
+                chatPath: livePath, deadline, hidden: pageHidden()}).catch(() => null);
+              if (stalled?.recheck === true) return;
+            }
+          }
+          continue;
+        }
         if (images.length > 4) throw new Error("More than four assistant images; preserve chat and inspect outputs");
         const sources = images.map(img => img.currentSrc || img.src);
         const signature = JSON.stringify(sources);
@@ -675,8 +789,9 @@
         }
         if (path !== location.pathname || busy() || JSON.stringify(outputImages().map(img => img.currentSrc || img.src)) !== signature)
           throw new Error("Existing result changed during collection; preserve chat and do not regenerate");
-        if (!collectOnly) {
-          if (!remoteStarted) {
+        // A visible finished output recovered for a claimed job still needs its durable receipts.
+        if (!collectOnly || job.visible_output_only === true) {
+          if (!remoteStarted || collectOnly) {
             await reportPhase(job, "remote_started", path);
             remoteStarted = true;
           }
@@ -688,6 +803,7 @@
         const result = await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
           ...(outputs.length === 1 ? {imageBase64: outputs[0]} : {imagesBase64: outputs}), chatPath: path,
           ...(visibleVariantCount ? {visibleVariantCount} : {}),
+          ...(job.stall_recovered === true ? {stallRecovered: true} : {}),
           ...(job.collect_only && promptBinding ? {promptBinding} : {})});
         if (result?.error) throw new Error("Image result could not be saved. Inspect ChatGPT; do not regenerate.");
         return;
@@ -698,7 +814,9 @@
         if (timedOut?.ok === true) return;
         throw new Error(timedOut?.error || "Adaptive timeout cleanup failed; inspect ChatGPT before any new request");
       }
-      throw new Error("Timed out before a remote chat was bound. Inspect ChatGPT before resubmitting. DOM: " + JSON.stringify(resultDomDiagnostics()));
+      const counts = resultDomDiagnostics();
+      delete counts.chat_path; // An unbound tab may show another caller's conversation.
+      throw new Error("Timed out before a remote chat was bound. Inspect ChatGPT before resubmitting. DOM: " + JSON.stringify(counts));
     } catch (error) {
       await chrome.runtime.sendMessage({type: "image-result", jobId: job.job_id,
         ...(job.collect_only && promptBinding ? {promptBinding} : {}),
@@ -751,16 +869,18 @@
           sessionStorage.setItem("gpt-bridge-pair", message.clientId);
       } catch (_) {}
       let idle = false;
+      if (!running) nudgeOutput();
+      const hidden = pageHidden() ? {page_hidden: true} : {};
       try {
         if (running) throw new Error("Content worker already running");
-        idleEditor();
+        idleEditor(undefined, !!finishedChat());
         idle = true;
+        if (hasTurns()) throw new Error("Existing conversation preserved; inspect its job result instead of submitting again");
         const model = "Create image";
         inspect({expected_model: model});
-        reply({fresh: true, model, input_protocol: 4, idle, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()});
-      } catch (error) { reply({error: !running && hasTurns() && !busy()
-          ? "Existing conversation preserved; inspect its job result instead of submitting again" : error.message,
-        input_protocol: 4, idle, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()}); }
+        reply({fresh: true, model, input_protocol: 4, idle, ...hidden, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()});
+      } catch (error) { reply({error: error.message,
+        input_protocol: 4, idle, ...hidden, upload_dom: uploadDomDiagnostics(), result_dom: resultDomDiagnostics(), prompt_dom: promptDomDiagnostics()}); }
       return;
     }
     if (!["image-job", "image-collect"].includes(message.type)) return;

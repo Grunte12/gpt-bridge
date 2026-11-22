@@ -19,7 +19,10 @@ or launch a dedicated account profile.
    run a terminal command or paste a pairing code. Chrome's Extension installation
    and permission confirmations remain owner actions. Never copy local secrets
    into agent chat or another agent's messages.
-2. Submit `generate` or `edit` once with explicit ordered reference roles.
+2. For one image, prefer `run(prompt, out_path, request_id)` when the live schema has it: it submits once,
+   waits, saves to `out_path` and cleans up. On `status: running`, call `run` again with the same
+   `request_id`. Read `cause`; use a new `request_id` only when `safe_to_retry` is true. Otherwise:
+   Submit `generate` or `edit` once with explicit ordered reference roles.
    Edits require the source image. `preflight` tests uploads without generation.
 3. Keep the job ID. Follow `wait` / `job` to saved paths and receipts.
    A healthy queue accepts more jobs; uncertain work must be inspected,

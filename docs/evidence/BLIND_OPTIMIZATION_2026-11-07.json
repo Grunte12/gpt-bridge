@@ -1,0 +1,901 @@
+{
+  "scope": "Synthetic GPT Bridge incidents. Local time 2026-11-07, Asia/Bangkok. Each case is a fresh, independent model context. P/F includes final user advice, not only tool effects.",
+  "method": "Before Claude: raw isolated MCP exchanges from Luna with other host integrations visible. During Claude: restricted Pro CLI, one isolated provider, checked tool surface; SDK init/list/describe not business calls. All tool durations in ms, CLI process wall time in s. No user account identifiers or live job data included.",
+  "cohorts": [
+    {
+      "cohort": "baseline",
+      "model": "gpt-6-luna",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "status",
+            "enqueue",
+            "job",
+            "wait",
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            26,
+            9,
+            16,
+            120013,
+            6
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "fail"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "status",
+            "enqueue",
+            "wait",
+            "job",
+            "status",
+            "wait"
+          ],
+          "errors": 0,
+          "ms": [
+            17,
+            14,
+            120024,
+            11,
+            7,
+            120019
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "fail"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job",
+            "job",
+            "status",
+            "wait"
+          ],
+          "errors": 1,
+          "ms": [
+            11,
+            9,
+            18,
+            5
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "pass"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "status",
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            21,
+            3
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "navigation",
+      "model": "gpt-6-luna",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            41
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "fail"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            89
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [],
+          "errors": 0,
+          "ms": [],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "outside_fixture": "1 extra out-of-scope job read; unknown synthetic ID, no write",
+          "external_errors": 1,
+          "verdict": "fail"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            37
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "isolated-1",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            18
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 13.77,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1520,
+            "cache_read_input_tokens": 8366,
+            "output_tokens": 659
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            17
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 13.24,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1539,
+            "cache_read_input_tokens": 8373,
+            "output_tokens": 699
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            7,
+            5
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 12.17,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2107,
+            "cache_read_input_tokens": 8384,
+            "output_tokens": 651
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            15,
+            10
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 12.92,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2094,
+            "cache_read_input_tokens": 8369,
+            "output_tokens": 698
+          },
+          "verdict": "fail"
+        }
+      ]
+    },
+    {
+      "cohort": "isolated-2",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue",
+            "wait"
+          ],
+          "errors": 0,
+          "ms": [
+            210,
+            91
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 33.01,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 1882,
+            "cache_read_input_tokens": 14046,
+            "output_tokens": 650
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue",
+            "wait",
+            "wait",
+            "wait"
+          ],
+          "errors": 1,
+          "ms": [
+            353,
+            195,
+            118,
+            136
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 38.72,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 2698,
+            "cache_read_input_tokens": 26275,
+            "output_tokens": 1008
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            202
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 33.85,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1578,
+            "cache_read_input_tokens": 8408,
+            "output_tokens": 442
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            301
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 34.22,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1581,
+            "cache_read_input_tokens": 8398,
+            "output_tokens": 538
+          },
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "isolated-3",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            11
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 11.26,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5222,
+            "cache_read_input_tokens": 4620,
+            "output_tokens": 276
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            14
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 13.04,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5347,
+            "cache_read_input_tokens": 4627,
+            "output_tokens": 547
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            15
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 12.24,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5303,
+            "cache_read_input_tokens": 4632,
+            "output_tokens": 401
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            8,
+            9
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 13.07,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5986,
+            "cache_read_input_tokens": 4630,
+            "output_tokens": 524
+          },
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "isolated-3-holdout",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            16
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 12.01,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1860,
+            "cache_read_input_tokens": 8398,
+            "output_tokens": 854
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            12
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 9.87,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1578,
+            "cache_read_input_tokens": 8339,
+            "output_tokens": 432
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            8
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 10.02,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1577,
+            "cache_read_input_tokens": 8338,
+            "output_tokens": 426
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            16,
+            7
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 13.89,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2323,
+            "cache_read_input_tokens": 8395,
+            "output_tokens": 1198
+          },
+          "verdict": "fail"
+        }
+      ]
+    },
+    {
+      "cohort": "check6-original",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            32
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 7.61,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1166,
+            "cache_read_input_tokens": 8695,
+            "output_tokens": 308
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            101
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 9.65,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1231,
+            "cache_read_input_tokens": 8710,
+            "output_tokens": 487
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            45,
+            41
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 10.12,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2672,
+            "cache_read_input_tokens": 8351,
+            "output_tokens": 548
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            20
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 9.73,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1866,
+            "cache_read_input_tokens": 8349,
+            "output_tokens": 763
+          },
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "check6-wording",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            10
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 10.91,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1452,
+            "cache_read_input_tokens": 8818,
+            "output_tokens": 802
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "ms": [
+            13
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 8.89,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1222,
+            "cache_read_input_tokens": 8701,
+            "output_tokens": 431
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "ms": [
+            6
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 7.82,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1851,
+            "cache_read_input_tokens": 8347,
+            "output_tokens": 426
+          },
+          "verdict": "fail"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "ms": [
+            11,
+            6
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 10.66,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2863,
+            "cache_read_input_tokens": 8399,
+            "output_tokens": 1199
+          },
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "check7-original",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            120
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 15.49,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5337,
+            "cache_read_input_tokens": 4678,
+            "output_tokens": 338
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            118
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 16.71,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1610,
+            "cache_read_input_tokens": 8455,
+            "output_tokens": 490
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            118
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 16.7,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5575,
+            "cache_read_input_tokens": 4692,
+            "output_tokens": 431
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            277
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 16.31,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 5577,
+            "cache_read_input_tokens": 4683,
+            "output_tokens": 429
+          },
+          "verdict": "pass"
+        }
+      ]
+    },
+    {
+      "cohort": "check7-wording",
+      "model": "claude-haiku-5-5",
+      "cases": [
+        {
+          "case": "A1",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            12
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 17.28,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1951,
+            "cache_read_input_tokens": 8511,
+            "output_tokens": 1012
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "A2",
+          "calls": [
+            "enqueue"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            182
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 15.78,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1600,
+            "cache_read_input_tokens": 8451,
+            "output_tokens": 503
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B1",
+          "calls": [
+            "job"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            36
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 16.96,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 1826,
+            "cache_read_input_tokens": 8454,
+            "output_tokens": 413
+          },
+          "verdict": "pass"
+        },
+        {
+          "case": "B2",
+          "calls": [
+            "job",
+            "status"
+          ],
+          "errors": 0,
+          "unsafe": 0,
+          "ms": [
+            32,
+            23
+          ],
+          "final_jobs": 1,
+          "final_claim_empty": true,
+          "elapsed_s": 20.19,
+          "surface_verified": true,
+          "tokens": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2758,
+            "cache_read_input_tokens": 8508,
+            "output_tokens": 1601
+          },
+          "verdict": "pass"
+        }
+      ]
+    }
+  ],
+  "final_source_sha256": {
+    "extension_bridge_py": "9b7d5b5948fc80cc628fefe83e0472281f6de57c4dd5a5554e3d0274b3ea8de5",
+    "content_js": "c6417f731ec8cbb8945a8746d02547867be3e21a1bbf2f34cc2db0e30c86fb23",
+    "worker_js": "e795910dea0b3665afae5c298619345d68a036f5963912e6d6ac397793c88ade"
+  }
+}

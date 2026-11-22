@@ -4,12 +4,19 @@ const fs = require('node:fs');
 const {createHash, webcrypto} = require('node:crypto');
 const vm = require('node:vm');
 const path = require('node:path');
+const {EventEmitter, once} = require('node:events');
 
 const root = path.resolve(__dirname, '..');
 const contentSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/content.js'), 'utf8');
 const workerSource = fs.readFileSync(path.join(root, 'extensions/chatgpt-image/worker.js'), 'utf8');
 
-function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, variantGalleries = [], outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, resultResponse = null, moreButtonCount = 1, chatActionSizes = [], sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, decoratedHeadingText = false, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
+const isContentResult = message => message.type === 'image-timeout' || (message.type === 'image-result' &&
+  (typeof message.imageBase64 === 'string' && message.imageBase64.length > 0 ||
+   Array.isArray(message.imagesBase64) && message.imagesBase64.length > 0 &&
+     message.imagesBase64.every(value => typeof value === 'string' && value.length > 0) ||
+   typeof message.error === 'string' && message.error.length > 0 || message.preflightReady === true));
+
+function contentHarness({label = 'Create image', draft = '', busy = false, user = false, challenge = false, challengeAfterSend = false, newUi = false, inflateWhitespace = false, corruptInsertion = false, conversationTurns = null, conversationTurnsAfterSend = false, conversationBodies = [], assistantRoleNodes = false, assistantImageSources = null, assistantImageSequence = null, variantGalleries = [], outsideAssistantSources = [], imagePositions = {}, userImageSources = [], userPromptDescendants = [], conversationImageSources = null, imageMode = true, loseImageChipOnInsert = false, attachments = false, controls = true, temporaryChat = false, editorAvailable = true, imageViewer = false, viewerDraft = '', viewerCloseWorks = true, onViewerClose = null, editorDelayQueries = 0, hiddenRetainedEditor = false, imageReady = false, promptLinkBadge = false, waitForHumanDelete = false, confirmationResponse = null, onConfirmation = null, resultResponse = null, moreButtonCount = 1, chatActionSizes = [], sendDelayQueries = 0, sendDisabledQueries = 0, hiddenFirstSend = false, changeDuringSend = null, changeAfterSendQueries = 1, uploadInput = true, uploadAccept = 'image/png,image/jpeg,image/webp', uploadMultiple = true, extraUploadInputs = 0, uploadInputSpecs = null, outsideUploadInput = null, formAvailable = true, attachmentCardCount = 0, uploadReadyAfterChecks = 0, uploadNeverReady = false, uploadReorder = false, uploadPartial = false, uploadError = false, uploadOutside = false, uploadMissingRemove = false, uploadMissingThumbnail = false, nativeUploadCards = false, reactClearsInputFiles = false, nativeAttachmentNames = [], nativeForeignOnUpload = '', nativeNoThumbnail = false, nativeAmbiguousContainer = false, nativeUnpairedThumbnail = false, changeDuringUpload = null, uploadRemovedBeforeSend = false, foreignTextAfterRemoveAt = 0, matchingDraftAfterRemoveAt = '', foreignAttachmentAfterRemoveAt = 0, removeProgressAfterClick = false, removeControlUnavailableAfter = Infinity, delayedNativeRemovePolls = 0, foreignTextAfterRemoveWaits = 0, matchingDraftAfterRemoveWaits = '', foreignAttachmentAfterRemoveWaits = 0, pathChangeAfterRemoveWaits = 0, staleListenerMarker = false, visibleHeadingsOutsideRegion = false, decoratedHeadingText = false, headerSurface = '', headerSurfaceCount = 1, stallResponse = null, pageVisibility = undefined, chatPath = '/c/123e4567-e89b-12d3-a456-426614174000'} = {}) {
   let now = 0;
   let listener;
   const contentListeners = [];
@@ -112,6 +119,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     (conversationTurnsAfterSend && sendClicks > 0 ? ['You said:', 'ChatGPT said:'] : []);
   const hasConversation = () => user || currentConversationTurns().length > 0;
   const sent = [];
+  const resultEvents = new EventEmitter();
   const phases = [];
   const chip = {innerText: 'Create image', getClientRects: () => [{}]};
   const composerText = () => `${imageMode ? 'Create image' : ''}${draft ? (imageMode ? ' ' : '') + draft : ''}`;
@@ -127,7 +135,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     get value() { return this._value; }
     focus() {}
     dispatchEvent(event) { composerEvents.push(event.type); }
-    getClientRects() { return editorAvailable ? [{}] : []; }
+    getClientRects() { return editorAvailable && !imageViewer ? [{}] : []; }
     click() { clicks++; }
   }
   Object.defineProperty(Textarea.prototype, 'value', {get() { return this._value; }, set(v) { this._value = v; }});
@@ -137,7 +145,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     get textContent() { return this.innerText; }
     focus() {}
     dispatchEvent(event) { composerEvents.push(event.type); }
-    getClientRects() { return editorAvailable ? [{}] : []; }
+    getClientRects() { return editorAvailable && !imageViewer ? [{}] : []; }
   }
   const editor = newUi ? new ContentEditable() : new Textarea();
   let form;
@@ -279,9 +287,15 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     textContent, innerText: textContent, disabled: false, getAttribute(name) { return name === 'aria-label' ? ariaLabel : null; },
     getClientRects: () => isVisible() ? [{}] : [], click() { clicks++; onClick(); }
   });
-  const newChatButton = button('New chat', 'New chat', () => controlsState && hasConversation(), () => {
+  const newChatButton = button('New chat', 'New chat', () => controlsState && !imageViewer && hasConversation(), () => {
+    editorAvailable = true;
     user = false; conversationTurns = []; conversationBodies = []; imageMode = false; draft = ''; setEditorText(''); menuOpen = false;
   });
+  const closeViewerButton = button('', 'Close viewer', () => imageViewer, () => {
+    if (viewerCloseWorks) imageViewer = false;
+    if (onViewerClose) onViewerClose();
+  });
+  const viewerEditor = {innerText: viewerDraft, getClientRects: () => imageViewer ? [{}] : []};
   const filesButton = button('Add files and more', 'Add files and more', () => controlsState && !hasConversation() && !busyState && !challengeState && !challengeAfterSend && !attachments, () => { menuOpen = true; });
   const createImageButton = button('Create imageVisualize anything', null, () => controlsState && menuOpen, () => {
     imageMode = true; setEditorText('Create image'); menuOpen = false;
@@ -293,6 +307,15 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       menuOpen = true;
     }
   }};
+  // 2026-11 header: 'wrapper' holds one menu button (pointerdown); 'contextmenu' and 'click' are the surface itself.
+  const surfaceGestures = [];
+  const surfaceButton = {...button('', 'Open conversation options', () => controlsState),
+    getAttribute(name) { return name === 'aria-haspopup' ? 'menu' : name === 'aria-label' ? 'Open conversation options' : null; },
+    dispatchEvent(event) { surfaceGestures.push(event.type); if (event.type === 'pointerdown') { clicks++; menuOpen = true; } }};
+  const headerSurfaceNode = {getClientRects: () => controlsState ? [{}] : [], getAttribute: () => null,
+    querySelectorAll(selector) { return selector === 'button' && headerSurface === 'wrapper' ? [surfaceButton] : []; },
+    dispatchEvent(event) { surfaceGestures.push(event.type); if (event.type === headerSurface) { clicks++; menuOpen = true; } },
+    click() { surfaceGestures.push('click'); if (headerSurface === 'click') { clicks++; menuOpen = true; } }};
   const deleteItem = {textContent: 'Delete', getClientRects: () => menuOpen ? [{}] : [], click() { clicks++; dialogOpen = true; menuOpen = false; }};
   const finalDeleteButton = {textContent: 'Delete chat', listeners: new Set(), getClientRects: () => dialogOpen ? [{}] : [],
     addEventListener(type, fn) { if (type === 'click') this.listeners.add(fn); },
@@ -323,6 +346,7 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     return [];
   }};
   const document = {
+    visibilityState: pageVisibility,
     querySelector(selector) {
       if ((newUi && selector.includes('[aria-label="Ask ChatGPT"]')) || selector.startsWith('#prompt-textarea')) {
         if (remainingEditorDelay > 0) { remainingEditorDelay--; return null; }
@@ -344,6 +368,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'button[aria-label="Close viewer"]') return [closeViewerButton];
+      if (selector === '[role="textbox"][contenteditable="true"][aria-label="Describe edits"]') return imageViewer ? [viewerEditor] : [];
       if (selector.startsWith('[data-testid="generated-image-gallery"]')) return variantGalleries.map(spec => ({
         getClientRects: () => spec.hidden ? [] : [{}],
         querySelectorAll(selector) {
@@ -380,6 +406,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
       if (selector === '[role="menuitem"]') return [deleteItem];
       if (selector === '[role="dialog"]') return dialogOpen ? [deleteDialog] : [];
       if (selector === 'button[aria-label="More"]') return Array.from({length: moreButtonCount}, () => moreButton);
+      if (selector === '[data-testid="app-shell-header-context-menu-surface"]')
+        return headerSurface ? Array.from({length: headerSurfaceCount}, () => headerSurfaceNode) : [];
       if (selector === 'button[aria-label="Chat actions"][data-size="xl"]')
         return chatActionSizes.filter(size => size === 'xl').map(() => moreButton);
       if (selector.startsWith('button')) return [newChatButton, filesButton, createImageButton, moreButton].filter(item =>
@@ -410,7 +438,12 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     onMessage: {addListener(fn) { listener = fn; contentListeners.push(fn); }, hasListener(fn) { return contentListeners.includes(fn); }},
     async sendMessage(message) {
       if (message.type === 'image-phase') { phases.push(message); phaseTimes.push({phase: message.phase, at: now}); }
-      else { sent.push(message); if (message.type === 'image-timeout') timeoutAt = now; }
+      else {
+        sent.push(message);
+        if (message.type === 'image-timeout') timeoutAt = now;
+        if (isContentResult(message)) resultEvents.emit('result', message);
+      }
+      if (message.type === 'image-stall' && stallResponse) return stallResponse;
       if (message.type === 'image-result' && resultResponse) return resultResponse(message);
       if (message.type === 'image-delete-prompt') return {ok: true};
       if (message.type === 'image-delete-confirmation') {
@@ -426,7 +459,8 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
     HTMLTextAreaElement: Textarea, Event: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     InputEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     File: FakeFile, DataTransfer: FakeDataTransfer, atob, crypto: webcrypto,
-    PointerEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } }, Date: SimDate,
+    PointerEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
+    MouseEvent: class { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } }, Date: SimDate,
     setTimeout(fn, ms) {
       if (pendingNativeRemoval && ms === 100) {
         nativeRemovalWaitPolls++;
@@ -450,15 +484,16 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
   };
   if (staleListenerMarker) context.__gptBridgeImageWorkerListener = () => {};
   vm.runInNewContext(contentSource, context, {filename: 'content.js'});
-  return {receive: listener, sent, phases, phaseTimes, get timeoutAt() { return timeoutAt; }, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
+  return {receive: listener, sent, resultEvents, phases, phaseTimes, get timeoutAt() { return timeoutAt; }, get contentListenerCount() { return contentListeners.length; }, rerunContent() { vm.runInNewContext(contentSource, context, {filename: 'content.js'}); },
     get clicks() { return clicks; }, get finalDeleteClicks() { return finalDeleteClicks; }, get sendClicks() { return sendClicks; },
     get sendQueries() { return sendQueries; }, get insertTextCalls() { return insertTextCalls; }, get composerEvents() { return composerEvents; },
     get fetchCalls() { return fetchCalls; }, get fetchedUrls() { return fetchedUrls; }, get fileReaderReads() { return fileReaderReads; },
     get sendClickedWhenReady() { return sendClickedWhenReady; }, get uploadedFiles() { return uploadedFiles; }, get fileInputs() { return fileInputs; }, get inputEvents() { return inputEvents; },
     get removeClicks() { return removeClickCount; },
     get removedUploadNames() { return removedUploadNames; },
-    get uploadReadyState() { return uploadReadyState; }, get uploadReadyChecks() { return uploadReadyChecks; }, editor, location,
-    clickMore() { moreButton.click(); }, get deleteMenuOpen() { return menuOpen; },
+    get uploadReadyState() { return uploadReadyState; }, get uploadReadyChecks() { return uploadReadyChecks; }, editor, location, document,
+    clickMore() { moreButton.click(); }, get deleteMenuOpen() { return menuOpen; }, surfaceGestures,
+    setEditorAvailable(value) { editorAvailable = value; }, setViewer(value, text = '') { imageViewer = value; viewerEditor.innerText = text; },
     setBusy(value) { busyState = value; }, setChallenge(value) { challengeState = value; },
     setControls(value) { controlsState = value; }, setConversationBodies(value) { conversationBodies = value; },
     confirmDelete() { for (const fn of finalDeleteButton.listeners) fn({isTrusted: true}); dialogOpen = false; location.pathname = '/'; },
@@ -471,19 +506,55 @@ function contentHarness({label = 'Create image', draft = '', busy = false, user 
 
 async function startContent(harness, job = {job_id: 'job-1', expected_model: 'Create image', prompt: 'draw a cat'}) {
   let accepted;
+  harness.resultOffset = harness.sent.length;
   harness.receive({type: 'image-job', job}, {}, value => { accepted = value; });
   await new Promise(resolve => setImmediate(resolve));
   return accepted;
 }
 
-async function waitForContentResult(harness) {
-  for (let i = 0; i < 50 && !harness.sent.some(message => message.type === 'image-result' &&
-    (message.imageBase64 || message.error || message.preflightReady === true)); i++)
+async function waitForContentResult(harness, timeoutMs = 5000) {
+  const existing = harness.sent.slice(harness.resultOffset || 0).find(isContentResult);
+  if (existing) {
     await new Promise(resolve => setImmediate(resolve));
+    return existing;
+  }
+  // Native SHA promises can outlive any fixed number of event-loop turns.
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(new Error('Content result deadline exceeded')), timeoutMs);
+  try {
+    const [message] = await once(harness.resultEvents, 'result', {signal: controller.signal});
+    // Let the sender consume its receipt and clear its running flag.
+    await new Promise(resolve => setImmediate(resolve));
+    return message;
+  } finally {
+    clearTimeout(deadline);
+  }
 }
+
+test('content result waiter waits for an event, accepts timeout/multi-image, and rejects no result', async () => {
+  const h = {sent: [], resultEvents: new EventEmitter()};
+  let finished = false;
+  const pending = waitForContentResult(h).then(message => { finished = true; return message; });
+  for (let tick = 0; tick < 100; tick++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(finished, false, 'event-loop turns cannot impersonate completion');
+  const result = {type: 'image-result', imagesBase64: ['a', 'b']};
+  h.resultEvents.emit('result', result);
+  assert.equal(await pending, result);
+  for (const terminal of [result, {type: 'image-timeout'}]) {
+    assert.equal(await waitForContentResult({sent: [terminal]}), terminal);
+  }
+  for (const invalid of [[], [{type: 'image-delete-prompt'}], [{type: 'image-result', imagesBase64: []}]]) {
+    const absent = {sent: invalid, resultEvents: new EventEmitter()};
+    await assert.rejects(waitForContentResult(absent, 25), {name: 'AbortError'});
+    assert.equal(absent.resultEvents.listenerCount('result'), 0, 'deadline removes the waiter');
+  }
+  const stale = {sent: [result], resultOffset: 1, resultEvents: new EventEmitter()};
+  await assert.rejects(waitForContentResult(stale, 25), {name: 'AbortError'}, 'a prior job receipt is not completion');
+});
 
 async function startCollect(harness, expectedModel = 'Create image', prompt = 'draw a cat', jobOptions = {}) {
   let accepted;
+  harness.resultOffset = harness.sent.length;
   harness.receive({type: 'image-collect', job: {job_id: 'job-collect', expected_model: expectedModel, prompt, ...jobOptions}}, {}, value => { accepted = value; });
   await new Promise(resolve => setImmediate(resolve));
   return accepted;
@@ -1057,6 +1128,73 @@ test('read-only inspection reports idle state without changing drafts, busy work
   }
 });
 
+test('conversation heartbeat preserves canonical blockers and allows finished-chat recovery', () => {
+  for (const [options, expected, idle] of [
+    [{attachments: true}, 'Remove existing attachments before using the image worker', false],
+    [{draft: 'keep me'}, 'Preserve the draft or running work. Nothing was submitted.', false],
+    [{challenge: true}, 'Owner action required: complete verification in ChatGPT. Nothing was submitted.', false],
+    [{editorAvailable: false, conversationTurns: ['You said:']}, 'ChatGPT composer unavailable. Nothing was submitted.', false],
+    [{editorAvailable: false}, 'Existing conversation preserved; inspect its job result instead of submitting again', true]
+  ]) {
+    const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:'], ...options});
+    let result;
+    h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+    assert.equal(result.error, expected);
+    assert.equal(result.idle, idle);
+    assert.equal(h.clicks, 0);
+    assert.equal(h.sendClicks, 0);
+  }
+});
+
+test('historical turn thumbnail is not a draft but ambiguous and composer thumbnails block', () => {
+  for (const scope of ['historical', 'ambiguous', 'composer']) {
+    const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:']});
+    const form = h.editor.closest('form');
+    const turn = {contains: element => element === marker};
+    const marker = {closest(selector) {
+      if (selector === 'form') return scope === 'composer' ? form : null;
+      if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]')
+        return scope === 'historical' || scope === 'composer' ? turn : null;
+      return null;
+    }};
+    const query = h.document.querySelector.bind(h.document);
+    const queryAll = h.document.querySelectorAll.bind(h.document);
+    h.document.querySelector = selector => selector.includes('[data-testid="file-upload-progress"]') ? marker : query(selector);
+    h.document.querySelectorAll = selector => selector.includes('[data-testid="attachment-preview"]') ? [marker] : queryAll(selector);
+    let result;
+    h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+    assert.equal(result.idle, scope === 'historical', scope);
+    assert.equal(result.error, scope === 'historical'
+      ? 'Existing conversation preserved; inspect its job result instead of submitting again'
+      : 'Remove existing attachments before using the image worker', scope);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+test('preparation skips only historical thumbnails and never removes genuine draft uploads', async () => {
+  for (const draftUpload of [false, true]) {
+    const h = contentHarness({user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+      nativeAttachmentNames: draftUpload ? ['draft.png'] : []});
+    const turn = {contains: element => element === marker};
+    const marker = {closest: selector => selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]' ? turn : null};
+    const query = h.document.querySelector.bind(h.document);
+    const queryAll = h.document.querySelectorAll.bind(h.document);
+    const history = () => query('[data-message-author-role="user"]') ? [marker] : [];
+    h.document.querySelector = selector => selector.includes('[data-testid="file-upload-progress"]')
+      ? query(selector) || history()[0] || null : query(selector);
+    h.document.querySelectorAll = selector => selector.includes('[data-testid="attachment-preview"]')
+      ? [...queryAll(selector), ...history()] : queryAll(selector);
+    const result = await startPrepare(h);
+    if (draftUpload) {
+      assert.equal(result.error, 'Remove existing attachments before using the image worker');
+      assert.equal(h.clicks, 0);
+    } else assert.equal(result.fresh, true);
+    assert.equal(h.removeClicks, 0);
+    assert.equal(h.sendClicks, 0);
+    assert.equal(h.finalDeleteClicks, 0);
+  }
+});
+
 test('content refuses an incompatible route before touching the composer', async () => {
   const h = contentHarness();
   assert.equal((await startContent(h, {job_id: 'job-route', expected_model: 'GPT-6 Thinking', prompt: 'draw'})).accepted, true);
@@ -1104,7 +1242,7 @@ test('timeout error carries the bounded result DOM snapshot within the stored er
   assert.match(error, /^Submission attempted\. Timed out before a remote chat was bound\. Inspect ChatGPT before resubmitting\. DOM: \{/);
   const dom = JSON.parse(error.slice(error.indexOf('DOM: ') + 5));
   assert.deepEqual(Object.keys(dom).sort(), ['assistant_body_found', 'assistant_headings', 'assistant_images', 'assistant_role_nodes',
-    'busy', 'chat_path', 'conversation_images', 'user_headings']);
+    'busy', 'conversation_images', 'user_headings']);
   assert.ok(error.length <= 500, `error is ${error.length} chars; the worker keeps only 500`);
 });
 
@@ -2233,6 +2371,21 @@ test('submitted-job recovery collects only from the exact inspected chat and pre
   assert.equal(h.sent.some(message => message.type === 'image-delete-prompt'), false);
 });
 
+test('submitted-job recovery tolerates the clamp suffix ChatGPT appends to long user messages', async () => {
+  const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
+  const originalPrompt = 'Create image Create one image. Return a generated image, not just a description.\n\ndraw a cat';
+  const h = contentHarness({newUi: true, chatPath, imageReady: true,
+    conversationTurns: ['You said:', 'ChatGPT said:'], conversationBodies: [originalPrompt + ' \u2026 Show more']});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {
+    collect_only: true, preserve_chat: true, recovery_chat_path: chatPath
+  });
+  assert.ok(accepted?.accepted);
+  await waitForContentResult(h);
+  const receipt = h.sent.find(message => message.type === 'image-result' && message.imageBase64);
+  assert.ok(receipt, JSON.stringify(h.sent));
+  assert.equal(receipt.promptBinding.root_match, true);
+});
+
 test('submitted-job recovery accepts an exact visible prompt child inside a labelled user-message wrapper', async () => {
   const chatPath = '/c/123e4567-e89b-12d3-a456-426614174000';
   const originalImages = [imageInput(1), imageInput(2)].map(({data_base64, ...metadata}) => metadata);
@@ -2507,7 +2660,8 @@ test('content listener reinjection is idempotent and ignores an unregistered sta
 function workerHarness({config = {token: 'x'.repeat(40), tabId: 7, clientId: 'client'}, active = {jobId: 'job-1', tabId: 7}} = {}) {
   let listener;
   const calls = [];
-  const storage = {config, active};
+  // Isolate message authorization from the independent startup heartbeat.
+  const storage = {};
   const chrome = {
     storage: {local: {
       async get(keys) { const out = {}; for (const key of (Array.isArray(keys) ? keys : [keys])) out[key] = storage[key]; return out; },
@@ -2520,6 +2674,7 @@ function workerHarness({config = {token: 'x'.repeat(40), tabId: 7, clientId: 'cl
   const context = {chrome, URL, crypto: {randomUUID: () => 'id'}, AbortSignal,
     async fetch(url, options) { calls.push({url, body: JSON.parse(options.body)}); return {ok: true, json: async () => ({})}; }};
   vm.runInNewContext(workerSource, context, {filename: 'worker.js'});
+  Object.assign(storage, {config, active});
   return {receive: listener, calls, storage};
 }
 
@@ -2532,7 +2687,8 @@ test('worker rejects unknown or unpaired content results and preserves the activ
   for (const [name, sender, jobId] of cases) await t.test(name, async () => {
     const h = workerHarness();
     let response;
-    h.receive({type: 'image-result', jobId, imageBase64: 'not-a-real-image'}, sender, value => { response = value; });
+    h.receive({type: 'image-result', jobId, imageBase64: 'not-a-real-image'},
+      {tab: sender, url: sender.url}, value => { response = value; });
     await new Promise(resolve => setImmediate(resolve));
     assert.match(response.error, /not from the paired job\/tab/);
     assert.equal(h.calls.length, 0);
@@ -2734,5 +2890,186 @@ test('timeout cleanup uses only a unique legacy or xl current-chat menu', async 
       chatPath: h.location.pathname}, {}, resolve));
     if (deleted) assert.equal(result.deleted, true);
     else { assert.match(result.error, /Native chat menu unavailable/); assert.equal(h.clicks, 0); }
+  }
+});
+
+
+test('finished chat without a composer opens New chat once without deleting or sending', async () => {
+  const h = contentHarness({editorAvailable: false, user: true,
+    conversationTurns: ['You said:', 'ChatGPT said:']});
+  const result = await startPrepare(h);
+  assert.equal(result.fresh, true);
+  assert.equal(h.clicks, 3); // New chat, tools, Create image.
+  assert.equal(h.finalDeleteClicks, 0);
+  assert.equal(h.sendClicks, 0);
+});
+
+test('empty image preview closes before fresh preparation and preserves its original chat', async () => {
+  for (const editorAvailable of [true, false]) {
+    const h = contentHarness({imageViewer: true, editorAvailable, user: true,
+      conversationTurns: ['You said:', 'ChatGPT said:']});
+    assert.equal((await startPrepare(h)).fresh, true);
+    assert.equal(h.clicks, 4); // Close viewer, New chat, tools, Create image.
+    assert.equal(h.finalDeleteClicks, 0);
+    assert.equal(h.sendClicks, 0);
+  }
+});
+
+test('missing-composer and preview recovery preserve drafts and uncertain conversations', async () => {
+  for (const options of [
+    {draft: 'keep this'}, {busy: true}, {attachments: true}, {challenge: true},
+    {temporaryChat: true}, {user: false, conversationTurns: []},
+    {conversationTurns: ['You said:']}, {chatPath: '/unknown'},
+    {imageViewer: true, viewerDraft: 'change the mouth'},
+    {imageViewer: true, busy: true}, {imageViewer: true, attachments: true},
+    {imageViewer: true, challenge: true}, {imageViewer: true, temporaryChat: true},
+    {imageViewer: true, conversationTurns: [], user: false}
+  ]) {
+    const h = contentHarness({editorAvailable: false, user: true,
+      conversationTurns: ['You said:', 'ChatGPT said:'], ...options});
+    assert.ok((await startPrepare(h)).error, JSON.stringify(options));
+    assert.equal(h.clicks, 0, JSON.stringify(options));
+    assert.equal(h.finalDeleteClicks, 0);
+  }
+});
+
+test('a preview that does not close cannot trigger New chat', async () => {
+  const h = contentHarness({imageViewer: true, viewerCloseWorks: false, user: true,
+    conversationTurns: ['You said:', 'ChatGPT said:']});
+  assert.ok((await startPrepare(h)).error);
+  assert.equal(h.clicks, 1);
+  assert.equal(h.finalDeleteClicks, 0);
+});
+
+test('saved-target binding is rechecked with missing composer and image preview', async () => {
+  for (const viewer of [false, true]) {
+    const h = await primeArchiveTarget();
+    h.setEditorAvailable(false);
+    h.setViewer(viewer);
+    let response;
+    h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+      job: {expected_model: 'Create image'}}, {}, value => { response = value; });
+    h.location.pathname = '/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    for (let i = 0; i < 10 && !response; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.match(response.error, /Saved job chat changed/);
+    assert.equal(h.clicks, 0);
+  }
+});
+
+
+test('saved-job preview recovery preserves output and rechecks work after closing the viewer', async () => {
+  for (const changeDuringClose of [false, true]) {
+    let h;
+    h = await primeArchiveTarget({onViewerClose() {
+      if (changeDuringClose) h.setConversationBodies(['another agent prompt']);
+    }});
+    h.setViewer(true);
+    const result = await new Promise(resolve => h.receive({type: 'image-prepare', afterSavedJobId: 'job-collect',
+      job: {expected_model: 'Create image'}}, {}, resolve));
+    if (changeDuringClose) {
+      assert.match(result.error, /Saved job chat changed/);
+      assert.equal(h.clicks, 1); // Only the viewer closed.
+    } else {
+      assert.equal(result.fresh, true);
+      assert.equal(h.clicks, 4);
+    }
+    assert.equal(h.finalDeleteClicks, 0);
+    assert.equal(h.sendClicks, 0);
+  }
+});
+
+// 2026-11-18 one-call workflow: false stalls, recovered outputs and the current header menu.
+const stalledPrompt = 'Create image Create one image. Return a generated image, not just a description. draw a cat';
+
+test('hidden-tab false stall asks the worker for one fresh visible look and stops watching', async () => {
+  const h = contentHarness({conversationTurnsAfterSend: true, assistantImageSources: [], pageVisibility: 'hidden',
+    stallResponse: {ok: true, recheck: true}});
+  await startContent(h, {job_id: 'job-stall', expected_model: 'Create image', prompt: 'draw a cat', generation_timeout_seconds: 600});
+  for (let i = 0; i < 400 && !h.sent.some(message => message.type === 'image-stall'); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const stalls = h.sent.filter(message => message.type === 'image-stall');
+  assert.equal(stalls.length, 1);
+  assert.equal(stalls[0].jobId, 'job-stall');
+  assert.equal(stalls[0].chatPath, h.location.pathname);
+  assert.equal(stalls[0].hidden, true);
+  const remote = h.phaseTimes.find(item => item.phase === 'remote_started');
+  assert.ok(stalls[0].deadline - remote.at >= 600000, 'the worker keeps watching until the job deadline');
+  // The reloaded page is the worker's to watch: no timeout, no failure, no second Send from this loop.
+  assert.equal(h.sent.some(message => message.type === 'image-timeout' || message.type === 'image-result'), false);
+  assert.equal(h.sendClicks, 1);
+});
+
+test('a declined stall recheck keeps the normal timeout path', async () => {
+  const h = contentHarness({conversationTurnsAfterSend: true, assistantImageSources: []});
+  await startContent(h, {job_id: 'job-stall', expected_model: 'Create image', prompt: 'draw a cat', generation_timeout_seconds: 300});
+  await waitForContentResult(h);
+  assert.equal(h.sent.filter(message => message.type === 'image-stall').length, 1);
+  assert.equal(h.sent.filter(message => message.type === 'image-timeout').length, 1);
+});
+
+test('a recovered visible output carries durable phase receipts and the stall flag', async () => {
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: [stalledPrompt], assistantImageSources: ['https://chatgpt.com/generated.png']});
+  const accepted = await startCollect(h, 'Create image', 'draw a cat', {visible_output_only: true, stall_recovered: true});
+  assert.equal(accepted?.accepted, true);
+  const saved = await waitForContentResult(h);
+
+  assert.ok(saved.imageBase64);
+  assert.equal(saved.stallRecovered, true);
+  assert.deepEqual(h.phases.map(message => [message.phase, message.chatPath]),
+    [['remote_started', h.location.pathname], ['result_captured', h.location.pathname]]);
+  assert.equal(h.sendClicks, 0);
+});
+
+test('an inspected collect-only recovery still sends no lifecycle receipts', async () => {
+  const h = contentHarness({newUi: true, user: true, conversationTurns: ['You said:', 'ChatGPT said:'],
+    conversationBodies: [stalledPrompt], assistantImageSources: ['https://chatgpt.com/generated.png']});
+  await startCollect(h);
+  await waitForContentResult(h);
+  assert.deepEqual(h.phases, []);
+});
+
+test('inspection reports a hidden page only when it is hidden', () => {
+  for (const [pageVisibility, expected] of [['hidden', true], ['visible', undefined], [undefined, undefined]]) {
+    const h = contentHarness({pageVisibility});
+    let result;
+    h.receive({type: 'image-inspect'}, {}, value => { result = value; });
+    assert.equal(result.page_hidden, expected);
+  }
+});
+
+test('timed-out chat deletion works through the current header menu surface', async () => {
+  for (const [headerSurface, gestures] of [['wrapper', ['pointerdown']],
+    ['contextmenu', ['pointerdown', 'contextmenu']], ['click', ['pointerdown', 'contextmenu', 'click']]]) {
+    const h = contentHarness({headerSurface, moreButtonCount: 0, newUi: true, user: true,
+      conversationTurns: ['You said:'], conversationBodies: [stalledPrompt]});
+    const result = await new Promise(resolve => h.receive({type: 'image-delete-timeout', jobId: 'job-timeout',
+      job: {job_id: 'job-timeout', expected_model: 'Create image', prompt: 'draw a cat'},
+      chatPath: h.location.pathname}, {}, resolve));
+    assert.equal(result.deleted, true, `${headerSurface}: ${result.error}`);
+    assert.deepEqual(h.surfaceGestures, gestures);
+    assert.equal(h.finalDeleteClicks, 1);
+  }
+});
+
+test('saved-chat deletion works through the current header menu surface', async () => {
+  const h = await primeArchiveTarget({headerSurface: 'wrapper', moreButtonCount: 0, confirmationResponse: {confirmed: true}});
+  assert.equal((await requestDelete(h)).deleted, true);
+  assert.equal(h.finalDeleteClicks, 1);
+});
+
+test('an ambiguous or dead header surface refuses without deleting anything', async () => {
+  for (const [options, pattern] of [[{headerSurface: 'wrapper', headerSurfaceCount: 2}, /Native chat menu unavailable/],
+    [{headerSurface: 'none'}, /Native Delete control unavailable/]]) {
+    const h = contentHarness({...options, moreButtonCount: 0, newUi: true, user: true,
+      conversationTurns: ['You said:'], conversationBodies: [stalledPrompt]});
+    const result = await new Promise(resolve => h.receive({type: 'image-delete-timeout', jobId: 'job-timeout',
+      job: {job_id: 'job-timeout', expected_model: 'Create image', prompt: 'draw a cat'},
+      chatPath: h.location.pathname}, {}, resolve));
+    assert.match(result.error, pattern);
+    assert.equal(h.finalDeleteClicks, 0);
+    assert.match(h.location.pathname, /^\/c\//);
   }
 });

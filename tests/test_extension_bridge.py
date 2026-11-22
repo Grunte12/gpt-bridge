@@ -684,6 +684,30 @@ def test_open_job_status_says_wait_and_names_that_job(tmp_path):
     assert queue.submit("Waits in line.", "Create image")["queue_position"] == 2
 
 
+def test_compact_status_exposes_only_safe_binding_and_readiness(tmp_path):
+    queue = _paired_queue(tmp_path)
+    queue.heartbeat(CLIENT_ID, ACCOUNT, tab_ready=False, tab_idle=False, tab_id=17,
+                    tab_error="private prompt or token", content_receiver="unavailable",
+                    receiver_error="no_receiver")
+    brief = compact_status(queue.status())
+    assert brief["browser_binding"]["paired_tab_id"] == 17
+    assert brief["receiver_readiness"] == {
+        "tab_ready": False, "tab_idle": False, "tab_error_present": True,
+        "content_receiver": "unavailable", "receiver_error": "no_receiver"}
+    assert "private prompt or token" not in str(brief)
+    assert compact_status({"job_id": "a", "state": "failed", "browser_tab_id": 18})["browser_tab_id"] == 18
+    assert "browser_tab_id" not in compact_status({"job_id": "a", "state": "failed", "browser_tab_id": True})
+
+
+def test_compact_status_unpaired_readiness_defaults(tmp_path):
+    queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
+    brief = compact_status(queue.status())
+    assert brief["browser_binding"]["paired_tab_id"] is None
+    assert brief["receiver_readiness"] == {
+        "tab_ready": False, "tab_idle": None, "tab_error_present": False,
+        "content_receiver": "unreported", "receiver_error": ""}
+
+
 def test_unknown_job_error_is_the_worker_message(tmp_path):
     queue = _paired_queue(tmp_path)
     handler = make_handler(queue, TOKEN, 8767)
@@ -737,7 +761,8 @@ def test_restart_marks_uncertain_claim_interrupted_without_redelivery(tmp_path):
     restarted = ExtensionQueue(root, ACCOUNT)
     status = restarted.status(submitted["job_id"])
     assert status["state"] == "interrupted"
-    assert "inspect ChatGPT" in status["error"]
+    assert "Check the original ChatGPT conversation" in status["error"]
+    assert "do not submit a second job" in status["error"]
     # A heartbeat reconnects the same client but never replays interrupted work.
     assert restarted.client is None
     assert restarted.status()["tab_ready"] is False
@@ -1107,7 +1132,7 @@ def test_inspected_completed_timeout_recovers_without_deleting_chat_or_resubmitt
     assert queue.client is None
     queue.heartbeat(CLIENT_ID, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
                     worker_version="0.1.37", content_receiver="available", result_dom=_result_dom(), tab_id=17)
-    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
+    assert queue.status(job_id)["cleanup_status"] == "preserved"  # A failed delete keeps the chat and the line open.
 
     queued = queue.resolve(job_id, recover_outputs=True, recovery_chat_path=RESULT_CHAT_PATH)
     assert queued["collect_only"] is True and queued["preserve_chat"] is True
@@ -1184,11 +1209,11 @@ def test_completed_timeout_recovery_requires_exact_finished_chat(tmp_path, wrong
         queue.resolve(job_id, recover_outputs=True,
                       recovery_chat_path=OTHER_RESULT_CHAT_PATH if wrong_chat else RESULT_CHAT_PATH)
     assert queue.status(job_id)["state"] == "failed"
-    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
+    assert queue.status(job_id)["cleanup_status"] == "preserved"
 
 
 @pytest.mark.parametrize("bad_case", ["client", "tab", "chat", "busy"])
-def test_timeout_inspection_rebind_requires_original_finished_chat(tmp_path, bad_case):
+def test_failed_timeout_delete_never_blocks_pairing_after_restart(tmp_path, bad_case):
     queue = ExtensionQueue(tmp_path / "queue", ACCOUNT)
     queue.pair(CLIENT_ID, ACCOUNT, "Create image", input_protocol=4, tab_id=17)
     job_id = queue.submit("Generate from the supplied reference.", "Create image",
@@ -1203,12 +1228,12 @@ def test_timeout_inspection_rebind_requires_original_finished_chat(tmp_path, bad
     client = str(uuid.uuid4()) if bad_case == "client" else CLIENT_ID
     tab = 18 if bad_case == "tab" else 17
     chat = OTHER_RESULT_CHAT_PATH if bad_case == "chat" else RESULT_CHAT_PATH
-    with pytest.raises(ValueError, match="timeout cleanup failed"):
-        queue.heartbeat(client, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
-                        worker_version="0.1.37", content_receiver="available", tab_id=tab,
-                        result_dom=_result_dom(chat, busy=bad_case == "busy"))
-    assert queue.client is None
-    assert queue.status(job_id)["cleanup_status"] == "timeout_delete_failed"
+    queue.heartbeat(client, ACCOUNT, "Create image", tab_ready=True, input_protocol=4,
+                    worker_version="0.1.37", content_receiver="available", tab_id=tab,
+                    result_dom=_result_dom(chat, busy=bad_case == "busy"))
+    assert queue.client["client_id"] == client
+    assert queue.status(job_id)["cleanup_status"] == "preserved"
+    assert queue.status()["queue_depth"] == 0
 
 
 def test_output_recovery_requires_the_exact_after_send_multiple_image_failure(tmp_path):
@@ -2018,6 +2043,7 @@ def test_six_simultaneous_callers_and_claimers_keep_one_owner(tmp_path):
     scheduling = compact_status(queue.status())["scheduler"]
     assert scheduling == {"policy": "fifo", "worker_tabs": 1, "capacity": 10,
                           "waiting": 5, "in_flight_or_cleanup": 1,
+                          "waiting_for_batch": 0,
                           "rate_limit_policy": "not_configured"}
 
 
@@ -2571,9 +2597,13 @@ def test_saved_chat_auto_cleanup_is_opt_in_and_default_stays_per_job(tmp_path):
 def test_opted_in_job_auto_authorizes_only_after_native_saved_chat_receipt(tmp_path):
     queue = _automatic_cleanup_queue(tmp_path / "queue")
     assert queue.status()["cleanup_policy"] == "automatic_saved_chats"
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", tab_id=7)
     submitted = queue.submit("Opted-in saved chat.", "Create image")
     assert submitted["auto_delete_saved_chat"] is True
     queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, submitted["job_id"], "submit_attempted", 7)
+    queue.phase(CLIENT_ID, submitted["job_id"], "remote_started", 7, "/c/123e4567-e89b-12d3-a456-426614174000")
+    queue.phase(CLIENT_ID, submitted["job_id"], "result_captured", 7, "/c/123e4567-e89b-12d3-a456-426614174000")
     image_base64, raw = _png_base64()
     complete = queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
                             cleanup_pending=True,
@@ -2630,8 +2660,12 @@ def test_runtime_auto_policy_does_not_retroactively_opt_in_existing_jobs(tmp_pat
 def test_restart_invalidates_auto_pending_cleanup_without_replay(tmp_path):
     root = tmp_path / "queue"
     queue = _automatic_cleanup_queue(root / "data")
+    queue.pair(CLIENT_ID, ACCOUNT, "Create image", tab_id=7)
     submitted = queue.submit("Restart safety.", "Create image")
     queue.claim(CLIENT_ID)
+    queue.phase(CLIENT_ID, submitted["job_id"], "submit_attempted", 7)
+    queue.phase(CLIENT_ID, submitted["job_id"], "remote_started", 7, "/c/123e4567-e89b-12d3-a456-426614174000")
+    queue.phase(CLIENT_ID, submitted["job_id"], "result_captured", 7, "/c/123e4567-e89b-12d3-a456-426614174000")
     image_base64, raw = _png_base64()
     queue.result(CLIENT_ID, submitted["job_id"], image_base64=image_base64,
                  cleanup_pending=True, chat_path="/c/123e4567-e89b-12d3-a456-426614174000")
@@ -3025,6 +3059,11 @@ def _timeout_cleanup_failed_queue(tmp_path, *, keep_replacement_queued=False):
     queue, job_id, replacement_id = _timeout_cleanup_waiting_queue(
         tmp_path, keep_replacement_queued=keep_replacement_queued)
     queue.timeout_cleanup(CLIENT_ID, job_id, False, "exact_chat_guard")
+    # Legacy record: services before 0.1.46 left a failed delete open until an explicit pair retry.
+    job = queue.jobs[job_id]
+    job["cleanup_status"] = "timeout_delete_failed"
+    job.pop("previous_cleanup_status")
+    job.pop("delete_failed")
     return queue, job_id, replacement_id
 
 
