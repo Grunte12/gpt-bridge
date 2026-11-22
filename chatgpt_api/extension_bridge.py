@@ -40,6 +40,8 @@ GENERATION_TIMEOUT_SAMPLES = 5
 MAX_TIMEOUT_REPLACEMENTS = 1
 AUTOMATION_PHASES = ("prepared", "submit_attempted", "remote_started", "result_captured", "completed")
 AUTOMATION_PHASE_RANK = {phase: index for index, phase in enumerate(AUTOMATION_PHASES)}
+OUTPUT_FILE = re.compile(r"image(?:-[0-9]{3})?\.(?:png|jpg|webp)")
+INPUT_FILE = re.compile(r"input-[0-9]{3}(?:-[a-f0-9]{32})?\.(?:png|jpg|webp)")
 
 
 _MANIFEST = Path(__file__).resolve().parent.parent / "extensions" / "chatgpt-image" / "manifest.json"
@@ -267,9 +269,14 @@ class ExtensionClient:
 
 
 class ExtensionQueue:
-    def __init__(self, root: Path, account: str, *, auto_delete_saved_chats: bool = False, batch_allowed_runs=()):
+    def __init__(self, root: Path, account: str, *, auto_delete_saved_chats: bool = False, batch_allowed_runs=(),
+                 output_ttl_seconds: float | None = None):
         if type(auto_delete_saved_chats) is not bool:
             raise ValueError("invalid chat cleanup policy")
+        from .retention import ttl_seconds
+        self.output_ttl_seconds = ttl_seconds() if output_ttl_seconds is None else float(output_ttl_seconds)
+        if self.output_ttl_seconds < 0:
+            raise ValueError("output TTL must be 0 or more")
         if root.is_symlink():
             raise ValueError("data directory must not be a symlink")
         self.root = root.resolve()
@@ -340,16 +347,114 @@ class ExtensionQueue:
         if (self.root / "batches").is_dir():
             from .extension_batch import BatchFeeder
             self._batch = BatchFeeder(self)
+        self.prune(include_inputs=True)  # Owner start: sweep inputs left by older builds, then expire old outputs.
 
     def _save(self, job):
         directory = self.root / job["job_id"]
         directory.mkdir(mode=0o700, exist_ok=True)
         from .extension_batch import atomic_json
         atomic_json(directory / "state.json", job)
+        if job.get("state") in TERMINAL:
+            self._remove_inputs(job)  # After the terminal state is durable; no path re-sends a terminal job's bytes.
         if ended_uncertain(job) and self.halted_job is None:
             self.halted_job = job["job_id"]
         with self.finished:
             self.finished.notify_all()
+
+    def _save_keep_mtime(self, job):
+        """Retention bookkeeping. resolve() and timing pick the latest job by state.json mtime, so keep it."""
+        path = self.root / job["job_id"] / "state.json"
+        before = path.stat() if path.is_file() else None
+        from .extension_batch import atomic_json
+        atomic_json(path, job)
+        if before:
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.finished:
+            self.finished.notify_all()
+
+    def _job_dir(self, job) -> Path | None:
+        directory = self.root / job["job_id"]
+        return None if directory.is_symlink() or not directory.is_dir() else directory
+
+    def _remove_inputs(self, job) -> int:
+        """Pinned input copies exist only to deliver a queued job once. Metadata (names, sha256) stays in state.json."""
+        directory = self._job_dir(job)
+        if directory is None:
+            return 0
+        removed = 0
+        for path in directory.glob("input-*"):
+            if INPUT_FILE.fullmatch(path.name) and not path.is_symlink() and path.is_file():
+                path.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
+    def prune(self, *, now: float | None = None, include_inputs: bool = False) -> dict:
+        """Retention sweep. Never touches work in progress, open chat cleanup, or a running batch's jobs.
+        - complete outputs older than the TTL: delete image files, keep state.json as an 'expired' tombstone;
+        - never-delivered queued requests older than the TTL: interrupted (nothing reached ChatGPT);
+        - include_inputs: delete input-* of terminal jobs (runtime saves already do this)."""
+        now = time.time() if now is None else now
+        ttl = self.output_ttl_seconds
+        counts = {"outputs_expired": 0, "inputs_removed": 0, "stale_requests_expired": 0}
+        with self.lock:
+            running = ({b["batch_id"] for b in self._batch.batches.values() if b.get("state") == "running"}
+                       if self._batch else set())
+            for job in list(self.jobs.values()):
+                if job.get("batch_id") in running:
+                    continue
+                created = job.get("created_at")
+                if (ttl and job.get("state") in {"queued", "waiting_for_batch"} and job.get("phase", "prepared") == "prepared"
+                        and not job.get("delivered") and isinstance(created, (int, float)) and now - created >= ttl):
+                    job.update(state="interrupted", completed_at=now, stale_expired=True,
+                               error=f"Expired after {ttl / 86400:g} days in the queue; nothing reached ChatGPT. Submit it again.")
+                    self._save_keep_mtime(job)
+                    counts["stale_requests_expired"] += 1
+                if job.get("state") in TERMINAL and include_inputs:
+                    counts["inputs_removed"] += self._remove_inputs(job)
+                if (ttl and job.get("state") == "complete" and not job_occupies_tab(job)
+                        and job.get("output_status") != "expired" and (job.get("outputs") or job.get("image_path"))):
+                    done = job.get("completed_at")
+                    if not isinstance(done, (int, float)):
+                        try:
+                            done = (self.root / job["job_id"] / "state.json").stat().st_mtime
+                        except OSError:
+                            continue
+                    if now - done >= ttl:
+                        self._expire_outputs(job, now)
+                        counts["outputs_expired"] += 1
+        return counts
+
+    def _expire_outputs(self, job, now):
+        directory = self._job_dir(job)
+        if directory is not None:
+            for path in directory.glob("image*"):
+                if OUTPUT_FILE.fullmatch(path.name) and not path.is_symlink() and path.is_file():
+                    path.unlink(missing_ok=True)
+        job.update(output_status="expired", outputs_expired_at=now)
+        if "image_path" in job:
+            job["image_path"] = None
+        for item in job.get("outputs") or []:
+            if isinstance(item, dict):
+                item["image_path"] = None
+        self._save_keep_mtime(job)
+
+    def _output_retention(self, job) -> dict:
+        """What a caller needs to know about the temporary bridge copy of a finished image."""
+        from .retention import iso_utc
+        if job.get("output_status") == "expired":
+            when = job.get("outputs_expired_at")
+            return {"output_status": "expired",
+                    "output_note": ("The bridge copy was deleted" + (f" on {iso_utc(when)}" if isinstance(when, (int, float)) else "") +
+                                    " after its retention period. Use the copy you saved; sha256 identifies it. "
+                                    "This job is never re-run.")}
+        if job.get("state") != "complete" or not (job.get("outputs") or job.get("image_path")):
+            return {}
+        view = {"output_status": "available",
+                "output_note": "image_path is a temporary bridge copy. Copy it into your project now."}
+        done = job.get("completed_at")
+        if self.output_ttl_seconds and isinstance(done, (int, float)):
+            view["output_expires_at"] = iso_utc(done + self.output_ttl_seconds)
+        return view
 
     def pair(self, client_id: str, account: str | None = None, visible_model: str = "", input_protocol: int = 0,
              tab_id: int | None = None, retry_timeout_cleanup: bool = False, automatic: bool = False) -> dict:
@@ -985,6 +1090,8 @@ class ExtensionQueue:
                     self._save(job)
                     if record and record["state"] == "running":
                         self._batch._stop(record, "batch output copy unverified; inspect before continuing")
+            if job.get("state") == "complete":
+                self.prune()  # After each completion: expire outputs past the TTL.
             return self.status(job_id)
 
     def timeout(self, client_id: str, job_id: str, chat_path: str, reason: str = "") -> dict:
@@ -1186,6 +1293,7 @@ class ExtensionQueue:
         if copied:
             receipt["outputs"] = copied
             receipt["output_count"] = len(copied)
+        receipt.update(self._output_retention(job))
         if job.get("cleanup_confirmation"):
             receipt["cleanup_confirmation"] = job.get("cleanup_confirmation")
         if (position := self._queue_position(job)) is not None:
@@ -1273,6 +1381,7 @@ class ExtensionQueue:
                 raise ValueError("unknown job")
             job = self.jobs[job_id]
             view = {k: v for k, v in job.items() if k not in {"prompt", "client_id"}}
+            view.update(self._output_retention(job))
             view.update(self._progress(job))
             if (position := self._queue_position(job)) is not None:
                 view["queue_position"] = position
@@ -1584,7 +1693,8 @@ def compact_status(raw: dict) -> dict:
             receipt["queue_position"] = raw["queue_position"]
         for key in ("generation_baseline_seconds", "generation_timeout_seconds", "generation_timing_samples",
                     "timed_out", "replacement_job_id", "replaces_job_id", "retry_count", "visible_variant_count", "cleanup_error",
-                    "request_id", "payload_hash", "blocked_by_batch", "accepted_sequence"):
+                    "request_id", "payload_hash", "blocked_by_batch", "accepted_sequence",
+                    "output_status", "output_expires_at", "output_note"):
             if key in raw:
                 receipt[key] = raw[key]
         progress = {key: raw[key] for key in ("wait_reason", "next_action", "stage_ms", "queue_wait_ms", "user_message", "agent_action", "remote_delivery", "safe_to_retry", "user_message_th") if key in raw}
@@ -1730,6 +1840,21 @@ def run_image(queue, prompt: str, out_path: str, request_id: str, images=None, m
         cause, safe = _run_failure(record)
         return finish("failed", cause, record, error=record.get("error"), safe_to_retry=safe)
     outputs = record.get("outputs") or []
+    dimensions = record.get("dimensions") or (outputs[0].get("dimensions") if outputs else None) or [None, None]
+    if record.get("output_status") == "expired":
+        # A resume after retention: never re-run. Done only if out_path already holds these exact bytes.
+        wanted = record.get("sha256") or (outputs[0].get("sha256") if outputs else None)
+        try:
+            held = (hashlib.sha256(target.read_bytes()).hexdigest()
+                    if target.is_file() and not target.is_symlink() else None)
+        except OSError:
+            held = None
+        if wanted and held == wanted:
+            return finish("done", "ok", record, out_path=str(target), width=dimensions[0], height=dimensions[1],
+                          sha256=wanted, image_path=None, output_status="expired")
+        return finish("failed", "output_expired", record, safe_to_retry=False, sha256=wanted, output_status="expired",
+                      error="The bridge copy of this finished image was deleted after its retention period, and out_path "
+                            "does not hold it. Use the copy saved by the first run. This request is never re-run.")
     source = record.get("image_path") or (outputs[0].get("image_path") if outputs else None)
     try:
         from .extension_batch import durable_write, read_regular
@@ -1741,7 +1866,6 @@ def run_image(queue, prompt: str, out_path: str, request_id: str, images=None, m
     except (OSError, ValueError, TypeError, IndexError) as error:
         return finish("failed", "save_failed", record, safe_to_retry=False, image_path=source,
                       error=f"Image is saved in the job folder but could not be written to out_path: {error}"[:300])
-    dimensions = record.get("dimensions") or (outputs[0].get("dimensions") if outputs else None) or [None, None]
     wanted_delete = record.get("cleanup_requested") == "delete_on_success"
     cause = ("false_stall_recovered" if record.get("stall_recovered") else
              "timeout_output_recovered" if record.get("auto_recovered") else
@@ -1756,7 +1880,7 @@ def run_image(queue, prompt: str, out_path: str, request_id: str, images=None, m
 
 def create_mcp(queue):
     from mcp.server.fastmcp import FastMCP
-    server = FastMCP("gpt-bridge", instructions="For one image call run(prompt, out_path, request_id): it submits once, waits, saves the file and cleans up; if status is running, call run again with the same request_id. Step by step instead: Book one image with enqueue; if the user supplied an order or ticket reference for it, use that exact reference as request_id. Same ID and arguments return the same job. For an existing receipt call job with its job_id. At report_to_user_and_stop, deliver user_message (user_message_th for Thai if present), without adding troubleshooting steps. Unknown remote delivery stays unknown even after an empty chat. Never retry when safe_to_retry is false.")
+    server = FastMCP("gpt-bridge", instructions="For one image call run(prompt, out_path, request_id): it submits once, waits, saves the file and cleans up; if status is running, call run again with the same request_id. Step by step instead: Book one image with enqueue; if the user supplied an order or ticket reference for it, use that exact reference as request_id. Same ID and arguments return the same job. For an existing receipt call job with its job_id. At report_to_user_and_stop, deliver user_message (user_message_th for Thai if present), without adding troubleshooting steps. Unknown remote delivery stays unknown even after an empty chat. Never retry when safe_to_retry is false. image_path is a temporary bridge copy that is deleted after output_expires_at: copy it into your project; run already does.")
 
     @server.tool()
     def status(job_id: str = "") -> dict:
@@ -1865,6 +1989,9 @@ def main(argv: list[str] | None = None):
                            help="Run only the loopback worker, independent of MCP stdio; agent hosts use --connect")
     parser.add_argument("--batch-run-root", type=Path, action="append", default=[],
                         help="Explicitly allow a batch run directory containing prompts.json, generation_log.tsv, raw and receipts; repeatable")
+    parser.add_argument("--output-ttl-days", type=float, default=None,
+                        help="Days to keep finished images in the job folder (default 7, or GPT_BRIDGE_OUTPUT_TTL_DAYS). "
+                             "0 keeps them forever. state.json is always kept for no-replay.")
     parser.add_argument("--auto-delete-saved-chats", action="store_true",
                         help="Owner opt-in: permanently delete only new Bridge-created image chats after validated local save, without per-image prompts")
     args = parser.parse_args(argv)
@@ -1872,6 +1999,10 @@ def main(argv: list[str] | None = None):
         parser.error("batch run allowlist belongs to the owning worker")
     if args.connect and args.auto_delete_saved_chats:
         parser.error("automatic cleanup is an owner-worker policy; set it on the owning command, not --connect")
+    if args.connect and args.output_ttl_days is not None:
+        parser.error("output retention is an owner-worker policy; set it on the owning command, not --connect")
+    if args.output_ttl_days is not None and not args.output_ttl_days >= 0:
+        parser.error("--output-ttl-days must be 0 or more")
     if args.data_dir.is_symlink():
         parser.error("data directory must not be a symlink")
     root = args.data_dir.resolve()
@@ -1890,7 +2021,13 @@ def main(argv: list[str] | None = None):
     except BlockingIOError:
         parser.error("another extension MCP owns this data directory")
     namespace = args.account or ("second" if root.name == "second" else "chrome")
-    queue = ExtensionQueue(root, namespace, auto_delete_saved_chats=args.auto_delete_saved_chats, batch_allowed_runs=args.batch_run_root)
+    from .retention import ttl_seconds
+    try:
+        output_ttl = ttl_seconds(args.output_ttl_days)
+    except ValueError as error:
+        parser.error(str(error))
+    queue = ExtensionQueue(root, namespace, auto_delete_saved_chats=args.auto_delete_saved_chats, batch_allowed_runs=args.batch_run_root,
+                           output_ttl_seconds=output_ttl)
     token_path = queue.root / "extension-token"
     if not token_path.exists():
         descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

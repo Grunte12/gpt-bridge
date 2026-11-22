@@ -1,5 +1,6 @@
 # Lessons
 
+- 2026-11-22: The bridge kept every job's images and inputs forever (2.6 GB in 5 weeks) and filled the owner's disk; callers already held their own copies. Rule: every file the bridge writes needs a named owner and an end-of-life rule (terminal state or TTL) in the same change, with a test; keep only the small record that no-replay needs.
 - 2026-11-18: Four jobs "timed out" at 600 s with a finished image in the chat, then a failed chat delete blocked every heartbeat. Rule: never believe a timeout from a tab nobody looked at; reload the exact chat visibly and recheck first. A cleanup failure is a note on the job (`preserved`), never a queue lock. Also: the poll-driven visible-output collect had never sent its phase receipts, and a `const state` reassignment broke the post-restart delete; an untested recovery path is a broken one.
 
 - 2026-11-18: Images were finished in ChatGPT but jobs timed out at 600 s, because the unpacked extension had moved to 0.1.45 while the service stayed on an older release. Rule: an extension reload and a service release ship as one matched pair; status must show running_extension_version listed in the live OUTPUT_BINDING_REVISIONS. A 400 heartbeat is silent: log non-200 replies when pairing stalls.

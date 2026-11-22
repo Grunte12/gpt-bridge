@@ -24,6 +24,7 @@ from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.types import ChatRequest, Message
 from chatgpt_api.providers.chatgpt.accounts import list_account_profiles, resolve_account_capture_path
 from chatgpt_api.providers.chatgpt.transport import _latest_message_id_from_value
+from chatgpt_api.retention import prune_old_files, ttl_seconds
 from chatgpt_api.worker.storage import WorkerPaths
 
 
@@ -71,6 +72,11 @@ class DirectWorkerClient:
     def __post_init__(self) -> None:
         self.account = resolve_direct_account(self.account, self.accounts_dir)
         self.timeout = max(1.0, float(self.timeout))
+        # Default-folder images are temporary copies; callers that need a file pass output_path.
+        try:
+            prune_old_files(WorkerPaths.default().root / "images", ttl_seconds())
+        except (OSError, ValueError):
+            pass  # Retention must never block a request.
 
     def config(self) -> OpenAICompatConfig:
         paths = WorkerPaths.default()

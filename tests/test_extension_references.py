@@ -304,7 +304,9 @@ def test_clear_preflight_requires_strict_matching_clear_receipt(tmp_path, invali
     assert "chat_path" not in receipt
     assert "auto_delete_saved_chat" not in queue.jobs[submitted["job_id"]]
     assert not list((queue.root / submitted["job_id"]).glob("image.*"))
-    assert (queue.root / submitted["job_id"] / submitted["images"][0]["name"]).read_bytes() == raw
+    # Terminal job: the pinned input copy is deleted; its metadata stays in state.json.
+    assert not (queue.root / submitted["job_id"] / submitted["images"][0]["name"]).exists()
+    assert queue.jobs[submitted["job_id"]]["images"][0]["sha256"] == hashlib.sha256(raw).hexdigest()
 
 
 @pytest.mark.parametrize("preflight_only", [False, True])

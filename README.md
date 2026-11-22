@@ -111,11 +111,35 @@ does the whole chain in code: durable enqueue, wait, collect, copy the saved ima
 | `not_submitted` | Nothing reached ChatGPT. |
 | `delivery_unknown`, `interrupted_unknown`, `output_unreadable`, `unexpected_outputs`, `recovery_failed`, `failed_unknown` | Sent or possibly sent; do not retry blindly. |
 | `extension_offline`, `extension_version_mismatch`, `queue_full`, `cleanup_in_progress`, `request_id_conflict`, `invalid_out_path`, `invalid_request`, `not_accepted`, `save_failed` | Refused before submission, or the copy to `out_path` failed (`image_path` still has the file). |
+| `output_expired` | A resume after the bridge copy expired, and `out_path` does not hold the image. Never re-run; use the first copy. |
 
 Stall handling (extension 0.1.46): every result check first loads the gallery eagerly and scrolls it into view.
 After 150 s without an image, and again before any timeout is recorded, the worker activates the job tab in
 its own window and reloads the exact bound chat once. Chrome is focused only if the page still reports hidden
 10 s later. The user's previous tab is restored afterwards. `status` and the other tools are unchanged.
+
+### Output retention
+
+The bridge is a pass-through. The caller keeps the image in its own project; the
+job folder copy is temporary.
+
+| What | When it is deleted | Kept |
+|---|---|---|
+| `input-*` pinned uploads | When the job ends (`complete`, `failed`, `interrupted`) | names, sha256, bytes in `state.json` |
+| `image*.png/jpg/webp` outputs | 7 days after `completed_at` | `state.json` with sha256, dimensions, chat path |
+| Never-sent queued request | 7 days after acceptance: becomes `interrupted`, nothing reached ChatGPT | `state.json` |
+| `worker/images` (direct worker default folder) | Files older than 7 days | other files and subfolders |
+
+- Set the age on the owning worker: `--output-ttl-days N`, or `GPT_BRIDGE_OUTPUT_TTL_DAYS=N`.
+  `0` keeps outputs forever. `--connect` cannot set it.
+- The sweep runs when the owner starts and after every completed image. It never
+  touches a job in progress, a job whose chat cleanup is still open, or a job of a running batch.
+- `state.json` is never deleted, so `request_id`, `payload_hash` and job lookups keep no-replay working.
+- Receipts for a finished image add `output_status: available`, `output_expires_at` (UTC) and
+  `output_note`. Copy `image_path` into your project before that time (`run` does it for you).
+- After expiry, `job`, `wait` and `status` return `output_status: expired`, `image_path: null`
+  and the original `sha256`. `run` with the same `request_id` returns `done` if `out_path`
+  still holds those bytes, else `output_expired`. It never submits again.
 
 ## Agent guidance and migration
 
