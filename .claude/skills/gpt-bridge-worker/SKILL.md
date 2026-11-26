@@ -8,7 +8,7 @@ description: "Use GPT Bridge for ChatGPT Web chat, research, conversation export
 ## Native image route
 
 Choose one image route from the current project's instructions and keep it for
-the whole job. In Goofy & Memo, call the `gpt-bridge` provider only through
+the whole job. If a project requires Agent LinkHub, call the `gpt-bridge` provider only through
 Agent LinkHub with account `second`. Do not bypass LinkHub by calling the direct
 Extension MCP, direct HTTP, or the worker image/edit CLI, including for status
 checks or recovery. If LinkHub lacks a capability, repair or diagnose that route
